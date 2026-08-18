@@ -1,0 +1,17 @@
+[package]
+name = "courier-pack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+courier-core = { path = "../courier-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+tempfile = "3.21"
+uuid.workspace = true

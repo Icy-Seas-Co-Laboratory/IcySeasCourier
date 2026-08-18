@@ -1,8 +1,14 @@
 /target/
+node_modules/
+dist/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
 /.courier/
 .env
 .DS_Store
 *.db
 *.db-shm
 *.db-wal
-

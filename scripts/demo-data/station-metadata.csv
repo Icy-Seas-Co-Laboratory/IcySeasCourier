@@ -1,0 +1,2 @@
+station_id,latitude_deg_n,longitude_deg_e,instrument,start_time_utc
+GB-DEMO-01,58.4521,-135.8874,synthetic-ctd,2026-08-11T18:00:00Z

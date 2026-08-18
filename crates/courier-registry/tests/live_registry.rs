@@ -1,0 +1,102 @@
+use std::time::{Duration, Instant};
+use std::{env, fs};
+
+use courier_core::{InventoryOptions, RetryPolicy, Transfer, TransferStore, inventory_transfer};
+use courier_registry::{RegistryClient, RegistryFileBinding, RegistryMultipartStore};
+use courier_transfer::{MultipartLimits, complete_uploaded_file, plan_parts, upload_missing_parts};
+
+#[tokio::test]
+#[ignore = "requires the local Registry stack and COURIER_TEST_INVITATION"]
+async fn rust_client_completes_registry_authorized_upload() {
+    let base_url =
+        env::var("COURIER_REGISTRY_URL").unwrap_or_else(|_| "http://127.0.0.1:8010".into());
+    let invitation = env::var("COURIER_TEST_INVITATION").expect("test invitation is required");
+    let exchanged = RegistryClient::unauthenticated(&base_url)
+        .exchange_invitation(&invitation, "courier-rust-e2e")
+        .await
+        .unwrap();
+    let session = RegistryClient::unauthenticated(&base_url)
+        .refresh_session(&exchanged.refresh_token)
+        .await
+        .unwrap();
+    let project = &session.projects[0].project_code;
+    let client = RegistryClient::authenticated(&base_url, session.access_token);
+    let hash_algorithm = client.system_config().await.unwrap().hash_algorithm;
+
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("cast.csv"),
+        b"temperature,salinity\n-1.2,31.4\n",
+    )
+    .unwrap();
+    let mut store = TransferStore::open_in_memory().unwrap();
+    let transfer = Transfer::draft(directory.path().to_owned(), Some(project.clone()));
+    store.create_transfer(&transfer).unwrap();
+    let files = inventory_transfer(
+        transfer.id,
+        directory.path(),
+        &InventoryOptions {
+            hash_algorithm,
+            ..InventoryOptions::default()
+        },
+    )
+    .unwrap();
+    store.replace_inventory(transfer.id, &files).unwrap();
+    for file in &files {
+        store
+            .replace_part_plan(
+                file.id,
+                &plan_parts(file.id, file.size, MultipartLimits::default()).unwrap(),
+            )
+            .unwrap();
+    }
+    let transfer = store.get_transfer(transfer.id).unwrap().unwrap();
+    let registered = client
+        .register_transfer(&transfer, project, "rust-e2e", hash_algorithm)
+        .await
+        .unwrap();
+    let receipt = client
+        .submit_manifest(
+            &transfer,
+            &registered.public_id,
+            project,
+            "rust-e2e",
+            &files,
+        )
+        .await
+        .unwrap();
+    let bindings = receipt
+        .files
+        .iter()
+        .map(|file| RegistryFileBinding {
+            server_file_id: file.id,
+            object_key: file.object_key.clone(),
+        })
+        .collect::<Vec<_>>();
+    let remote = RegistryMultipartStore::new(client.clone(), &registered.public_id, bindings);
+    for (local, registered_file) in files.iter().zip(receipt.files.iter()) {
+        store
+            .bind_registry_file(local.id, registered_file.id, &registered_file.object_key)
+            .unwrap();
+        upload_missing_parts(&store, &remote, local, &RetryPolicy::default())
+            .await
+            .unwrap();
+        complete_uploaded_file(&store, &remote, local, &RetryPolicy::default())
+            .await
+            .unwrap();
+    }
+    client
+        .finalize_transfer(&registered.public_id)
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = client.transfer_status(&registered.public_id).await.unwrap();
+        if status.status == "complete" {
+            break;
+        }
+        assert_ne!(status.status, "failed", "{:?}", status.verification_error);
+        assert!(Instant::now() < deadline, "verification timed out");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light">
+  <title>Icy Seas Registry Console</title>
+  <link rel="stylesheet" href="/admin/styles.css?v=2">
+  <style>[hidden] { display: none !important; }</style>
+</head>
+<body>
+  <div id="login" class="login-shell">
+    <section class="login-card">
+      <div class="brand-mark" aria-hidden="true">IS</div>
+      <p class="eyebrow">Icy Seas Data Registry</p>
+      <h1>Operations Console</h1>
+      <p>Monitor incoming datasets, issue upload invitations, and review verification evidence.</p>
+      <form id="login-form">
+        <label for="admin-key">Admin API key</label>
+        <input id="admin-key" type="password" autocomplete="current-password" required>
+        <small>The key stays in this browser tab and is never written to local storage.</small>
+        <button id="login-submit" class="primary" type="submit">Open console</button>
+      </form>
+      <div id="login-error" class="error" hidden></div>
+    </section>
+  </div>
+
+  <div id="console" class="app-shell" hidden>
+    <aside>
+      <div class="identity"><div class="brand-mark">IS</div><span><strong>Icy Seas</strong><small>Registry Console</small></span></div>
+      <nav aria-label="Console sections">
+        <button data-view="overview" class="active">Overview</button>
+        <button data-view="transfers">Transfers</button>
+        <button data-view="invitations">Invitations</button>
+        <button data-view="projects">Projects</button>
+        <button data-view="audit">Audit log</button>
+      </nav>
+      <div class="aside-foot"><span class="health-dot"></span><span id="health-label">Registry connected</span><button id="logout">Lock</button></div>
+    </aside>
+
+    <main>
+      <header><div><p class="eyebrow">Operations</p><h1 id="view-title">Overview</h1></div><div class="header-actions"><span id="last-refresh"></span><button id="refresh" class="secondary">Refresh</button></div></header>
+      <div id="global-error" class="error" hidden></div>
+
+      <section id="view-overview" class="view active">
+        <div id="metrics" class="metrics"></div>
+        <div class="two-column">
+          <article class="card"><div class="card-head"><h2>Recent transfers</h2><button data-go="transfers">View all</button></div><div id="recent-transfers"></div></article>
+          <article class="card"><div class="card-head"><h2>Recent activity</h2><button data-go="audit">View audit log</button></div><div id="recent-audit"></div></article>
+        </div>
+      </section>
+
+      <section id="view-transfers" class="view">
+        <div class="toolbar"><input id="transfer-search" type="search" placeholder="Search ID, source, or project"><select id="transfer-filter"><option value="">All statuses</option><option>draft</option><option>uploading</option><option>finalizing</option><option>verifying</option><option>complete</option><option>failed</option></select></div>
+        <article class="card table-card"><div id="transfer-table"></div></article>
+      </section>
+
+      <section id="view-invitations" class="view">
+        <div class="section-intro"><div><h2>Upload invitations</h2><p>Issue narrowly scoped, expiring access to one or more projects.</p></div><button id="new-invitation" class="primary">New invitation</button></div>
+        <article class="card table-card"><div id="invitation-table"></div></article>
+      </section>
+
+      <section id="view-projects" class="view">
+        <div class="section-intro"><div><h2>Projects</h2><p>Organize incoming transfers under stable project identifiers.</p></div><button id="new-project" class="primary">New project</button></div>
+        <div id="project-grid" class="project-grid"></div>
+      </section>
+
+      <section id="view-audit" class="view"><article class="card table-card"><div id="audit-table"></div></article></section>
+    </main>
+  </div>
+
+  <dialog id="form-dialog"><form method="dialog"><div class="dialog-head"><div><p class="eyebrow" id="dialog-eyebrow"></p><h2 id="dialog-title"></h2></div><button value="cancel" aria-label="Close">×</button></div><div id="dialog-body"></div><div class="dialog-actions"><button value="cancel" class="secondary">Cancel</button><button id="dialog-submit" value="default" class="primary">Save</button></div></form></dialog>
+  <dialog id="detail-dialog" class="detail-dialog"><form method="dialog"><div class="dialog-head"><div><p class="eyebrow">Transfer evidence</p><h2 id="detail-title"></h2></div><button value="cancel" aria-label="Close">×</button></div><div id="detail-body"></div><div class="dialog-actions"><button value="cancel" class="secondary">Close</button></div></form></dialog>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="/admin/app.js?v=2" defer></script>
+</body>
+</html>
