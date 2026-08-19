@@ -24,6 +24,15 @@ class Settings(BaseSettings):
     verification_lease_seconds: int = 300
     verification_max_attempts: int = 3
     hash_algorithm: str = "sha256"
+    maximum_transfer_files: int = 100_000
+    maximum_request_body_bytes: int = 64 * 1024 * 1024
+    authentication_requests_per_minute: int = 30
+    admin_requests_per_minute: int = 120
+    client_requests_per_minute: int = 600
+    rate_limit_maximum_clients: int = 2_048
+    admin_allowed_networks: str = "127.0.0.1/32,::1/128,100.64.0.0/16"
+    trusted_proxy_networks: str = ""
+    require_https: bool = False
 
     @model_validator(mode="after")
     def reject_development_secrets_outside_development(self) -> "Settings":
@@ -31,12 +40,20 @@ class Settings(BaseSettings):
         if self.hash_algorithm not in {"sha256", "xxhash3", "blake3"}:
             raise ValueError("hash_algorithm must be sha256, xxhash3, or blake3")
         if self.environment != "development":
-            defaults = {"development-only-change-me", "development-only-change-me-too"}
+            defaults = {
+                "development-only-change-me",
+                "development-only-change-me-too",
+                "development",
+            }
             if (
                 self.admin_api_key.get_secret_value() in defaults
                 or self.token_pepper.get_secret_value() in defaults
+                or self.s3_access_key_id.get_secret_value() in defaults
+                or self.s3_secret_access_key.get_secret_value() in defaults
             ):
                 raise ValueError("development secrets are forbidden outside development")
+            if not self.require_https:
+                raise ValueError("HTTPS is required outside development")
         return self
 
 

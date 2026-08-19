@@ -67,7 +67,17 @@ where
         WalkDir::new(source)
             .follow_links(false)
             .into_iter()
-            .filter_map(|entry| entry.ok())
+            .map(|entry| {
+                entry.map_err(|error| CourierError::SourceTraversal {
+                    path: error
+                        .path()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| source.to_path_buf()),
+                    message: error.to_string(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
             .filter(|entry| entry.file_type().is_file())
             .map(|entry| entry.into_path())
             .collect()

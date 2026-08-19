@@ -2,7 +2,7 @@
 
 Icy Seas Courier is a resumable scientific-data transfer client for Icy Seas Co-Laboratory LLC. It is being built as a reusable Rust engine with CLI, desktop, headless, and instrument-facing clients layered over the same implementation.
 
-This repository contains the client-first foundation of Phase 1: the monorepo, persistent transfer and multipart state, recursive streaming inventory and configurable logical-file hashing, source-mutation checks, deterministic S3-compatible part planning, restart reconciliation, bounded-memory SeaweedFS uploads, retry policy, and CLI and desktop interfaces. The Registry control plane now provides scoped sessions, immutable manifests, and direct multipart authorization; `complete` remains reserved for independent server-side verification.
+This repository contains the client-first foundation of Phase 1: the monorepo, persistent transfer and multipart state, strict recursive inventory and configurable logical-file hashing, source-mutation checks, deterministic S3-compatible part planning, restart reconciliation, bounded-memory SeaweedFS uploads, retry policy, and CLI and desktop interfaces. The Registry accepts manifest v3 only, keeps logical files separate from transport objects, provides scoped renewable sessions and direct object upload authorization, and reserves `complete` for independent server-side verification.
 
 ## Quick start
 
@@ -45,11 +45,11 @@ cargo test --workspace
 cargo test -p courier-transfer --test seaweedfs -- --ignored
 ```
 
-See [docs/architecture.md](docs/architecture.md) and [docs/adr](docs/adr) for design context.
+See [docs/architecture.md](docs/architecture.md), [docs/adr](docs/adr), and the [closed-beta deployment runbook](docs/beta-deployment.md) for design and operating guidance.
 
 ## Desktop application
 
-The initial Tauri 2/Svelte application lives in `apps/courier-desktop`. It provides invitation context, native source-folder selection, Rust-backed inventory review, and locally persisted transfer discovery.
+The initial Tauri 2/Svelte application lives in `apps/courier-desktop`. It provides validated Registry endpoint configuration, invitation context, native source-folder selection, Rust-backed inventory review, and locally persisted transfer discovery.
 
 ```bash
 cd apps/courier-desktop
@@ -58,7 +58,7 @@ npm run check
 npm run tauri dev
 ```
 
-The desktop exchanges Registry invitations, presents only authorized projects, registers immutable manifests, and uploads through short-lived part-specific URLs. It displays live confirmed-byte progress with pause/resume controls, keeps rotating credentials in the operating system vault, persists non-secret recovery state and server identities in SQLite, and never describes an object-store upload as a verified dataset.
+The desktop exchanges Registry invitations, presents only authorized projects, groups files up to 8 MiB into deterministic 64 MiB target zstd transport packs, registers immutable v3 manifests, and uploads through short-lived part-specific URLs. Pack files, multipart state, and rotating Registry sessions are cached for pause/resume recovery; pack files are removed after Registry verification completes. Courier displays live confirmed logical-byte progress, keeps credentials in the operating system vault, and never describes an object-store upload as a verified dataset.
 
 ## Status language
 
@@ -66,7 +66,7 @@ Courier deliberately distinguishes `uploaded` from `complete`. Local upload comp
 
 ## Data Registry
 
-The FastAPI/PostgreSQL control plane now supports projects, hashed upload invitations, rotating renewable Courier sessions, scoped and idempotent transfer creation, immutable canonical manifests, server-generated object identities, narrowly scoped multipart authorization, audit events, schema migrations, and health/readiness endpoints.
+The FastAPI/PostgreSQL control plane supports projects, hashed upload invitations, rotating renewable Courier sessions, scoped and idempotent transfer creation, immutable canonical v3 manifests, opaque transport object keys, narrowly scoped multipart authorization, audit events, schema migrations, request limits, security headers, and health/readiness endpoints.
 
 ```bash
 ./scripts/dev-up.sh
@@ -76,7 +76,7 @@ The FastAPI/PostgreSQL control plane now supports projects, hashed upload invita
 
 OpenAPI documentation is available at `http://127.0.0.1:8010/docs` in development. Dataset bytes continue to travel directly to S3-compatible storage; the Registry does not proxy them.
 
-The Registry Operations Console is available at `http://127.0.0.1:8010/admin/`.
+The Registry Operations Console is available at `http://127.0.0.1:8010/admin/` and is rejected unless the client address is loopback or in `100.64.0.0/16`.
 For the default development stack, unlock it with the local-only admin key
 `development-only-change-me`.
 

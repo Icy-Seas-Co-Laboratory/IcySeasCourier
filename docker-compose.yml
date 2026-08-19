@@ -4,9 +4,9 @@ services:
     environment:
       POSTGRES_DB: registry
       POSTGRES_USER: registry
-      POSTGRES_PASSWORD: registry
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-registry}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -16,11 +16,15 @@ services:
       retries: 20
 
   seaweedfs:
-    image: chrislusf/seaweedfs:3.98
-    command: server -s3 -dir=/data -volume.max=0
+    image: chrislusf/seaweedfs:4.29
+    command: mini -dir=/data
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-development}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-development}
+      S3_BUCKET: ${REGISTRY_S3_BUCKET:-icy-seas-incoming}
     ports:
-      - "8333:8333"
-      - "9333:9333"
+      - "${SEAWEEDFS_BIND_ADDRESS:-0.0.0.0}:8333:8333"
+      - "127.0.0.1:9333:9333"
     volumes:
       - seaweedfs-data:/data
 
@@ -29,23 +33,34 @@ services:
     build:
       context: apps/data-registry
     environment:
-      REGISTRY_DATABASE_URL: postgresql+psycopg://registry:registry@postgres:5432/registry
+      REGISTRY_ENVIRONMENT: ${REGISTRY_ENVIRONMENT:-development}
+      REGISTRY_DATABASE_URL: postgresql+psycopg://registry:${POSTGRES_PASSWORD:-registry}@postgres:5432/registry
       REGISTRY_ADMIN_API_KEY: ${REGISTRY_ADMIN_API_KEY:-development-only-change-me}
       REGISTRY_TOKEN_PEPPER: ${REGISTRY_TOKEN_PEPPER:-development-only-change-me-too}
       REGISTRY_S3_INTERNAL_ENDPOINT_URL: http://seaweedfs:8333
-      REGISTRY_S3_PUBLIC_ENDPOINT_URL: http://127.0.0.1:8333
+      REGISTRY_S3_PUBLIC_ENDPOINT_URL: ${REGISTRY_S3_PUBLIC_ENDPOINT_URL:-http://127.0.0.1:8333}
       REGISTRY_S3_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-development}
       REGISTRY_S3_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-development}
       REGISTRY_HASH_ALGORITHM: ${REGISTRY_HASH_ALGORITHM:-sha256}
+      REGISTRY_MAXIMUM_TRANSFER_FILES: ${REGISTRY_MAXIMUM_TRANSFER_FILES:-100000}
+      REGISTRY_MAXIMUM_REQUEST_BODY_BYTES: ${REGISTRY_MAXIMUM_REQUEST_BODY_BYTES:-67108864}
+      REGISTRY_AUTHENTICATION_REQUESTS_PER_MINUTE: ${REGISTRY_AUTHENTICATION_REQUESTS_PER_MINUTE:-30}
+      REGISTRY_ADMIN_REQUESTS_PER_MINUTE: ${REGISTRY_ADMIN_REQUESTS_PER_MINUTE:-120}
+      REGISTRY_ADMIN_ALLOWED_NETWORKS: ${REGISTRY_ADMIN_ALLOWED_NETWORKS:-127.0.0.1/32,::1/128,100.64.0.0/16}
+      REGISTRY_TRUSTED_PROXY_NETWORKS: ${REGISTRY_TRUSTED_PROXY_NETWORKS:-}
+      REGISTRY_CLIENT_REQUESTS_PER_MINUTE: ${REGISTRY_CLIENT_REQUESTS_PER_MINUTE:-600}
+      REGISTRY_RATE_LIMIT_MAXIMUM_CLIENTS: ${REGISTRY_RATE_LIMIT_MAXIMUM_CLIENTS:-2048}
+      REGISTRY_REQUIRE_HTTPS: ${REGISTRY_REQUIRE_HTTPS:-false}
+      FORWARDED_ALLOW_IPS: ${REGISTRY_FORWARDED_ALLOW_IPS:-127.0.0.1}
     ports:
-      - "${REGISTRY_PORT:-8010}:8000"
+      - "${REGISTRY_BIND_ADDRESS:-0.0.0.0}:${REGISTRY_PORT:-8010}:8000"
     depends_on:
       postgres:
         condition: service_healthy
       seaweedfs:
         condition: service_started
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready')"]
+      test: ["CMD", "python", "-c", "import urllib.request; request=urllib.request.Request('http://127.0.0.1:8000/ready', headers={'X-Forwarded-Proto':'https'}); urllib.request.urlopen(request)"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -54,13 +69,16 @@ services:
     image: icy-seas-data-registry:dev
     command: ["python", "-m", "data_registry.worker"]
     environment:
-      REGISTRY_DATABASE_URL: postgresql+psycopg://registry:registry@postgres:5432/registry
+      REGISTRY_ENVIRONMENT: ${REGISTRY_ENVIRONMENT:-development}
+      REGISTRY_DATABASE_URL: postgresql+psycopg://registry:${POSTGRES_PASSWORD:-registry}@postgres:5432/registry
+      REGISTRY_ADMIN_API_KEY: ${REGISTRY_ADMIN_API_KEY:-development-only-change-me}
       REGISTRY_TOKEN_PEPPER: ${REGISTRY_TOKEN_PEPPER:-development-only-change-me-too}
       REGISTRY_S3_INTERNAL_ENDPOINT_URL: http://seaweedfs:8333
-      REGISTRY_S3_PUBLIC_ENDPOINT_URL: http://127.0.0.1:8333
+      REGISTRY_S3_PUBLIC_ENDPOINT_URL: ${REGISTRY_S3_PUBLIC_ENDPOINT_URL:-http://127.0.0.1:8333}
       REGISTRY_S3_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-development}
       REGISTRY_S3_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-development}
       REGISTRY_HASH_ALGORITHM: ${REGISTRY_HASH_ALGORITHM:-sha256}
+      REGISTRY_REQUIRE_HTTPS: ${REGISTRY_REQUIRE_HTTPS:-false}
     depends_on:
       data-registry:
         condition: service_healthy

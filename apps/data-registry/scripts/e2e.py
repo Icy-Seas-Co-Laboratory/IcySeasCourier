@@ -7,6 +7,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import blake3
@@ -108,7 +109,7 @@ def main() -> None:
             "source_name": "dev-smoke-cast",
             "file_count": 1,
             "original_bytes": len(content),
-            "manifest_version": 2,
+            "manifest_version": 3,
             "courier_version": "0.1.0",
             "idempotency_key": f"dev-e2e-{datetime.now(UTC).timestamp()}",
             "hash_algorithm": hash_algorithm,
@@ -117,22 +118,32 @@ def main() -> None:
     )
     transfer_id = transfer["public_id"]
     now = datetime.now(UTC).isoformat()
+    object_id = str(uuid.uuid4())
     _, manifest, _ = request(
         "PUT",
         f"/api/v1/transfers/{transfer_id}/manifest",
         {
             "schema": "icy-seas-transfer-manifest",
-            "version": 2,
+            "version": 3,
             "transfer_id": transfer_id,
             "project": "P26014",
             "created_at": now,
             "courier": {
                 "version": "0.1.0",
                 "platform": "dev-e2e",
-                "transport_encoding_version": 1,
+                "transport_encoding_version": 2,
             },
             "source": {"name": "dev-smoke-cast"},
             "summary": {"file_count": 1, "original_bytes": len(content)},
+            "transport_objects": [
+                {
+                    "id": object_id,
+                    "kind": "file",
+                    "compression": "none",
+                    "encoding_version": 1,
+                    "original_bytes": len(content),
+                }
+            ],
             "files": [
                 {
                     "path": "casts/dev-smoke.csv",
@@ -142,29 +153,29 @@ def main() -> None:
                         "algorithm": hash_algorithm,
                         "value": content_digest(content, hash_algorithm),
                     },
-                    "transport": {"compression": "none", "encoding_version": 1},
+                    "transport": {"object_id": object_id, "member_index": 0},
                 }
             ],
         },
         bearer,
     )
-    file_id = manifest["files"][0]["id"]
-    request("POST", f"/api/v1/transfers/{transfer_id}/files/{file_id}/multipart", headers=bearer)
+    object_id = manifest["transport_objects"][0]["id"]
+    request(
+        "POST", f"/api/v1/transfers/{transfer_id}/objects/{object_id}/multipart", headers=bearer
+    )
     _, authorization, _ = request(
         "POST",
-        f"/api/v1/transfers/{transfer_id}/files/{file_id}/multipart/parts/1/authorize",
+        f"/api/v1/transfers/{transfer_id}/objects/{object_id}/multipart/parts/1/authorize",
         headers=bearer,
     )
     etag = upload_part(authorization["url"], content)
     request(
         "POST",
-        f"/api/v1/transfers/{transfer_id}/files/{file_id}/multipart/complete",
+        f"/api/v1/transfers/{transfer_id}/objects/{object_id}/multipart/complete",
         {"parts": [{"part_number": 1, "etag": etag, "size": len(content)}]},
         bearer,
     )
-    _, finalized, _ = request(
-        "POST", f"/api/v1/transfers/{transfer_id}/finalize", headers=bearer
-    )
+    _, finalized, _ = request("POST", f"/api/v1/transfers/{transfer_id}/finalize", headers=bearer)
     deadline = time.monotonic() + 30
     while finalized["status"] not in {"complete", "failed"} and time.monotonic() < deadline:
         time.sleep(0.5)

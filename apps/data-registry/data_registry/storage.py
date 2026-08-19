@@ -20,9 +20,7 @@ class ObjectStorage:
         }
         self.bucket = settings.s3_bucket
         self.url_lifetime = settings.upload_url_lifetime_seconds
-        self.internal = boto3.client(
-            "s3", endpoint_url=settings.s3_internal_endpoint_url, **common
-        )
+        self.internal = boto3.client("s3", endpoint_url=settings.s3_internal_endpoint_url, **common)
         self.public = boto3.client("s3", endpoint_url=settings.s3_public_endpoint_url, **common)
 
     def ensure_bucket(self) -> None:
@@ -37,9 +35,7 @@ class ObjectStorage:
         return str(result["UploadId"])
 
     def list_parts(self, object_key: str, upload_id: str) -> list[dict[str, Any]]:
-        result = self.internal.list_parts(
-            Bucket=self.bucket, Key=object_key, UploadId=upload_id
-        )
+        result = self.internal.list_parts(Bucket=self.bucket, Key=object_key, UploadId=upload_id)
         return list(result.get("Parts", []))
 
     def authorize_part(self, object_key: str, upload_id: str, part_number: int) -> str:

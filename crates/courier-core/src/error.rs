@@ -26,6 +26,8 @@ pub enum CourierError {
     InvalidSystemTime,
     #[error("path cannot be represented relative to source root: {0}")]
     InvalidRelativePath(PathBuf),
+    #[error("could not traverse source path {path}: {message}")]
+    SourceTraversal { path: PathBuf, message: String },
 }
 
 pub type Result<T> = std::result::Result<T, CourierError>;

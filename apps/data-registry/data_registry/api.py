@@ -16,7 +16,8 @@ from .models import (
     Project,
     Transfer,
     TransferFile,
-    TransferPart,
+    TransferObject,
+    TransportPart,
     UploadInvitation,
 )
 from .schemas import (
@@ -61,9 +62,7 @@ admin = APIRouter(prefix="/api/v1/admin", tags=["administration"])
 client = APIRouter(prefix="/api/v1", tags=["courier"])
 
 
-def owned_transfer(
-    database: Database, identity: CourierIdentity, transfer_id: str
-) -> Transfer:
+def owned_transfer(database: Database, identity: CourierIdentity, transfer_id: str) -> Transfer:
     transfer = database.scalar(select(Transfer).where(Transfer.public_id == transfer_id))
     if transfer is None:
         raise HTTPException(status_code=404, detail="transfer not found")
@@ -87,6 +86,23 @@ def owned_file(
     if transfer_file is None:
         raise HTTPException(status_code=404, detail="transfer file not found")
     return transfer, transfer_file
+
+
+def owned_object(
+    database: Database,
+    identity: CourierIdentity,
+    transfer_id: str,
+    object_id: uuid.UUID,
+) -> tuple[Transfer, TransferObject]:
+    transfer = owned_transfer(database, identity, transfer_id)
+    transport_object = database.scalar(
+        select(TransferObject).where(
+            TransferObject.id == object_id, TransferObject.transfer_id == transfer.id
+        )
+    )
+    if transport_object is None:
+        raise HTTPException(status_code=404, detail="transport object not found")
+    return transfer, transport_object
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -145,21 +161,18 @@ def admin_overview(
     return AdminOverviewResponse(
         projects=database.scalar(select(func.count()).select_from(Project)) or 0,
         active_invitations=database.scalar(
-            select(func.count()).select_from(UploadInvitation).where(
-                UploadInvitation.revoked_at.is_(None), UploadInvitation.expires_at > now
-            )
+            select(func.count())
+            .select_from(UploadInvitation)
+            .where(UploadInvitation.revoked_at.is_(None), UploadInvitation.expires_at > now)
         )
         or 0,
         total_transfers=sum(statuses.values()),
         active_transfers=sum(
-            statuses.get(value, 0)
-            for value in ("draft", "uploading", "finalizing", "verifying")
+            statuses.get(value, 0) for value in ("draft", "uploading", "finalizing", "verifying")
         ),
         failed_transfers=statuses.get("failed", 0),
         completed_transfers=statuses.get("complete", 0),
-        original_bytes=database.scalar(
-            select(func.coalesce(func.sum(Transfer.original_bytes), 0))
-        )
+        original_bytes=database.scalar(select(func.coalesce(func.sum(Transfer.original_bytes), 0)))
         or 0,
         hash_algorithm=settings.hash_algorithm,
     )
@@ -247,9 +260,7 @@ def retry_failed_transfer(
         raise HTTPException(status_code=404, detail="transfer not found")
     if transfer.status != "failed":
         raise HTTPException(status_code=409, detail="only failed transfers can be retried")
-    files_not_ready = any(
-        item.status not in {"uploaded", "verified"} for item in transfer.files
-    )
+    files_not_ready = any(item.status not in {"uploaded", "verified"} for item in transfer.files)
     if not transfer.files or files_not_ready:
         raise HTTPException(
             status_code=409, detail="transfer objects are not ready for verification"
@@ -272,9 +283,7 @@ def retry_failed_transfer(
 
 
 @admin.get("/audit-events", response_model=list[AuditEventResponse])
-def list_audit_events(
-    database: Database, _: AdminActor, limit: int = 100
-) -> list[AuditEvent]:
+def list_audit_events(database: Database, _: AdminActor, limit: int = 100) -> list[AuditEvent]:
     limit = min(max(limit, 1), 500)
     return list(
         database.scalars(select(AuditEvent).order_by(AuditEvent.timestamp.desc()).limit(limit))
@@ -423,9 +432,7 @@ def refresh_session(
     courier_session.token_hash = hash_token(raw_token, settings)
     courier_session.refresh_token_hash = hash_token(raw_refresh_token, settings)
     courier_session.expires_at = now + timedelta(seconds=settings.session_lifetime_seconds)
-    courier_session.refresh_expires_at = now + timedelta(
-        seconds=settings.refresh_lifetime_seconds
-    )
+    courier_session.refresh_expires_at = now + timedelta(seconds=settings.refresh_lifetime_seconds)
     record_event(
         database,
         actor=f"courier:{courier_session.client_identifier}",
@@ -454,6 +461,8 @@ def create_transfer(
     response: Response,
     settings: Configuration,
 ) -> Transfer:
+    if payload.file_count > settings.maximum_transfer_files:
+        raise HTTPException(status_code=413, detail="transfer exceeds Registry file-count limit")
     allowed = {project.project_code: project for project in identity.invitation.projects}
     project = allowed.get(payload.project_code)
     if project is None:
@@ -472,7 +481,7 @@ def create_transfer(
     if existing is not None:
         response.status_code = status.HTTP_200_OK
         return existing
-    if payload.manifest_version not in {1, 2}:
+    if payload.manifest_version != 3:
         raise HTTPException(status_code=422, detail="unsupported manifest version")
     if payload.hash_algorithm != settings.hash_algorithm:
         raise HTTPException(
@@ -531,9 +540,12 @@ def submit_manifest(
             manifest_sha256=transfer.manifest_sha256,
             submitted_at=transfer.manifest_submitted_at,
             files=transfer.files,
+            transport_objects=transfer.transport_objects,
         )
     if payload.transfer_id != transfer.public_id:
         raise HTTPException(status_code=422, detail="manifest transfer_id does not match")
+    if payload.version != transfer.manifest_version:
+        raise HTTPException(status_code=422, detail="manifest version does not match transfer")
     if payload.project != transfer.project.project_code:
         raise HTTPException(status_code=422, detail="manifest project does not match")
     if payload.source.name != transfer.source_name:
@@ -544,33 +556,51 @@ def submit_manifest(
         raise HTTPException(status_code=422, detail="manifest byte count does not match")
     if payload.courier.version != transfer.courier_version:
         raise HTTPException(status_code=422, detail="manifest Courier version does not match")
-    algorithms = {
-        item.digest.algorithm if item.digest is not None else "sha256"
-        for item in payload.files
-    }
-    if algorithms != {transfer.hash_algorithm}:
+    algorithms = {item.digest.algorithm for item in payload.files}
+    if payload.files and algorithms != {transfer.hash_algorithm}:
         raise HTTPException(status_code=422, detail="manifest hash algorithm does not match")
+
+    object_ids = [item.id for item in payload.transport_objects]
+    if database.scalar(select(TransferObject.id).where(TransferObject.id.in_(object_ids))):
+        raise HTTPException(status_code=409, detail="transport object ID is already registered")
 
     now = datetime.now(UTC)
     transfer.manifest = canonical
     transfer.manifest_sha256 = digest
     transfer.manifest_submitted_at = now
     transfer.status = "ready"
+    for item in payload.transport_objects:
+        transfer.transport_objects.append(
+            TransferObject(
+                id=item.id,
+                kind=item.kind,
+                compression=item.compression,
+                encoding_version=item.encoding_version,
+                original_bytes=item.original_bytes,
+                object_key=(
+                    f"incoming/{transfer.project.project_code}/{transfer.public_id}/"
+                    f"{item.id}/payload"
+                ),
+                status="pending",
+            )
+        )
+    objects = {item.id: item for item in transfer.transport_objects}
     for item in payload.files:
         file_id = uuid.uuid4()
+        transport_object = objects[item.transport.object_id]
         transfer.files.append(
             TransferFile(
                 id=file_id,
                 relative_path=item.path,
                 original_size=item.size,
-                original_sha256=(item.digest.value if item.digest is not None else item.sha256),
-                hash_algorithm=(item.digest.algorithm if item.digest is not None else "sha256"),
+                original_sha256=item.digest.value,
+                hash_algorithm=item.digest.algorithm,
                 modified_at=item.mtime,
-                compression=item.transport.compression,
-                transport_encoding_version=item.transport.encoding_version,
-                object_key=(
-                    f"incoming/{transfer.project.project_code}/{transfer.public_id}/{file_id}/payload"
-                ),
+                compression=transport_object.compression,
+                transport_encoding_version=transport_object.encoding_version,
+                object_key=transport_object.object_key,
+                transport_object_id=transport_object.id,
+                member_index=item.transport.member_index,
                 status="pending",
             )
         )
@@ -589,54 +619,55 @@ def submit_manifest(
         manifest_sha256=digest,
         submitted_at=now,
         files=transfer.files,
+        transport_objects=transfer.transport_objects,
     )
 
 
 @client.post(
-    "/transfers/{transfer_id}/files/{file_id}/multipart",
+    "/transfers/{transfer_id}/objects/{object_id}/multipart",
     response_model=MultipartResponse,
     status_code=status.HTTP_201_CREATED,
 )
 def initiate_multipart(
     transfer_id: str,
-    file_id: uuid.UUID,
+    object_id: uuid.UUID,
     database: Database,
     identity: CourierIdentity,
     storage: Storage,
     response: Response,
 ) -> MultipartResponse:
-    _, transfer_file = owned_file(database, identity, transfer_id, file_id)
-    if transfer_file.status == "uploaded":
-        raise HTTPException(status_code=409, detail="file upload is already complete")
-    if transfer_file.multipart_upload_id is None:
-        transfer_file.multipart_upload_id = storage.create_multipart(transfer_file.object_key)
-        transfer_file.status = "uploading"
+    _, transport_object = owned_object(database, identity, transfer_id, object_id)
+    if transport_object.status == "uploaded":
+        raise HTTPException(status_code=409, detail="transport object upload is already complete")
+    if transport_object.multipart_upload_id is None:
+        transport_object.multipart_upload_id = storage.create_multipart(transport_object.object_key)
+        transport_object.status = "uploading"
         database.commit()
     else:
         response.status_code = status.HTTP_200_OK
     return MultipartResponse(
-        file_id=transfer_file.id,
-        upload_id=transfer_file.multipart_upload_id,
-        status=transfer_file.status,
+        file_id=transport_object.id,
+        upload_id=transport_object.multipart_upload_id,
+        status=transport_object.status,
     )
 
 
 @client.get(
-    "/transfers/{transfer_id}/files/{file_id}/multipart/parts", response_model=PartsResponse
+    "/transfers/{transfer_id}/objects/{object_id}/multipart/parts", response_model=PartsResponse
 )
 def list_multipart_parts(
     transfer_id: str,
-    file_id: uuid.UUID,
+    object_id: uuid.UUID,
     database: Database,
     identity: CourierIdentity,
     storage: Storage,
 ) -> PartsResponse:
-    _, transfer_file = owned_file(database, identity, transfer_id, file_id)
-    if transfer_file.multipart_upload_id is None:
+    _, transport_object = owned_object(database, identity, transfer_id, object_id)
+    if transport_object.multipart_upload_id is None:
         raise HTTPException(status_code=409, detail="multipart upload has not been initiated")
-    parts = storage.list_parts(transfer_file.object_key, transfer_file.multipart_upload_id)
+    parts = storage.list_parts(transport_object.object_key, transport_object.multipart_upload_id)
     return PartsResponse(
-        file_id=file_id,
+        file_id=object_id,
         parts=[
             UploadedPart(
                 part_number=int(part["PartNumber"]),
@@ -649,27 +680,27 @@ def list_multipart_parts(
 
 
 @client.get(
-    "/transfers/{transfer_id}/files/{file_id}/object",
+    "/transfers/{transfer_id}/objects/{object_id}/object",
     response_model=ObjectStatusResponse,
 )
 def object_status(
     transfer_id: str,
-    file_id: uuid.UUID,
+    object_id: uuid.UUID,
     database: Database,
     identity: CourierIdentity,
     storage: Storage,
 ) -> ObjectStatusResponse:
-    _, transfer_file = owned_file(database, identity, transfer_id, file_id)
-    return ObjectStatusResponse(exists=storage.object_exists(transfer_file.object_key))
+    _, transport_object = owned_object(database, identity, transfer_id, object_id)
+    return ObjectStatusResponse(exists=storage.object_exists(transport_object.object_key))
 
 
 @client.post(
-    "/transfers/{transfer_id}/files/{file_id}/multipart/parts/{part_number}/authorize",
+    "/transfers/{transfer_id}/objects/{object_id}/multipart/parts/{part_number}/authorize",
     response_model=PartAuthorizationResponse,
 )
 def authorize_part(
     transfer_id: str,
-    file_id: uuid.UUID,
+    object_id: uuid.UUID,
     part_number: int,
     database: Database,
     identity: CourierIdentity,
@@ -677,53 +708,53 @@ def authorize_part(
 ) -> PartAuthorizationResponse:
     if part_number < 1 or part_number > 10_000:
         raise HTTPException(status_code=422, detail="part number must be between 1 and 10000")
-    _, transfer_file = owned_file(database, identity, transfer_id, file_id)
-    if transfer_file.multipart_upload_id is None or transfer_file.status != "uploading":
-        raise HTTPException(status_code=409, detail="file is not accepting parts")
+    _, transport_object = owned_object(database, identity, transfer_id, object_id)
+    if transport_object.multipart_upload_id is None or transport_object.status != "uploading":
+        raise HTTPException(status_code=409, detail="transport object is not accepting parts")
     return PartAuthorizationResponse(
-        file_id=file_id,
+        file_id=object_id,
         part_number=part_number,
         url=storage.authorize_part(
-            transfer_file.object_key, transfer_file.multipart_upload_id, part_number
+            transport_object.object_key, transport_object.multipart_upload_id, part_number
         ),
         expires_in_seconds=storage.url_lifetime,
     )
 
 
 @client.post(
-    "/transfers/{transfer_id}/files/{file_id}/multipart/complete",
+    "/transfers/{transfer_id}/objects/{object_id}/multipart/complete",
     response_model=CompleteMultipartResponse,
 )
 def complete_multipart(
     transfer_id: str,
-    file_id: uuid.UUID,
+    object_id: uuid.UUID,
     payload: CompleteMultipartRequest,
     database: Database,
     identity: CourierIdentity,
     storage: Storage,
 ) -> CompleteMultipartResponse:
-    _, transfer_file = owned_file(database, identity, transfer_id, file_id)
-    if transfer_file.status == "uploaded":
-        return CompleteMultipartResponse(file_id=file_id, status="uploaded", etag="")
-    if transfer_file.multipart_upload_id is None:
+    _, transport_object = owned_object(database, identity, transfer_id, object_id)
+    if transport_object.status == "uploaded":
+        return CompleteMultipartResponse(file_id=object_id, status="uploaded", etag="")
+    if transport_object.multipart_upload_id is None:
         raise HTTPException(status_code=409, detail="multipart upload has not been initiated")
     parts = [{"PartNumber": part.part_number, "ETag": part.etag} for part in payload.parts]
     etag = storage.complete_multipart(
-        transfer_file.object_key, transfer_file.multipart_upload_id, parts
+        transport_object.object_key, transport_object.multipart_upload_id, parts
     )
     for item in payload.parts:
-        transfer_file.parts.append(
-            TransferPart(part_number=item.part_number, etag=item.etag, size=item.size)
+        transport_object.parts.append(
+            TransportPart(part_number=item.part_number, etag=item.etag, size=item.size)
         )
-    transfer_file.status = "uploaded"
-    transfer_file.completed_at = datetime.now(UTC)
+    transport_object.status = "uploaded"
+    transport_object.completed_at = datetime.now(UTC)
+    for transfer_file in transport_object.files:
+        transfer_file.status = "uploaded"
     database.commit()
-    return CompleteMultipartResponse(file_id=file_id, status="uploaded", etag=etag)
+    return CompleteMultipartResponse(file_id=object_id, status="uploaded", etag=etag)
 
 
-@client.post(
-    "/transfers/{transfer_id}/finalize", response_model=FinalizeTransferResponse
-)
+@client.post("/transfers/{transfer_id}/finalize", response_model=FinalizeTransferResponse)
 def finalize_transfer(
     transfer_id: str, database: Database, identity: CourierIdentity
 ) -> FinalizeTransferResponse:
@@ -732,10 +763,12 @@ def finalize_transfer(
         return FinalizeTransferResponse(transfer_id=transfer.public_id, status=transfer.status)
     if transfer.status == "failed":
         raise HTTPException(status_code=409, detail="transfer verification failed")
+    if transfer.manifest_version != 3:
+        raise HTTPException(status_code=409, detail="legacy transfer versions cannot be finalized")
     if transfer.manifest_sha256 is None:
         raise HTTPException(status_code=409, detail="manifest has not been submitted")
-    if any(transfer_file.status != "uploaded" for transfer_file in transfer.files):
-        raise HTTPException(status_code=409, detail="not all files are uploaded")
+    if any(item.status != "uploaded" for item in transfer.transport_objects):
+        raise HTTPException(status_code=409, detail="not all transport objects are uploaded")
     transfer.status = "finalizing"
     transfer.completed_at = datetime.now(UTC)
     record_event(

@@ -116,6 +116,29 @@ class Transfer(Base):
     files: Mapped[list["TransferFile"]] = relationship(
         back_populates="transfer", cascade="all, delete-orphan", lazy="selectin"
     )
+    transport_objects: Mapped[list["TransferObject"]] = relationship(
+        back_populates="transfer", cascade="all, delete-orphan", lazy="selectin"
+    )
+
+
+class TransferObject(Base):
+    __tablename__ = "transfer_objects"
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    transfer_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("transfers.id", ondelete="CASCADE"))
+    kind: Mapped[str] = mapped_column(String(20))
+    compression: Mapped[str] = mapped_column(String(20))
+    encoding_version: Mapped[int] = mapped_column(Integer)
+    original_bytes: Mapped[int] = mapped_column(BigInteger)
+    object_key: Mapped[str] = mapped_column(Text, unique=True)
+    multipart_upload_id: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(30), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    transfer: Mapped[Transfer] = relationship(back_populates="transport_objects")
+    files: Mapped[list["TransferFile"]] = relationship(back_populates="transport_object")
+    parts: Mapped[list["TransportPart"]] = relationship(
+        back_populates="transport_object", cascade="all, delete-orphan", lazy="selectin"
+    )
 
 
 class TransferFile(Base):
@@ -129,7 +152,7 @@ class TransferFile(Base):
     modified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     compression: Mapped[str] = mapped_column(String(20))
     transport_encoding_version: Mapped[int] = mapped_column(Integer)
-    object_key: Mapped[str] = mapped_column(Text, unique=True)
+    object_key: Mapped[str] = mapped_column(Text)
     multipart_upload_id: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(30), default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -139,7 +162,12 @@ class TransferFile(Base):
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     verification_error: Mapped[str | None] = mapped_column(Text)
     hash_algorithm: Mapped[str] = mapped_column(String(20), default="sha256")
+    transport_object_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("transfer_objects.id", ondelete="CASCADE"), index=True
+    )
+    member_index: Mapped[int | None] = mapped_column(Integer)
     transfer: Mapped[Transfer] = relationship(back_populates="files")
+    transport_object: Mapped[TransferObject | None] = relationship(back_populates="files")
     parts: Mapped[list["TransferPart"]] = relationship(
         back_populates="file", cascade="all, delete-orphan", lazy="selectin"
     )
@@ -149,9 +177,7 @@ class TransferPart(Base):
     __tablename__ = "transfer_parts"
     __table_args__ = (UniqueConstraint("file_id", "part_number"),)
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    file_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("transfer_files.id", ondelete="CASCADE")
-    )
+    file_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("transfer_files.id", ondelete="CASCADE"))
     part_number: Mapped[int] = mapped_column(Integer)
     etag: Mapped[str] = mapped_column(Text)
     size: Mapped[int | None] = mapped_column(BigInteger)
@@ -159,6 +185,22 @@ class TransferPart(Base):
         DateTime(timezone=True), server_default=func.now()
     )
     file: Mapped[TransferFile] = relationship(back_populates="parts")
+
+
+class TransportPart(Base):
+    __tablename__ = "transport_parts"
+    __table_args__ = (UniqueConstraint("transport_object_id", "part_number"),)
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    transport_object_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("transfer_objects.id", ondelete="CASCADE")
+    )
+    part_number: Mapped[int] = mapped_column(Integer)
+    etag: Mapped[str] = mapped_column(Text)
+    size: Mapped[int | None] = mapped_column(BigInteger)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    transport_object: Mapped[TransferObject] = relationship(back_populates="parts")
 
 
 class VerificationAttempt(Base):

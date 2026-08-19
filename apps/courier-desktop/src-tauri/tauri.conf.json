@@ -21,11 +21,12 @@
         "fullscreen": false
       }
     ],
-    "security": { "csp": null }
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost; connect-src ipc: http://ipc.localhost"
+    }
   },
   "bundle": {
     "active": true,
     "targets": "all"
   }
 }
-

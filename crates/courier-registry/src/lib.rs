@@ -1,8 +1,15 @@
-use std::{collections::HashMap, path::Component, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::Component,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
-use courier_core::{FileRecord, HashAlgorithm, Transfer};
+use courier_core::{
+    FileRecord, HashAlgorithm, Transfer, TransportMemberRecord, TransportObjectRecord,
+};
 use courier_transfer::{MultipartStore, RemotePart, StoreError, UploadSession};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -88,6 +95,7 @@ struct Manifest<'a> {
     courier: ManifestCourier<'a>,
     source: ManifestSource<'a>,
     summary: ManifestSummary,
+    transport_objects: Vec<ManifestTransportObject>,
     files: Vec<ManifestFile>,
 }
 
@@ -114,11 +122,8 @@ struct ManifestFile {
     path: String,
     size: u64,
     mtime: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sha256: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    digest: Option<ManifestDigest>,
-    transport: ManifestTransport,
+    digest: ManifestDigest,
+    transport: ManifestFileTransport,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -128,9 +133,18 @@ struct ManifestDigest {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ManifestTransport {
-    compression: &'static str,
+struct ManifestTransportObject {
+    id: Uuid,
+    kind: String,
+    compression: String,
     encoding_version: u8,
+    original_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ManifestFileTransport {
+    object_id: Uuid,
+    member_index: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -142,17 +156,49 @@ pub struct RegistryFile {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct RegistryObject {
+    pub id: Uuid,
+    pub object_key: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ManifestReceipt {
     pub transfer_id: String,
     pub manifest_sha256: String,
     pub files: Vec<RegistryFile>,
+    pub transport_objects: Vec<RegistryObject>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
+pub struct ManifestTransportPlan<'a> {
+    pub objects: &'a [TransportObjectRecord],
+    pub members: &'a [TransportMemberRecord],
+}
+
+#[derive(Clone)]
 pub struct RegistryClient {
     base_url: String,
-    bearer: Option<String>,
+    auth: Option<Arc<Mutex<AuthState>>>,
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    session_observer: Option<SessionObserver>,
     http: Client,
+}
+
+#[derive(Debug)]
+struct AuthState {
+    access_token: String,
+    refresh_token: Option<String>,
+}
+
+type SessionObserver = Arc<dyn Fn(&RegistrySession) -> Result<(), String> + Send + Sync>;
+
+fn http_client() -> Client {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(30 * 60))
+        .build()
+        .expect("Courier HTTP client configuration is valid")
 }
 
 impl RegistryClient {
@@ -166,16 +212,41 @@ impl RegistryClient {
     pub fn unauthenticated(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
-            bearer: None,
-            http: Client::new(),
+            auth: None,
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+            session_observer: None,
+            http: http_client(),
         }
     }
 
     pub fn authenticated(base_url: impl Into<String>, bearer: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
-            bearer: Some(bearer.into()),
-            http: Client::new(),
+            auth: Some(Arc::new(Mutex::new(AuthState {
+                access_token: bearer.into(),
+                refresh_token: None,
+            }))),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+            session_observer: None,
+            http: http_client(),
+        }
+    }
+
+    pub fn renewable(
+        base_url: impl Into<String>,
+        access_token: impl Into<String>,
+        refresh_token: impl Into<String>,
+        session_observer: SessionObserver,
+    ) -> Self {
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_owned(),
+            auth: Some(Arc::new(Mutex::new(AuthState {
+                access_token: access_token.into(),
+                refresh_token: Some(refresh_token.into()),
+            }))),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+            session_observer: Some(session_observer),
+            http: http_client(),
         }
     }
 
@@ -208,12 +279,20 @@ impl RegistryClient {
             refresh_token: &'a str,
         }
 
-        self.send_json(
-            self.http
-                .post(format!("{}/api/v1/auth/sessions/refresh", self.base_url))
-                .json(&RefreshRequest { refresh_token }),
-        )
-        .await
+        let response = self
+            .http
+            .post(format!("{}/api/v1/auth/sessions/refresh", self.base_url))
+            .json(&RefreshRequest { refresh_token })
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(RegistryError::Rejected {
+                status,
+                detail: response.text().await.unwrap_or_default(),
+            });
+        }
+        Ok(response.json().await?)
     }
 
     pub async fn register_transfer(
@@ -249,10 +328,19 @@ impl RegistryClient {
         project_code: &str,
         source_name: &str,
         files: &[FileRecord],
+        transport: ManifestTransportPlan<'_>,
     ) -> Result<ManifestReceipt, RegistryError> {
+        let member_by_file = transport
+            .members
+            .iter()
+            .map(|member| (member.file_id, member))
+            .collect::<HashMap<_, _>>();
         let manifest_files = files
             .iter()
             .map(|file| {
+                let member = member_by_file.get(&file.id).ok_or_else(|| {
+                    RegistryError::State(format!("transport plan omitted logical file {}", file.id))
+                })?;
                 let seconds = file.mtime_ns.div_euclid(1_000_000_000);
                 let nanos = file.mtime_ns.rem_euclid(1_000_000_000) as u32;
                 let mtime = Utc
@@ -263,34 +351,44 @@ impl RegistryClient {
                     path: portable_relative_path(file)?,
                     size: file.size,
                     mtime,
-                    sha256: (transfer.manifest_version == 1).then(|| file.sha256.clone()),
-                    digest: (transfer.manifest_version == 2).then(|| ManifestDigest {
+                    digest: ManifestDigest {
                         algorithm: file.hash_algorithm,
                         value: file.sha256.clone(),
-                    }),
-                    transport: ManifestTransport {
-                        compression: "none",
-                        encoding_version: 1,
+                    },
+                    transport: ManifestFileTransport {
+                        object_id: member.object_id,
+                        member_index: member.member_index,
                     },
                 })
             })
             .collect::<Result<Vec<_>, RegistryError>>()?;
         let payload = Manifest {
             schema: "icy-seas-transfer-manifest",
-            version: transfer.manifest_version,
+            version: 3,
             transfer_id: server_transfer_id,
             project: project_code,
             created_at: transfer.created_at,
             courier: ManifestCourier {
                 version: env!("CARGO_PKG_VERSION"),
                 platform: std::env::consts::OS,
-                transport_encoding_version: 1,
+                transport_encoding_version: 2,
             },
             source: ManifestSource { name: source_name },
             summary: ManifestSummary {
                 file_count: transfer.file_count,
                 original_bytes: transfer.original_bytes,
             },
+            transport_objects: transport
+                .objects
+                .iter()
+                .map(|object| ManifestTransportObject {
+                    id: object.id,
+                    kind: object.kind.to_string(),
+                    compression: object.compression.clone(),
+                    encoding_version: object.encoding_version,
+                    original_bytes: object.original_bytes,
+                })
+                .collect(),
             files: manifest_files,
         };
         self.send_json(
@@ -329,9 +427,14 @@ impl RegistryClient {
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::RequestBuilder, RegistryError> {
-        let bearer = self.bearer.as_ref().ok_or_else(|| {
+        let auth = self.auth.as_ref().ok_or_else(|| {
             RegistryError::State("authenticated Registry session required".into())
         })?;
+        let bearer = auth
+            .lock()
+            .map_err(|_| RegistryError::State("Registry credentials are unavailable".into()))?
+            .access_token
+            .clone();
         Ok(request.bearer_auth(bearer))
     }
 
@@ -339,7 +442,32 @@ impl RegistryClient {
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<T, RegistryError> {
-        let response = request.send().await?;
+        let retry = request.try_clone();
+        let mut response = request.send().await?;
+        if response.status() == StatusCode::UNAUTHORIZED
+            && let (Some(auth), Some(observer), Some(retry)) =
+                (&self.auth, &self.session_observer, retry)
+        {
+            let _guard = self.refresh_lock.lock().await;
+            let refresh_token = auth
+                .lock()
+                .map_err(|_| RegistryError::State("Registry credentials are unavailable".into()))?
+                .refresh_token
+                .clone()
+                .ok_or_else(|| {
+                    RegistryError::State("renewable Registry session required".into())
+                })?;
+            let session = self.refresh_session(&refresh_token).await?;
+            observer(&session).map_err(RegistryError::State)?;
+            {
+                let mut state = auth.lock().map_err(|_| {
+                    RegistryError::State("Registry credentials are unavailable".into())
+                })?;
+                state.access_token = session.access_token.clone();
+                state.refresh_token = Some(session.refresh_token.clone());
+            }
+            response = retry.bearer_auth(&session.access_token).send().await?;
+        }
         let status = response.status();
         if !status.is_success() {
             return Err(RegistryError::Rejected {
@@ -367,8 +495,8 @@ fn portable_relative_path(file: &FileRecord) -> Result<String, RegistryError> {
 }
 
 #[derive(Debug, Clone)]
-pub struct RegistryFileBinding {
-    pub server_file_id: Uuid,
+pub struct RegistryObjectBinding {
+    pub server_object_id: Uuid,
     pub object_key: String,
 }
 
@@ -422,7 +550,7 @@ impl RegistryMultipartStore {
     pub fn new(
         client: RegistryClient,
         server_transfer_id: impl Into<String>,
-        bindings: impl IntoIterator<Item = RegistryFileBinding>,
+        bindings: impl IntoIterator<Item = RegistryObjectBinding>,
     ) -> Self {
         Self {
             client,
@@ -430,7 +558,7 @@ impl RegistryMultipartStore {
             files: Arc::new(
                 bindings
                     .into_iter()
-                    .map(|binding| (binding.object_key, binding.server_file_id))
+                    .map(|binding| (binding.object_key, binding.server_object_id))
                     .collect(),
             ),
         }
@@ -444,7 +572,7 @@ impl RegistryMultipartStore {
 
     fn endpoint(&self, file_id: Uuid, suffix: &str) -> String {
         format!(
-            "{}/api/v1/transfers/{}/files/{file_id}/multipart{suffix}",
+            "{}/api/v1/transfers/{}/objects/{file_id}/multipart{suffix}",
             self.client.base_url, self.server_transfer_id
         )
     }
@@ -580,7 +708,7 @@ impl MultipartStore for RegistryMultipartStore {
             .registry_json(
                 self.client
                     .authorized(self.client.http.get(format!(
-                        "{}/api/v1/transfers/{}/files/{file_id}/object",
+                        "{}/api/v1/transfers/{}/objects/{file_id}/object",
                         self.client.base_url, self.server_transfer_id
                     )))
                     .map_err(map_registry_error)?,
@@ -627,7 +755,12 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        path::PathBuf,
+        sync::atomic::{AtomicBool, Ordering},
+    };
 
     use courier_core::FileStatus;
 
@@ -664,5 +797,67 @@ mod tests {
             map_status(StatusCode::UNPROCESSABLE_ENTITY, String::new()),
             StoreError::Permanent(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn renewable_client_refreshes_after_unauthorized_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for (index, expected) in [
+                "/api/v1/transfers/ISC-TR-TEST",
+                "/api/v1/auth/sessions/refresh",
+                "/api/v1/transfers/ISC-TR-TEST",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let count = stream.read(&mut buffer).unwrap();
+                    request.extend_from_slice(&buffer[..count]);
+                    if request.windows(4).any(|value| value == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                assert!(request.contains(expected));
+                let (status, body) = match index {
+                    0 => ("401 Unauthorized", r#"{"detail":"expired"}"#),
+                    1 => (
+                        "200 OK",
+                        r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_at":"2030-01-01T00:00:00Z","refresh_expires_at":"2030-02-01T00:00:00Z","projects":[]}"#,
+                    ),
+                    _ => (
+                        "200 OK",
+                        r#"{"transfer_id":"ISC-TR-TEST","status":"complete","manifest_sha256":null,"verification_attempt_count":1,"verification_error":null}"#,
+                    ),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let observed = Arc::new(AtomicBool::new(false));
+        let observer_flag = observed.clone();
+        let client = RegistryClient::renewable(
+            format!("http://{address}"),
+            "old-access",
+            "old-refresh",
+            Arc::new(move |session| {
+                assert_eq!(session.refresh_token, "new-refresh");
+                observer_flag.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+        );
+
+        let status = client.transfer_status("ISC-TR-TEST").await.unwrap();
+        assert_eq!(status.status, "complete");
+        assert!(observed.load(Ordering::SeqCst));
+        server.join().unwrap();
     }
 }

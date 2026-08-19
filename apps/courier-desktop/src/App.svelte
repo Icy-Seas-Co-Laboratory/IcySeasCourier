@@ -24,6 +24,7 @@
   }
 
   let step: Step = "invite";
+  let registryUrl = "http://127.0.0.1:8010";
   let invitation = "";
   let projectId = "";
   let projects: RegistryProject[] = [];
@@ -41,6 +42,7 @@
 
   onMount(() => {
     void loadTransfers();
+    void loadRegistryEndpoint();
     void restoreAuthorization();
     let unlistenProgress: UnlistenFn | undefined;
     let unlistenInventory: UnlistenFn | undefined;
@@ -63,6 +65,14 @@
       unlistenInventory?.();
     };
   });
+
+  async function loadRegistryEndpoint() {
+    try {
+      registryUrl = await invoke<string>("registry_endpoint");
+    } catch (reason) {
+      error = message(reason);
+    }
+  }
 
   async function refreshVerificationStatus() {
     if (!current || (current.status !== "finalizing" && current.status !== "verifying")) return;
@@ -96,6 +106,10 @@
 
   async function acceptInvitation() {
     error = "";
+    if (!registryUrl.trim()) {
+      error = "Enter the Registry address supplied by Icy Seas.";
+      return;
+    }
     if (!invitation.trim()) {
       error = "Enter the upload invitation supplied by Icy Seas.";
       return;
@@ -103,6 +117,7 @@
     busy = true;
     try {
       const authorization = await invoke<RegistryAuthorization>("exchange_invitation", {
+        registryUrl: registryUrl.trim(),
         invitationCode: invitation.trim(),
       });
       applyAuthorization(authorization);
@@ -117,6 +132,7 @@
 
   function applyAuthorization(value: RegistryAuthorization) {
     authorization = value;
+    registryUrl = value.registryUrl;
     projects = value.projects.filter((project) => project.status === "active");
     if (!projects.some((project) => project.project_code === projectId)) {
       projectId = projects[0]?.project_code ?? "";
@@ -256,6 +272,9 @@
         <p class="eyebrow">Secure data delivery</p>
         <h1>Send a dataset to Icy Seas</h1>
         <p class="lede">Courier keeps a durable local record so large scientific transfers can recover from interrupted connections.</p>
+        <label for="registry-url">Registry address</label>
+        <input id="registry-url" type="url" bind:value={registryUrl} placeholder="https://courier.example.org" autocomplete="url" autocapitalize="none" spellcheck="false" />
+        <p class="hint">Use the HTTPS address supplied with your beta invitation. Local development may use localhost.</p>
         <label for="invitation">Upload invitation</label>
         <input id="invitation" bind:value={invitation} placeholder="ISC-A7F4-KQ92-XT81" autocomplete="off" onkeydown={(event) => event.key === "Enter" && void acceptInvitation()} />
         <p class="hint">The invitation authorizes a new upload. It does not provide access to other project data.</p>
@@ -265,7 +284,7 @@
       <section class="panel">
         <p class="eyebrow">Prepare transfer</p>
         <h1>Choose the source dataset</h1>
-        {#if authorization}<div class="session-banner"><i></i><span><strong>Registry authorized</strong><small>{projects.length} active {projects.length === 1 ? "project" : "projects"} · session renews automatically</small></span></div>{/if}
+        {#if authorization}<div class="session-banner"><i></i><span><strong>Registry authorized</strong><small>{projects.length} active {projects.length === 1 ? "project" : "projects"} · {authorization.registryUrl} · session renews automatically</small></span></div>{/if}
         <div class="field-grid">
           <div>
             <label for="project">Authorized project</label>

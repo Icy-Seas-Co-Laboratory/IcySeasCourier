@@ -133,7 +133,7 @@ class TransferCreate(BaseModel):
     source_name: str = Field(min_length=1, max_length=512)
     file_count: int = Field(ge=0)
     original_bytes: int = Field(ge=0)
-    manifest_version: int = Field(default=1, ge=1)
+    manifest_version: Literal[3] = 3
     courier_version: str = Field(min_length=1, max_length=40)
     idempotency_key: str = Field(min_length=8, max_length=100)
     hash_algorithm: HashAlgorithm = "sha256"
@@ -153,7 +153,7 @@ class TransferResponse(ORMModel):
 class ManifestCourier(BaseModel):
     version: str = Field(min_length=1, max_length=40)
     platform: str = Field(min_length=1, max_length=100)
-    transport_encoding_version: Literal[1]
+    transport_encoding_version: Literal[2]
 
 
 class ManifestSource(BaseModel):
@@ -165,18 +165,25 @@ class ManifestSummary(BaseModel):
     original_bytes: int = Field(ge=0)
 
 
-class ManifestTransport(BaseModel):
+class ManifestTransportObject(BaseModel):
+    id: uuid.UUID
+    kind: Literal["file", "pack"]
     compression: Literal["none", "zstd"]
-    encoding_version: Literal[1]
+    encoding_version: Literal[1, 2]
+    original_bytes: int = Field(ge=0)
+
+
+class ManifestFileTransport(BaseModel):
+    object_id: uuid.UUID
+    member_index: int = Field(ge=0)
 
 
 class ManifestFile(BaseModel):
     path: str = Field(min_length=1, max_length=4096)
     size: int = Field(ge=0)
     mtime: datetime
-    sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
-    digest: "ManifestDigest | None" = None
-    transport: ManifestTransport
+    digest: "ManifestDigest"
+    transport: ManifestFileTransport
 
     @field_validator("path")
     @classmethod
@@ -209,13 +216,14 @@ class TransferManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     schema_name: Literal["icy-seas-transfer-manifest"] = Field(alias="schema")
-    version: Literal[1, 2]
+    version: Literal[3]
     transfer_id: str = Field(min_length=1, max_length=80)
     project: str = Field(pattern=r"^P[0-9]{5}$")
     created_at: datetime
     courier: ManifestCourier
     source: ManifestSource
     summary: ManifestSummary
+    transport_objects: list[ManifestTransportObject]
     files: list[ManifestFile]
 
     @model_validator(mode="after")
@@ -227,11 +235,34 @@ class TransferManifest(BaseModel):
         paths = [file.path for file in self.files]
         if len(paths) != len(set(paths)):
             raise ValueError("file paths must be unique")
+        objects = {item.id: item for item in self.transport_objects}
+        if len(objects) != len(self.transport_objects):
+            raise ValueError("transport object IDs must be unique")
+        members: dict[uuid.UUID, list[ManifestFile]] = {object_id: [] for object_id in objects}
         for file in self.files:
-            if self.version == 1 and (file.sha256 is None or file.digest is not None):
-                raise ValueError("manifest v1 files require sha256")
-            if self.version == 2 and (file.digest is None or file.sha256 is not None):
-                raise ValueError("manifest v2 files require digest")
+            if file.transport.object_id not in objects:
+                raise ValueError("file references an unknown transport object")
+            members[file.transport.object_id].append(file)
+        for object_id, item in objects.items():
+            object_members = members[object_id]
+            if not object_members:
+                raise ValueError("every transport object must contain at least one file")
+            indexes = sorted(file.transport.member_index for file in object_members)
+            if indexes != list(range(len(object_members))):
+                raise ValueError("transport member indexes must be contiguous from zero")
+            if sum(file.size for file in object_members) != item.original_bytes:
+                raise ValueError("transport object byte count does not match its files")
+            if item.kind == "file" and (
+                len(object_members) != 1
+                or indexes != [0]
+                or item.compression != "none"
+                or item.encoding_version != 1
+            ):
+                raise ValueError(
+                    "file transport objects require one uncompressed member at index zero"
+                )
+            if item.kind == "pack" and (item.compression != "zstd" or item.encoding_version != 2):
+                raise ValueError("pack transport objects require zstd encoding version 2")
         return self
 
 
@@ -244,11 +275,22 @@ class TransferFileResponse(ORMModel):
     status: str
 
 
+class TransferObjectResponse(ORMModel):
+    id: uuid.UUID
+    kind: str
+    compression: str
+    encoding_version: int
+    original_bytes: int
+    object_key: str
+    status: str
+
+
 class ManifestResponse(BaseModel):
     transfer_id: str
     manifest_sha256: str
     submitted_at: datetime
     files: list[TransferFileResponse]
+    transport_objects: list[TransferObjectResponse]
 
 
 class MultipartResponse(BaseModel):

@@ -4,7 +4,7 @@ Courier is client-first and library-first. `courier-core` owns inventory, integr
 
 SQLite is the durable local source of truth. WAL mode and transactional file/part updates allow an interrupted process to discover incomplete transfers and continue from confirmed part state. Absolute paths exist only in local state; manifests will contain preserved relative paths.
 
-The transfer data plane will use standard S3 multipart semantics against SeaweedFS. The later Data Registry will remain a small control plane that authorizes narrowly scoped direct uploads and verifies reconstructed logical files. FastAPI will never proxy dataset bytes.
+The transfer data plane uses standard S3 multipart semantics against local SeaweedFS. The Data Registry is a small control plane that accepts manifest v3 only, authorizes narrowly scoped direct transport-object uploads, and verifies reconstructed logical files. FastAPI never proxies dataset bytes.
 
 ## Current increment
 
@@ -28,6 +28,6 @@ The Tauri 2 application is a thin interface adapter. Native folder selection hap
 
 Desktop progress is emitted only after a part ETag is committed locally. Pause is cooperative: an in-flight request is allowed to resolve, its result is persisted, and the engine stops before beginning another part. Resume uses the ordinary remote-authoritative reconciliation path, so application restarts and user pauses share one recovery mechanism.
 
-## Next client increment
+## Registry and transport boundary
 
-The Rust Courier client connects to Registry invitation exchange, renewable session rotation, transfer registration, immutable manifest submission, Registry-issued multipart authorization, and verification status. SQLite remains the recovery source of truth for non-secret metadata and Registry identities; rotating access and refresh credentials live in the operating system credential vault. The PostgreSQL-backed ingest worker claims finalized transfers, streams and reconstructs logical objects, records verification evidence, and alone advances a transfer to `complete`.
+The Rust Courier client connects to Registry invitation exchange, renewable session rotation (including renewal during active uploads), transfer registration, immutable v3 manifest submission, Registry-issued multipart authorization, and verification status. During inventory it groups eligible small files into cached, deterministic `ISCPACK1` zstd objects while leaving singleton and large files standalone. SQLite remains the recovery source of truth for logical-to-transport membership, multipart progress, non-secret metadata, and Registry identities; rotating access and refresh credentials live in the operating system credential vault. The PostgreSQL-backed ingest worker claims finalized transfers, streams standalone objects or reconstructs packs, records verification evidence for each logical file, and alone advances a transfer to `complete`.

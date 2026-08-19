@@ -83,7 +83,7 @@ def client(
     database_factory: sessionmaker[Session],
     fake_storage: FakeObjectStorage,
 ) -> Generator[TestClient]:
-    app = create_app()
+    app = create_app(settings)
 
     def override_session():
         with database_factory() as database:
@@ -92,5 +92,5 @@ def client(
     app.dependency_overrides[get_session] = override_session
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_object_storage] = lambda: fake_storage
-    with TestClient(app) as test_client:
+    with TestClient(app, client=("127.0.0.1", 50000)) as test_client:
         yield test_client

@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for incremental implementation.
+Implemented.
 
 ## Context
 
@@ -10,13 +10,13 @@ Uploading thousands of small scientific files as separate S3 objects creates exc
 
 ## Decision
 
-Courier may group files no larger than 8 MiB into deterministic packs targeting 128 MiB of original content. Candidates are ordered by normalized relative path. Large files remain standalone transport objects.
+Courier may group files no larger than 8 MiB into deterministic packs targeting 64 MiB of original content. Candidates are ordered by normalized relative path. Large files remain standalone transport objects.
 
 Each pack is an independently retryable Zstandard frame using the versioned `ISCPACK1` format. It contains a sequence of metadata headers followed by exact logical-file bytes. Headers record the normalized path, size, digest algorithm, and digest. Encoding streams from the source and does not build an uncompressed archive or dataset-sized temporary file.
 
-The immutable manifest remains a logical-file manifest. Manifest v3 will map each logical file to a server-generated transport object and member position. The ingest worker must stream every pack, reject missing, duplicate, reordered, or unexpected members, and verify each logical file independently.
+The immutable manifest remains a logical-file manifest. Manifest v3 maps each logical file to a client-planned transport object and member position; the Registry assigns the opaque storage key. The ingest worker streams every pack, rejects missing, duplicate, reordered, or unexpected members, and verifies each logical file independently.
 
-Existing manifest v1 and v2 transfers remain one-object-per-file and resumable under their original transport plan.
+Manifest v3 is the sole accepted transfer contract. Earlier manifest versions are intentionally rejected as a breaking change.
 
 ## Consequences
 

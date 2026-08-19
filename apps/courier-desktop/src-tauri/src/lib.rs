@@ -1,19 +1,23 @@
 use std::{
     collections::HashMap,
-    fs,
-    path::PathBuf,
+    fs::{self, File},
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::UNIX_EPOCH,
 };
 
 use courier_core::{
-    HashAlgorithm, InventoryOptions, RegistrySessionRecord, RetryPolicy, Transfer, TransferStatus,
-    TransferStore, inventory_transfer_observed,
+    FileRecord, FileStatus, HashAlgorithm, InventoryOptions, RegistrySessionRecord, RetryPolicy,
+    Transfer, TransferStatus, TransferStore, TransportMemberRecord, TransportObjectKind,
+    TransportObjectRecord, inventory_transfer_observed,
 };
+use courier_pack::{PackOptions, encode_pack, plan_packs};
 use courier_registry::{
-    RegistryClient, RegistryFileBinding, RegistryMultipartStore, RegistryProject,
+    ManifestTransportPlan, RegistryClient, RegistryMultipartStore, RegistryObjectBinding,
+    RegistryProject,
 };
 use courier_transfer::{
     MultipartLimits, PartUploadEvent, UploadError, UploadObserver, complete_uploaded_file,
@@ -21,6 +25,7 @@ use courier_transfer::{
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
+use url::{Host, Url};
 use uuid::Uuid;
 
 #[derive(Default)]
@@ -52,6 +57,7 @@ struct InventoryProgressEvent {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RegistryAuthorization {
+    registry_url: String,
     expires_at: chrono::DateTime<chrono::Utc>,
     projects: Vec<RegistryProject>,
     hash_algorithm: HashAlgorithm,
@@ -116,6 +122,7 @@ fn persist_registry_session(
 async fn active_registry_session(
     store: &TransferStore,
     base_url: &str,
+    database: &std::path::Path,
 ) -> Result<(RegistryClient, RegistrySessionRecord), String> {
     let metadata = store
         .registry_session(base_url)
@@ -129,8 +136,18 @@ async fn active_registry_session(
         return Err("Registry authorization expired; enter a new invitation".into());
     }
     if metadata.expires_at > chrono::Utc::now() + chrono::Duration::minutes(5) {
+        let observer_database = database.to_path_buf();
+        let observer_url = base_url.to_owned();
         return Ok((
-            RegistryClient::authenticated(base_url, credentials.access_token),
+            RegistryClient::renewable(
+                base_url,
+                credentials.access_token,
+                credentials.refresh_token,
+                Arc::new(move |session| {
+                    let store = TransferStore::open(&observer_database).map_err(display)?;
+                    persist_registry_session(&store, &observer_url, session)
+                }),
+            ),
             metadata,
         ));
     }
@@ -140,30 +157,86 @@ async fn active_registry_session(
         .map_err(display)?;
     persist_registry_session(store, base_url, &refreshed)?;
     let metadata = session_record(base_url.to_owned(), &refreshed)?;
+    let observer_database = database.to_path_buf();
+    let observer_url = base_url.to_owned();
     Ok((
-        RegistryClient::authenticated(base_url, refreshed.access_token),
+        RegistryClient::renewable(
+            base_url,
+            refreshed.access_token,
+            refreshed.refresh_token,
+            Arc::new(move |session| {
+                let store = TransferStore::open(&observer_database).map_err(display)?;
+                persist_registry_session(&store, &observer_url, session)
+            }),
+        ),
         metadata,
     ))
 }
 
-fn registry_url() -> String {
-    std::env::var("COURIER_REGISTRY_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8010".into())
-        .trim_end_matches('/')
-        .to_owned()
+fn normalize_registry_url(value: &str) -> Result<String, String> {
+    let parsed = Url::parse(value.trim()).map_err(|_| "Enter a valid Registry URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("Registry URL must use HTTPS".into());
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !matches!(parsed.path(), "" | "/")
+    {
+        return Err("Registry URL must contain only a scheme, host, and optional port".into());
+    }
+    let host = parsed
+        .host()
+        .ok_or_else(|| "Registry URL must include a host".to_string())?;
+    let is_loopback = match host {
+        Host::Domain(name) => name.eq_ignore_ascii_case("localhost"),
+        Host::Ipv4(address) => address.is_loopback(),
+        Host::Ipv6(address) => address.is_loopback(),
+    };
+    if parsed.scheme() != "https" && !is_loopback {
+        return Err("Remote Registry connections require HTTPS".into());
+    }
+    Ok(parsed.origin().ascii_serialization())
+}
+
+fn default_registry_url() -> Result<String, String> {
+    normalize_registry_url(
+        &std::env::var("COURIER_REGISTRY_URL").unwrap_or_else(|_| "http://127.0.0.1:8010".into()),
+    )
+}
+
+fn configured_registry_url(store: &TransferStore) -> Result<String, String> {
+    match store.active_registry().map_err(display)? {
+        Some(value) => normalize_registry_url(&value),
+        None => default_registry_url(),
+    }
+}
+
+#[tauri::command]
+async fn registry_endpoint(app: AppHandle) -> Result<String, String> {
+    let database = database_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = TransferStore::open(database).map_err(display)?;
+        configured_registry_url(&store)
+    })
+    .await
+    .map_err(|error| format!("Registry setting lookup failed: {error}"))?
 }
 
 #[tauri::command]
 async fn exchange_invitation(
     app: AppHandle,
+    registry_url: String,
     invitation_code: String,
 ) -> Result<RegistryAuthorization, String> {
-    let base_url = registry_url();
+    let base_url = normalize_registry_url(&registry_url)?;
     let remote = RegistryClient::unauthenticated(&base_url)
         .exchange_invitation(invitation_code.trim(), "courier-desktop")
         .await
         .map_err(display)?;
     let authorization = RegistryAuthorization {
+        registry_url: base_url.clone(),
         expires_at: remote.expires_at,
         projects: remote.projects.clone(),
         hash_algorithm: RegistryClient::unauthenticated(&base_url)
@@ -174,8 +247,9 @@ async fn exchange_invitation(
     };
     let database = database_path(&app)?;
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
-        let store = TransferStore::open(database).map_err(display)?;
-        persist_registry_session(&store, &base_url, &remote)
+        let store = TransferStore::open(&database).map_err(display)?;
+        persist_registry_session(&store, &base_url, &remote)?;
+        store.set_active_registry(&base_url).map_err(display)
     })
     .await
     .map_err(|error| format!("Session save failed: {error}"))?
@@ -186,12 +260,13 @@ async fn exchange_invitation(
 #[tauri::command]
 async fn current_authorization(app: AppHandle) -> Result<Option<RegistryAuthorization>, String> {
     let database = database_path(&app)?;
-    let base_url = registry_url();
     tauri::async_runtime::spawn_blocking(move || {
-        let store = TransferStore::open(database).map_err(display)?;
+        let store = TransferStore::open(&database).map_err(display)?;
+        let base_url = configured_registry_url(&store)?;
         tauri::async_runtime::block_on(async {
-            match active_registry_session(&store, &base_url).await {
+            match active_registry_session(&store, &base_url, &database).await {
                 Ok((_, record)) => Ok(Some(RegistryAuthorization {
+                    registry_url: base_url.clone(),
                     expires_at: record.expires_at,
                     projects: serde_json::from_str(&record.projects_json).map_err(display)?,
                     hash_algorithm: RegistryClient::unauthenticated(&base_url)
@@ -222,6 +297,9 @@ struct DesktopObserver {
     base_confirmed: u64,
     total: u64,
     current_file: String,
+    object_original_bytes: u64,
+    object_transport_bytes: u64,
+    object_confirmed_transport_bytes: AtomicU64,
 }
 
 impl UploadObserver for DesktopObserver {
@@ -230,10 +308,14 @@ impl UploadObserver for DesktopObserver {
     }
 
     fn part_confirmed(&self, event: PartUploadEvent) {
-        let confirmed = self
-            .confirmed
+        let object_confirmed = self
+            .object_confirmed_transport_bytes
             .fetch_add(event.source_bytes, Ordering::Relaxed)
             .saturating_add(event.source_bytes);
+        let confirmed = self
+            .base_confirmed
+            .saturating_add(self.scaled(object_confirmed));
+        self.confirmed.store(confirmed, Ordering::Relaxed);
         let _ = self.app.emit(
             "courier://progress",
             TransferProgressEvent {
@@ -247,7 +329,11 @@ impl UploadObserver for DesktopObserver {
     }
 
     fn reconciled(&self, source_bytes_confirmed: u64) {
-        let confirmed = self.base_confirmed.saturating_add(source_bytes_confirmed);
+        self.object_confirmed_transport_bytes
+            .store(source_bytes_confirmed, Ordering::Relaxed);
+        let confirmed = self
+            .base_confirmed
+            .saturating_add(self.scaled(source_bytes_confirmed));
         self.confirmed.store(confirmed, Ordering::Relaxed);
         let _ = self.app.emit(
             "courier://progress",
@@ -260,6 +346,155 @@ impl UploadObserver for DesktopObserver {
             },
         );
     }
+}
+
+impl DesktopObserver {
+    fn scaled(&self, transport_bytes: u64) -> u64 {
+        if self.object_transport_bytes == 0 || transport_bytes >= self.object_transport_bytes {
+            self.object_original_bytes
+        } else {
+            ((transport_bytes as u128 * self.object_original_bytes as u128)
+                / self.object_transport_bytes as u128) as u64
+        }
+    }
+}
+
+fn modified_ns(path: &Path) -> Result<i64, String> {
+    let modified = path
+        .metadata()
+        .map_err(display)?
+        .modified()
+        .map_err(display)?;
+    let duration = modified.duration_since(UNIX_EPOCH).map_err(display)?;
+    i64::try_from(duration.as_secs() as i128 * 1_000_000_000_i128 + duration.subsec_nanos() as i128)
+        .map_err(display)
+}
+
+fn remove_completed_pack_cache(store: &TransferStore, transfer_id: Uuid) {
+    let Ok(objects) = store.transport_objects(transfer_id) else {
+        return;
+    };
+    let mut directories = Vec::new();
+    for path in objects.into_iter().filter_map(|object| object.cache_path) {
+        if let Some(parent) = path.parent() {
+            directories.push(parent.to_path_buf());
+        }
+        if let Err(error) = fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "Could not remove completed Courier pack {}: {error}",
+                path.display()
+            );
+        }
+    }
+    directories.sort();
+    directories.dedup();
+    for directory in directories {
+        if let Err(error) = fs::remove_dir(&directory)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "Could not remove completed Courier pack directory {}: {error}",
+                directory.display()
+            );
+        }
+    }
+}
+
+struct PreparedTransportPlan {
+    objects: Vec<TransportObjectRecord>,
+    members: Vec<TransportMemberRecord>,
+    upload_sources: Vec<FileRecord>,
+}
+
+fn prepare_transport_plan(
+    transfer_id: Uuid,
+    files: &[FileRecord],
+    cache_root: &Path,
+) -> Result<PreparedTransportPlan, String> {
+    let options = PackOptions::default();
+    let plan = plan_packs(files, options).map_err(display)?;
+    let pack_directory = cache_root.join("packs").join(transfer_id.to_string());
+    if !plan.packs.is_empty() {
+        fs::create_dir_all(&pack_directory).map_err(display)?;
+    }
+    let mut objects = Vec::new();
+    let mut members = Vec::new();
+    let mut upload_sources = Vec::new();
+
+    for pack in plan.packs {
+        let object_id = Uuid::new_v4();
+        let destination = pack_directory.join(format!("{object_id}.iscpack.zst"));
+        let temporary = pack_directory.join(format!("{object_id}.tmp"));
+        let result = (|| -> Result<(), String> {
+            let mut output = File::create(&temporary).map_err(display)?;
+            encode_pack(&pack, &mut output, options.zstd_level).map_err(display)?;
+            output.sync_all().map_err(display)?;
+            fs::rename(&temporary, &destination).map_err(display)
+        })();
+        if let Err(error) = result {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        let transport_bytes = destination.metadata().map_err(display)?.len();
+        let original_bytes = pack
+            .iter()
+            .fold(0_u64, |total, file| total.saturating_add(file.size));
+        objects.push(TransportObjectRecord {
+            id: object_id,
+            transfer_id,
+            kind: TransportObjectKind::Pack,
+            compression: "zstd".into(),
+            encoding_version: 2,
+            original_bytes,
+            transport_bytes: Some(transport_bytes),
+            cache_path: Some(destination.clone()),
+        });
+        for (member_index, file) in pack.iter().enumerate() {
+            members.push(TransportMemberRecord {
+                object_id,
+                file_id: file.id,
+                member_index: member_index as u32,
+            });
+        }
+        upload_sources.push(FileRecord {
+            id: object_id,
+            transfer_id,
+            relative_path: PathBuf::from(format!("Courier pack {object_id}")),
+            absolute_path: destination.clone(),
+            size: transport_bytes,
+            mtime_ns: modified_ns(&destination)?,
+            hash_algorithm: HashAlgorithm::Sha256,
+            sha256: String::new(),
+            status: FileStatus::Ready,
+            bytes_completed: 0,
+        });
+    }
+
+    for file in plan.standalone {
+        objects.push(TransportObjectRecord {
+            id: file.id,
+            transfer_id,
+            kind: TransportObjectKind::File,
+            compression: "none".into(),
+            encoding_version: 1,
+            original_bytes: file.size,
+            transport_bytes: Some(file.size),
+            cache_path: None,
+        });
+        members.push(TransportMemberRecord {
+            object_id: file.id,
+            file_id: file.id,
+            member_index: 0,
+        });
+        upload_sources.push(file.clone());
+    }
+    Ok(PreparedTransportPlan {
+        objects,
+        members,
+        upload_sources,
+    })
 }
 
 #[tauri::command]
@@ -275,9 +510,13 @@ async fn create_inventory(
         let source = PathBuf::from(&source_path)
             .canonicalize()
             .map_err(|error| format!("Could not open source: {error}"))?;
-        let mut store = TransferStore::open(database).map_err(display)?;
+        let mut store = TransferStore::open(&database).map_err(display)?;
+        let base_url = configured_registry_url(&store)?;
         let transfer = Transfer::draft(source.clone(), project_id);
         store.create_transfer(&transfer).map_err(display)?;
+        store
+            .bind_transfer_registry(transfer.id, &base_url)
+            .map_err(display)?;
         store
             .transition(transfer.id, TransferStatus::Inventorying)
             .map_err(display)?;
@@ -306,10 +545,19 @@ async fn create_inventory(
                 store
                     .replace_inventory(transfer.id, &files)
                     .map_err(display)?;
-                for file in &files {
-                    let parts = plan_parts(file.id, file.size, MultipartLimits::default())
+                let cache_root = database
+                    .parent()
+                    .ok_or_else(|| "Courier data directory is unavailable".to_string())?;
+                let plan = prepare_transport_plan(transfer.id, &files, cache_root)?;
+                store
+                    .replace_transport_plan(transfer.id, &plan.objects, &plan.members)
+                    .map_err(display)?;
+                for source in &plan.upload_sources {
+                    let parts = plan_parts(source.id, source.size, MultipartLimits::default())
                         .map_err(display)?;
-                    store.replace_part_plan(file.id, &parts).map_err(display)?;
+                    store
+                        .replace_part_plan(source.id, &parts)
+                        .map_err(display)?;
                 }
                 store
                     .transition(transfer.id, TransferStatus::Ready)
@@ -347,7 +595,7 @@ async fn list_transfers(app: AppHandle) -> Result<Vec<Transfer>, String> {
 async fn refresh_transfer_status(app: AppHandle, transfer_id: Uuid) -> Result<Transfer, String> {
     let database = database_path(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let store = TransferStore::open(database).map_err(display)?;
+        let store = TransferStore::open(&database).map_err(display)?;
         let transfer = store
             .get_transfer(transfer_id)
             .map_err(display)?
@@ -355,9 +603,12 @@ async fn refresh_transfer_status(app: AppHandle, transfer_id: Uuid) -> Result<Tr
         let Some(server_transfer_id) = transfer.server_transfer_id.as_deref() else {
             return Ok(transfer);
         };
-        let base_url = registry_url();
+        let base_url = match store.transfer_registry(transfer_id).map_err(display)? {
+            Some(value) => normalize_registry_url(&value)?,
+            None => configured_registry_url(&store)?,
+        };
         tauri::async_runtime::block_on(async {
-            let (client, _) = active_registry_session(&store, &base_url).await?;
+            let (client, _) = active_registry_session(&store, &base_url, &database).await?;
             let remote = client
                 .transfer_status(server_transfer_id)
                 .await
@@ -377,6 +628,9 @@ async fn refresh_transfer_status(app: AppHandle, transfer_id: Uuid) -> Result<Tr
             }
             if let Some(target) = target.filter(|target| *target != current) {
                 store.transition(transfer_id, target).map_err(display)?;
+            }
+            if remote.status == "complete" {
+                remove_completed_pack_cache(&store, transfer_id);
             }
             store
                 .get_transfer(transfer_id)
@@ -422,11 +676,16 @@ fn run_upload(
     transfer_id: Uuid,
     pause: Arc<AtomicBool>,
 ) -> Result<Transfer, String> {
-    let store = TransferStore::open(database).map_err(display)?;
+    let store = TransferStore::open(&database).map_err(display)?;
     let transfer = store
         .get_transfer(transfer_id)
         .map_err(display)?
         .ok_or_else(|| format!("Transfer not found: {transfer_id}"))?;
+    if transfer.manifest_version != 3 {
+        return Err(
+            "This transfer uses an unsupported legacy manifest; create a new transfer".into(),
+        );
+    }
     match transfer.status {
         TransferStatus::Ready | TransferStatus::Paused | TransferStatus::Interrupted => store
             .transition(transfer_id, TransferStatus::Uploading)
@@ -437,10 +696,73 @@ fn run_upload(
 
     let retry = RetryPolicy::default();
     let files = store.files_for_transfer(transfer_id).map_err(display)?;
+    let transport_objects = store.transport_objects(transfer_id).map_err(display)?;
+    let transport_members = store.transport_members(transfer_id).map_err(display)?;
+    if !files.is_empty() && transport_objects.is_empty() {
+        return Err("This transfer has no v3 transport plan; create a new transfer".into());
+    }
+    let files_by_id = files
+        .iter()
+        .map(|file| (file.id, file))
+        .collect::<HashMap<_, _>>();
+    let mut upload_sources = HashMap::new();
+    for object in &transport_objects {
+        let object_members = transport_members
+            .iter()
+            .filter(|member| member.object_id == object.id)
+            .collect::<Vec<_>>();
+        let source = match object.kind {
+            TransportObjectKind::File => {
+                let member = object_members
+                    .first()
+                    .ok_or_else(|| format!("Transport object {} has no member", object.id))?;
+                (*files_by_id.get(&member.file_id).ok_or_else(|| {
+                    format!("Transport object {} references a missing file", object.id)
+                })?)
+                .clone()
+            }
+            TransportObjectKind::Pack => {
+                let path = object.cache_path.clone().ok_or_else(|| {
+                    format!("Transport pack {} has no local cache path", object.id)
+                })?;
+                let size = path
+                    .metadata()
+                    .map_err(|error| {
+                        format!(
+                            "Could not open cached transport pack {}: {error}",
+                            path.display()
+                        )
+                    })?
+                    .len();
+                if object.transport_bytes != Some(size) {
+                    return Err(format!(
+                        "Cached transport pack {} changed; create a new transfer",
+                        path.display()
+                    ));
+                }
+                FileRecord {
+                    id: object.id,
+                    transfer_id,
+                    relative_path: PathBuf::from(format!("Courier pack {}", object.id)),
+                    absolute_path: path.clone(),
+                    size,
+                    mtime_ns: modified_ns(&path)?,
+                    hash_algorithm: HashAlgorithm::Sha256,
+                    sha256: String::new(),
+                    status: FileStatus::Ready,
+                    bytes_completed: 0,
+                }
+            }
+        };
+        upload_sources.insert(object.id, source);
+    }
     let confirmed = Arc::new(AtomicU64::new(0));
     let result: Result<(), String> = tauri::async_runtime::block_on(async {
-        let base_url = registry_url();
-        let (client, _) = active_registry_session(&store, &base_url).await?;
+        let base_url = match store.transfer_registry(transfer_id).map_err(display)? {
+            Some(value) => normalize_registry_url(&value)?,
+            None => configured_registry_url(&store)?,
+        };
+        let (client, _) = active_registry_session(&store, &base_url, &database).await?;
         let project_code = transfer
             .project_id
             .as_deref()
@@ -478,39 +800,53 @@ fn run_upload(
                 project_code,
                 source_name,
                 &files,
+                ManifestTransportPlan {
+                    objects: &transport_objects,
+                    members: &transport_members,
+                },
             )
             .await
             .map_err(display)?;
-        for local in &files {
-            let path = local.relative_path.to_string_lossy().replace('\\', "/");
+        for local in &transport_objects {
             let registered = receipt
-                .files
+                .transport_objects
                 .iter()
-                .find(|file| file.relative_path == path)
-                .ok_or_else(|| format!("Registry omitted manifest file {path}"))?;
+                .find(|object| object.id == local.id)
+                .ok_or_else(|| format!("Registry omitted transport object {}", local.id))?;
             store
-                .bind_registry_file(local.id, registered.id, &registered.object_key)
+                .bind_registry_object(local.id, registered.id, &registered.object_key)
                 .map_err(display)?;
         }
-        let bindings = files
+        let bindings = transport_objects
             .iter()
-            .map(|file| {
-                let (server_file_id, object_key) = store
-                    .registry_file_binding(file.id)
+            .map(|object| {
+                let (server_object_id, object_key) = store
+                    .registry_object_binding(object.id)
                     .map_err(display)?
-                    .ok_or_else(|| format!("Registry binding missing for {}", file.id))?;
-                Ok(RegistryFileBinding {
-                    server_file_id,
+                    .ok_or_else(|| format!("Registry binding missing for {}", object.id))?;
+                Ok(RegistryObjectBinding {
+                    server_object_id,
                     object_key,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
         let remote = RegistryMultipartStore::new(client.clone(), &server_transfer_id, bindings);
-        for file in &files {
-            if file.status == courier_core::FileStatus::Uploaded {
-                confirmed.fetch_add(file.size, Ordering::Relaxed);
+        for object in &transport_objects {
+            let object_members = transport_members
+                .iter()
+                .filter(|member| member.object_id == object.id)
+                .collect::<Vec<_>>();
+            if object_members.iter().all(|member| {
+                files_by_id
+                    .get(&member.file_id)
+                    .is_some_and(|file| file.status == FileStatus::Uploaded)
+            }) {
+                confirmed.fetch_add(object.original_bytes, Ordering::Relaxed);
                 continue;
             }
+            let source = upload_sources
+                .get(&object.id)
+                .ok_or_else(|| format!("Upload source missing for {}", object.id))?;
             let base_confirmed = confirmed.load(Ordering::Relaxed);
             let observer = DesktopObserver {
                 app: app.clone(),
@@ -519,18 +855,34 @@ fn run_upload(
                 confirmed: confirmed.clone(),
                 base_confirmed,
                 total: transfer.original_bytes,
-                current_file: file.relative_path.to_string_lossy().into_owned(),
+                current_file: match object.kind {
+                    TransportObjectKind::File => {
+                        source.relative_path.to_string_lossy().into_owned()
+                    }
+                    TransportObjectKind::Pack => {
+                        format!("Packing group ({} files)", object_members.len())
+                    }
+                },
+                object_original_bytes: object.original_bytes,
+                object_transport_bytes: source.size,
+                object_confirmed_transport_bytes: AtomicU64::new(0),
             };
-            upload_missing_parts_observed(&store, &remote, file, &retry, &observer)
+            upload_missing_parts_observed(&store, &remote, source, &retry, &observer)
                 .await
                 .map_err(display)?;
             if observer.should_pause() {
                 return Err(UploadError::Paused.to_string());
             }
-            complete_uploaded_file(&store, &remote, file, &retry)
+            complete_uploaded_file(&store, &remote, source, &retry)
                 .await
                 .map_err(display)?;
-            store.mark_file_uploaded(file.id).map_err(display)?;
+            for member in object_members {
+                store.mark_file_uploaded(member.file_id).map_err(display)?;
+            }
+            confirmed.store(
+                base_confirmed.saturating_add(object.original_bytes),
+                Ordering::Relaxed,
+            );
         }
         client
             .finalize_transfer(&server_transfer_id)
@@ -632,6 +984,7 @@ pub fn run() {
         .manage(RuntimeState::default())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            registry_endpoint,
             exchange_invitation,
             current_authorization,
             create_inventory,
@@ -642,4 +995,69 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Icy Seas Courier");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use courier_core::{InventoryOptions, inventory_transfer};
+    use courier_pack::decode_pack;
+
+    use super::*;
+
+    #[test]
+    fn registry_urls_require_https_except_on_loopback() {
+        assert_eq!(
+            normalize_registry_url(" https://registry.example.test:8443/ ").unwrap(),
+            "https://registry.example.test:8443"
+        );
+        assert_eq!(
+            normalize_registry_url("http://127.0.0.1:8010").unwrap(),
+            "http://127.0.0.1:8010"
+        );
+        assert!(normalize_registry_url("http://100.64.1.2:8010").is_err());
+        assert!(normalize_registry_url("https://user@registry.example.test").is_err());
+        assert!(normalize_registry_url("https://registry.example.test/prefix").is_err());
+    }
+
+    #[test]
+    fn small_files_become_a_cached_resumable_pack() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("a.csv"), b"a,1\n").unwrap();
+        fs::write(source.join("b.csv"), b"b,2\n").unwrap();
+        let transfer_id = Uuid::new_v4();
+        let files = inventory_transfer(transfer_id, &source, &InventoryOptions::default()).unwrap();
+
+        let plan = prepare_transport_plan(transfer_id, &files, directory.path()).unwrap();
+
+        assert_eq!(plan.objects.len(), 1);
+        assert_eq!(plan.objects[0].kind, TransportObjectKind::Pack);
+        assert_eq!(plan.members.len(), 2);
+        assert_eq!(plan.upload_sources.len(), 1);
+        assert_eq!(
+            plan.objects[0].transport_bytes,
+            Some(
+                plan.upload_sources[0]
+                    .absolute_path
+                    .metadata()
+                    .unwrap()
+                    .len()
+            )
+        );
+        let mut paths = Vec::new();
+        decode_pack(
+            File::open(&plan.upload_sources[0].absolute_path).unwrap(),
+            |header, reader| {
+                let mut bytes = Vec::new();
+                reader.read_to_end(&mut bytes)?;
+                paths.push(header.path);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(paths, ["a.csv", "b.csv"]);
+    }
 }

@@ -33,6 +33,7 @@ export interface RegistryProject {
 }
 
 export interface RegistryAuthorization {
+  registryUrl: string;
   expiresAt: string;
   projects: RegistryProject[];
   hashAlgorithm: "sha256" | "xxhash3" | "blake3";

@@ -16,9 +16,7 @@ depends_on = None
 
 def upgrade() -> None:
     op.add_column("courier_sessions", sa.Column("refresh_token_hash", sa.String(64)))
-    op.add_column(
-        "courier_sessions", sa.Column("refresh_expires_at", sa.DateTime(timezone=True))
-    )
+    op.add_column("courier_sessions", sa.Column("refresh_expires_at", sa.DateTime(timezone=True)))
     op.add_column("courier_sessions", sa.Column("revoked_at", sa.DateTime(timezone=True)))
     op.create_index(
         "ix_courier_sessions_refresh_token_hash",

@@ -4,9 +4,9 @@ The ingest worker is implemented by `data_registry.worker` and runs as a separat
 
 For each finalized transfer it:
 
-1. streams each opaque object from S3-compatible storage;
-2. decodes the declared transport compression;
-3. independently calculates logical byte size and SHA-256;
+1. streams each manifest-v3 transport object from local SeaweedFS;
+2. reads a standalone file or strictly reconstructs each member of an `ISCPACK1` pack;
+3. independently calculates logical byte size and the manifest-declared digest;
 4. compares both values to the immutable manifest;
 5. records file and attempt evidence plus an audit event;
 6. advances the transfer to `complete` only when every file matches.

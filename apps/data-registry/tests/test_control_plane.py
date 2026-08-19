@@ -55,6 +55,21 @@ def test_admin_key_is_required(client: TestClient) -> None:
     assert response.status_code == 401
 
 
+def test_admin_network_is_limited_to_loopback_and_vpn(client: TestClient) -> None:
+    with TestClient(client.app, client=("10.20.30.40", 50000)) as remote:
+        assert remote.get("/admin/").status_code == 403
+        assert remote.get("/api/v1/admin/projects", headers=ADMIN).status_code == 403
+        assert (
+            remote.get(
+                "/api/v1/admin/projects",
+                headers={**ADMIN, "X-Forwarded-For": "127.0.0.1"},
+            ).status_code
+            == 403
+        )
+    with TestClient(client.app, client=("100.64.22.9", 50000)) as vpn:
+        assert vpn.get("/admin/").status_code == 200
+
+
 def test_admin_console_and_operational_read_models(client: TestClient) -> None:
     console = client.get("/admin/")
     assert console.status_code == 200
@@ -106,15 +121,11 @@ def test_admin_transfer_listing_and_retry_guards(client: TestClient) -> None:
     assert listing.json()[0]["transfer_id"] == transfer["public_id"]
     assert listing.json()[0]["project_code"] == "P26014"
 
-    detail = client.get(
-        f"/api/v1/admin/transfers/{transfer['public_id']}", headers=ADMIN
-    )
+    detail = client.get(f"/api/v1/admin/transfers/{transfer['public_id']}", headers=ADMIN)
     assert detail.status_code == 200
     assert detail.json()["source_name"] == "admin-console-dataset"
 
-    retry = client.post(
-        f"/api/v1/admin/transfers/{transfer['public_id']}/retry", headers=ADMIN
-    )
+    retry = client.post(f"/api/v1/admin/transfers/{transfer['public_id']}/retry", headers=ADMIN)
     assert retry.status_code == 409
 
 
@@ -129,7 +140,7 @@ def test_invitation_exchange_and_idempotent_transfer_creation(client: TestClient
         "source_name": "2026_Chukchi_Cruise",
         "file_count": 12_489,
         "original_bytes": 1_840_000_000_000,
-        "manifest_version": 1,
+        "manifest_version": 3,
         "courier_version": "0.1.0",
         "idempotency_key": "local-transfer-123456",
     }
@@ -139,6 +150,47 @@ def test_invitation_exchange_and_idempotent_transfer_creation(client: TestClient
     repeated = client.post("/api/v1/transfers", headers=headers, json=payload)
     assert repeated.status_code == 200
     assert repeated.json()["public_id"] == first.json()["public_id"]
+
+
+def test_legacy_manifest_versions_are_rejected(client: TestClient) -> None:
+    create_project(client)
+    invitation = create_invitation(client)
+    session = exchange(client, invitation["invitation_code"])
+    response = client.post(
+        "/api/v1/transfers",
+        headers={"Authorization": f"Bearer {session['access_token']}"},
+        json={
+            "project_code": "P26014",
+            "source_name": "legacy",
+            "file_count": 1,
+            "original_bytes": 1,
+            "manifest_version": 2,
+            "courier_version": "0.1.0",
+            "idempotency_key": "legacy-transfer-version",
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_transfer_file_count_limit_is_enforced(client: TestClient, settings: Settings) -> None:
+    settings.maximum_transfer_files = 2
+    create_project(client)
+    invitation = create_invitation(client)
+    session = exchange(client, invitation["invitation_code"])
+    response = client.post(
+        "/api/v1/transfers",
+        headers={"Authorization": f"Bearer {session['access_token']}"},
+        json={
+            "project_code": "P26014",
+            "source_name": "too-many-files",
+            "file_count": 3,
+            "original_bytes": 3,
+            "manifest_version": 3,
+            "courier_version": "0.1.0",
+            "idempotency_key": "too-many-files-transfer",
+        },
+    )
+    assert response.status_code == 413
 
 
 def test_invitation_use_limit_and_revocation(client: TestClient) -> None:
@@ -230,6 +282,41 @@ def test_health_is_process_liveness_only(client: TestClient) -> None:
     assert client.get("/health").json() == {"status": "ok"}
 
 
+def test_request_body_and_authentication_rate_limits(
+    client: TestClient, settings: Settings
+) -> None:
+    settings.maximum_request_body_bytes = 8
+    oversized = client.post(
+        "/api/v1/auth/invitations/exchange",
+        content=b"0123456789",
+        headers={"Content-Type": "application/json"},
+    )
+    assert oversized.status_code == 413
+
+    settings.maximum_request_body_bytes = 1024
+    settings.authentication_requests_per_minute = 2
+    payload = {
+        "invitation_code": "ISC-AAAA-BBBB-CCCC",
+        "client_identifier": "rate-test",
+        "courier_version": "0.1.0",
+    }
+    assert client.post("/api/v1/auth/invitations/exchange", json=payload).status_code == 401
+    assert client.post("/api/v1/auth/invitations/exchange", json=payload).status_code == 401
+    limited = client.post("/api/v1/auth/invitations/exchange", json=payload)
+    assert limited.status_code == 429
+    assert limited.headers["Retry-After"] == "60"
+
+
+def test_general_client_api_rate_limit(client: TestClient, settings: Settings) -> None:
+    settings.client_requests_per_minute = 1
+
+    assert client.get("/api/v1/system/config").status_code == 200
+    limited = client.get("/api/v1/system/config")
+
+    assert limited.status_code == 429
+    assert limited.headers["Retry-After"] == "60"
+
+
 def test_manifest_is_immutable_and_drives_scoped_multipart_lifecycle(
     client: TestClient,
     settings: Settings,
@@ -249,32 +336,45 @@ def test_manifest_is_immutable_and_drives_scoped_multipart_lifecycle(
             "source_name": "cast-001",
             "file_count": 1,
             "original_bytes": len(content),
-            "manifest_version": 1,
+            "manifest_version": 3,
             "courier_version": "0.1.0",
             "idempotency_key": "manifest-lifecycle-001",
         },
     )
     transfer_id = transfer_response.json()["public_id"]
+    object_id = "4d5d7d7f-944f-4eef-a4d8-80d42c608dac"
     manifest = {
         "schema": "icy-seas-transfer-manifest",
-        "version": 1,
+        "version": 3,
         "transfer_id": transfer_id,
         "project": "P26014",
         "created_at": datetime.now(UTC).isoformat(),
         "courier": {
             "version": "0.1.0",
             "platform": "test",
-            "transport_encoding_version": 1,
+            "transport_encoding_version": 2,
         },
         "source": {"name": "cast-001"},
         "summary": {"file_count": 1, "original_bytes": len(content)},
+        "transport_objects": [
+            {
+                "id": object_id,
+                "kind": "file",
+                "compression": "none",
+                "encoding_version": 1,
+                "original_bytes": len(content),
+            }
+        ],
         "files": [
             {
                 "path": "casts/cast-001.csv",
                 "size": len(content),
                 "mtime": datetime.now(UTC).isoformat(),
-                "sha256": hashlib.sha256(content).hexdigest(),
-                "transport": {"compression": "none", "encoding_version": 1},
+                "digest": {
+                    "algorithm": "sha256",
+                    "value": hashlib.sha256(content).hexdigest(),
+                },
+                "transport": {"object_id": object_id, "member_index": 0},
             }
         ],
     }
@@ -282,8 +382,8 @@ def test_manifest_is_immutable_and_drives_scoped_multipart_lifecycle(
         f"/api/v1/transfers/{transfer_id}/manifest", headers=headers, json=manifest
     )
     assert submitted.status_code == 200
-    transfer_file = submitted.json()["files"][0]
-    assert "casts/cast-001.csv" not in transfer_file["object_key"]
+    transport_object = submitted.json()["transport_objects"][0]
+    assert "casts/cast-001.csv" not in transport_object["object_key"]
 
     repeated = client.put(
         f"/api/v1/transfers/{transfer_id}/manifest", headers=headers, json=manifest
@@ -291,29 +391,30 @@ def test_manifest_is_immutable_and_drives_scoped_multipart_lifecycle(
     assert repeated.status_code == 200
     changed = {**manifest, "created_at": (datetime.now(UTC) + timedelta(seconds=1)).isoformat()}
     assert (
-        client.put(f"/api/v1/transfers/{transfer_id}/manifest", headers=headers, json=changed)
-        .status_code
+        client.put(
+            f"/api/v1/transfers/{transfer_id}/manifest", headers=headers, json=changed
+        ).status_code
         == 409
     )
 
-    file_id = transfer_file["id"]
+    object_id = transport_object["id"]
     initiated = client.post(
-        f"/api/v1/transfers/{transfer_id}/files/{file_id}/multipart", headers=headers
+        f"/api/v1/transfers/{transfer_id}/objects/{object_id}/multipart", headers=headers
     )
     assert initiated.status_code == 201
     authorized = client.post(
-        f"/api/v1/transfers/{transfer_id}/files/{file_id}/multipart/parts/1/authorize",
+        f"/api/v1/transfers/{transfer_id}/objects/{object_id}/multipart/parts/1/authorize",
         headers=headers,
     )
     assert authorized.status_code == 200
     assert authorized.json()["method"] == "PUT"
     completed = client.post(
-        f"/api/v1/transfers/{transfer_id}/files/{file_id}/multipart/complete",
+        f"/api/v1/transfers/{transfer_id}/objects/{object_id}/multipart/complete",
         headers=headers,
         json={"parts": [{"part_number": 1, "etag": '"part-etag"', "size": len(content)}]},
     )
     assert completed.json()["status"] == "uploaded"
-    fake_storage.objects[transfer_file["object_key"]] = content
+    fake_storage.objects[transport_object["object_key"]] = content
     finalized = client.post(f"/api/v1/transfers/{transfer_id}/finalize", headers=headers)
     assert finalized.json()["status"] == "finalizing"
     with database_factory() as database:

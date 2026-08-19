@@ -22,7 +22,7 @@ impl Default for PackOptions {
     fn default() -> Self {
         Self {
             maximum_member_size: 8 * 1024 * 1024,
-            target_pack_size: 128 * 1024 * 1024,
+            target_pack_size: 64 * 1024 * 1024,
             zstd_level: 3,
         }
     }
@@ -82,15 +82,25 @@ pub fn plan_packs<'a>(
     for file in candidates {
         if !current.is_empty() && current_size.saturating_add(file.size) > options.target_pack_size
         {
-            packs.push(std::mem::take(&mut current));
+            let completed = std::mem::take(&mut current);
+            if completed.len() == 1 {
+                standalone.extend(completed);
+            } else {
+                packs.push(completed);
+            }
             current_size = 0;
         }
         current_size = current_size.saturating_add(file.size);
         current.push(file);
     }
     if !current.is_empty() {
-        packs.push(current);
+        if current.len() == 1 {
+            standalone.extend(current);
+        } else {
+            packs.push(current);
+        }
     }
+    standalone.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     Ok(PackPlan { packs, standalone })
 }
 
@@ -154,6 +164,14 @@ pub fn decode_pack(
         decoder.read_exact(&mut length)?;
         let length = u32::from_le_bytes(length) as usize;
         if length == 0 {
+            let mut trailing = [0_u8; 1];
+            if decoder.read(&mut trailing)? != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Courier pack contains trailing decoded bytes",
+                )
+                .into());
+            }
             return Ok(());
         }
         let mut encoded = vec![0; length];
@@ -220,11 +238,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(plan.packs.len(), 2);
+        assert_eq!(plan.packs.len(), 1);
         assert_eq!(plan.packs[0][0].relative_path, PathBuf::from("a"));
         assert_eq!(plan.packs[0][1].relative_path, PathBuf::from("b"));
-        assert_eq!(plan.packs[1][0].relative_path, PathBuf::from("c"));
-        assert_eq!(plan.standalone[0].relative_path, PathBuf::from("large"));
+        assert_eq!(plan.standalone[0].relative_path, PathBuf::from("c"));
+        assert_eq!(plan.standalone[1].relative_path, PathBuf::from("large"));
     }
 
     #[test]

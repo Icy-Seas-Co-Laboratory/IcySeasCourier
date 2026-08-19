@@ -65,6 +65,14 @@ impl TransferStore {
             self.conn
                 .execute_batch(include_str!("../migrations/007_transport_objects.sql"))?;
         }
+        if version < 8 {
+            self.conn
+                .execute_batch(include_str!("../migrations/008_manifest_v3_only.sql"))?;
+        }
+        if version < 9 {
+            self.conn
+                .execute_batch(include_str!("../migrations/009_registry_endpoints.sql"))?;
+        }
         Ok(())
     }
 
@@ -147,9 +155,24 @@ impl TransferStore {
 
     pub fn replace_part_plan(&mut self, file_id: Uuid, parts: &[PartRecord]) -> Result<()> {
         let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM parts WHERE file_id=?1", [file_id.to_string()])?;
-        for part in parts {
-            tx.execute("INSERT INTO parts (file_id,part_number,source_offset,source_length,transport_length,checksum,etag,attempt_count,status,last_error) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![part.file_id.to_string(), part.part_number, part.source_offset, part.source_length, part.transport_length, part.checksum, part.etag, part.attempt_count, part.status.to_string(), part.last_error])?;
+        let is_transport_object = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM transport_objects WHERE id=?1)",
+            [file_id.to_string()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if is_transport_object {
+            tx.execute(
+                "DELETE FROM transport_parts WHERE object_id=?1",
+                [file_id.to_string()],
+            )?;
+            for part in parts {
+                tx.execute("INSERT INTO transport_parts (object_id,part_number,source_offset,source_length,transport_length,checksum,etag,attempt_count,status,last_error) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![part.file_id.to_string(), part.part_number, part.source_offset, part.source_length, part.transport_length, part.checksum, part.etag, part.attempt_count, part.status.to_string(), part.last_error])?;
+            }
+        } else {
+            tx.execute("DELETE FROM parts WHERE file_id=?1", [file_id.to_string()])?;
+            for part in parts {
+                tx.execute("INSERT INTO parts (file_id,part_number,source_offset,source_length,transport_length,checksum,etag,attempt_count,status,last_error) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![part.file_id.to_string(), part.part_number, part.source_offset, part.source_length, part.transport_length, part.checksum, part.etag, part.attempt_count, part.status.to_string(), part.last_error])?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -259,8 +282,52 @@ impl TransferStore {
             .map_err(Into::into)
     }
 
+    pub fn bind_registry_object(
+        &self,
+        object_id: Uuid,
+        server_object_id: Uuid,
+        object_key: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE transport_objects SET server_object_id=?1, object_key=?2 WHERE id=?3",
+            params![
+                server_object_id.to_string(),
+                object_key,
+                object_id.to_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn registry_object_binding(&self, object_id: Uuid) -> Result<Option<(Uuid, String)>> {
+        self.conn
+            .query_row(
+                "SELECT server_object_id,object_key FROM transport_objects WHERE id=?1 AND server_object_id IS NOT NULL AND object_key IS NOT NULL",
+                [object_id.to_string()],
+                |row| {
+                    let id: String = row.get(0)?;
+                    let parsed = Uuid::parse_str(&id).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                    Ok((parsed, row.get(1)?))
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn parts_for_file(&self, file_id: Uuid) -> Result<Vec<PartRecord>> {
-        let mut stmt = self.conn.prepare("SELECT file_id,part_number,source_offset,source_length,transport_length,checksum,etag,attempt_count,status,last_error FROM parts WHERE file_id=?1 ORDER BY part_number")?;
+        let is_transport_object = self.has_transport_object(file_id)?;
+        let sql = if is_transport_object {
+            "SELECT object_id,part_number,source_offset,source_length,transport_length,checksum,etag,attempt_count,status,last_error FROM transport_parts WHERE object_id=?1 ORDER BY part_number"
+        } else {
+            "SELECT file_id,part_number,source_offset,source_length,transport_length,checksum,etag,attempt_count,status,last_error FROM parts WHERE file_id=?1 ORDER BY part_number"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map([file_id.to_string()], row_to_part)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
@@ -272,10 +339,17 @@ impl TransferStore {
         object_key: &str,
         upload_id: &str,
     ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE files SET object_key=?1, upload_id=?2 WHERE id=?3",
-            params![object_key, upload_id, file_id.to_string()],
-        )?;
+        if self.has_transport_object(file_id)? {
+            self.conn.execute(
+                "UPDATE transport_objects SET object_key=?1, upload_id=?2 WHERE id=?3",
+                params![object_key, upload_id, file_id.to_string()],
+            )?;
+        } else {
+            self.conn.execute(
+                "UPDATE files SET object_key=?1, upload_id=?2 WHERE id=?3",
+                params![object_key, upload_id, file_id.to_string()],
+            )?;
+        }
         Ok(())
     }
 
@@ -285,6 +359,44 @@ impl TransferStore {
             params![server_transfer_id, Utc::now().to_rfc3339(), id.to_string()],
         )?;
         Ok(())
+    }
+
+    pub fn bind_transfer_registry(&self, id: Uuid, base_url: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE transfers SET registry_url=?1, updated_at=?2 WHERE id=?3",
+            params![base_url, Utc::now().to_rfc3339(), id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn transfer_registry(&self, id: Uuid) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT registry_url FROM transfers WHERE id=?1 AND registry_url IS NOT NULL",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn set_active_registry(&self, base_url: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO app_settings (key,value,updated_at) VALUES ('active_registry_url',?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+            params![base_url, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn active_registry(&self) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='active_registry_url'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn bind_registry_file(
@@ -374,13 +486,23 @@ impl TransferStore {
     }
 
     pub fn upload_session(&self, file_id: Uuid) -> Result<Option<(String, String)>> {
-        self.conn.query_row("SELECT object_key,upload_id FROM files WHERE id=?1 AND object_key IS NOT NULL AND upload_id IS NOT NULL", [file_id.to_string()], |row| Ok((row.get(0)?, row.get(1)?))).optional().map_err(Into::into)
+        let table = if self.has_transport_object(file_id)? {
+            "transport_objects"
+        } else {
+            "files"
+        };
+        self.conn.query_row(&format!("SELECT object_key,upload_id FROM {table} WHERE id=?1 AND object_key IS NOT NULL AND upload_id IS NOT NULL"), [file_id.to_string()], |row| Ok((row.get(0)?, row.get(1)?))).optional().map_err(Into::into)
     }
 
     pub fn object_key(&self, file_id: Uuid) -> Result<Option<String>> {
+        let table = if self.has_transport_object(file_id)? {
+            "transport_objects"
+        } else {
+            "files"
+        };
         self.conn
             .query_row(
-                "SELECT object_key FROM files WHERE id=?1 AND object_key IS NOT NULL",
+                &format!("SELECT object_key FROM {table} WHERE id=?1 AND object_key IS NOT NULL"),
                 [file_id.to_string()],
                 |row| row.get(0),
             )
@@ -396,12 +518,21 @@ impl TransferStore {
         checksum: Option<&str>,
         transport_length: u64,
     ) -> Result<()> {
-        self.conn.execute("UPDATE parts SET status='complete', etag=?1, checksum=?2, transport_length=?3, attempt_count=attempt_count+1, last_attempt=?4, last_error=NULL WHERE file_id=?5 AND part_number=?6", params![etag, checksum, transport_length, Utc::now().to_rfc3339(), file_id.to_string(), part_number])?;
-        self.refresh_file_progress(file_id)
+        if self.has_transport_object(file_id)? {
+            self.conn.execute("UPDATE transport_parts SET status='complete', etag=?1, checksum=?2, transport_length=?3, attempt_count=attempt_count+1, last_attempt=?4, last_error=NULL WHERE object_id=?5 AND part_number=?6", params![etag, checksum, transport_length, Utc::now().to_rfc3339(), file_id.to_string(), part_number])?;
+            Ok(())
+        } else {
+            self.conn.execute("UPDATE parts SET status='complete', etag=?1, checksum=?2, transport_length=?3, attempt_count=attempt_count+1, last_attempt=?4, last_error=NULL WHERE file_id=?5 AND part_number=?6", params![etag, checksum, transport_length, Utc::now().to_rfc3339(), file_id.to_string(), part_number])?;
+            self.refresh_file_progress(file_id)
+        }
     }
 
     pub fn record_part_failure(&self, file_id: Uuid, part_number: u32, error: &str) -> Result<()> {
-        self.conn.execute("UPDATE parts SET status='failed', attempt_count=attempt_count+1, last_attempt=?1, last_error=?2 WHERE file_id=?3 AND part_number=?4", params![Utc::now().to_rfc3339(), error, file_id.to_string(), part_number])?;
+        if self.has_transport_object(file_id)? {
+            self.conn.execute("UPDATE transport_parts SET status='failed', attempt_count=attempt_count+1, last_attempt=?1, last_error=?2 WHERE object_id=?3 AND part_number=?4", params![Utc::now().to_rfc3339(), error, file_id.to_string(), part_number])?;
+        } else {
+            self.conn.execute("UPDATE parts SET status='failed', attempt_count=attempt_count+1, last_attempt=?1, last_error=?2 WHERE file_id=?3 AND part_number=?4", params![Utc::now().to_rfc3339(), error, file_id.to_string(), part_number])?;
+        }
         Ok(())
     }
 
@@ -415,15 +546,39 @@ impl TransferStore {
 
     pub fn reconcile_remote_parts(&self, file_id: Uuid, remote: &[(u32, String)]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
+        let is_transport_object = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM transport_objects WHERE id=?1)",
+            [file_id.to_string()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let (table, column) = if is_transport_object {
+            ("transport_parts", "object_id")
+        } else {
+            ("parts", "file_id")
+        };
         tx.execute(
-            "UPDATE parts SET status='pending', etag=NULL WHERE file_id=?1 AND status='complete'",
+            &format!("UPDATE {table} SET status='pending', etag=NULL WHERE {column}=?1 AND status='complete'"),
             [file_id.to_string()],
         )?;
         for (number, etag) in remote {
-            tx.execute("UPDATE parts SET status='complete', etag=?1, last_error=NULL WHERE file_id=?2 AND part_number=?3", params![etag, file_id.to_string(), number])?;
+            tx.execute(&format!("UPDATE {table} SET status='complete', etag=?1, last_error=NULL WHERE {column}=?2 AND part_number=?3"), params![etag, file_id.to_string(), number])?;
         }
         tx.commit()?;
-        self.refresh_file_progress(file_id)
+        if is_transport_object {
+            Ok(())
+        } else {
+            self.refresh_file_progress(file_id)
+        }
+    }
+
+    fn has_transport_object(&self, id: Uuid) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM transport_objects WHERE id=?1)",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     fn refresh_file_progress(&self, file_id: Uuid) -> Result<()> {
@@ -612,9 +767,51 @@ mod tests {
         store
             .replace_transport_plan(transfer.id, std::slice::from_ref(&object), &members)
             .unwrap();
+        let parts = [PartRecord {
+            file_id: object.id,
+            part_number: 1,
+            source_offset: 0,
+            source_length: 21,
+            transport_length: None,
+            checksum: None,
+            etag: None,
+            attempt_count: 0,
+            status: PartStatus::Pending,
+            last_error: None,
+        }];
+        store.replace_part_plan(object.id, &parts).unwrap();
+        let server_object_id = Uuid::new_v4();
+        store
+            .bind_registry_object(object.id, server_object_id, "incoming/pack/payload")
+            .unwrap();
+        store
+            .set_upload_session(object.id, "incoming/pack/payload", "upload-pack")
+            .unwrap();
+        store
+            .confirm_part(object.id, 1, "pack-etag", None, 21)
+            .unwrap();
 
-        assert_eq!(store.transport_objects(transfer.id).unwrap(), vec![object]);
+        assert_eq!(
+            store.transport_objects(transfer.id).unwrap(),
+            vec![object.clone()]
+        );
         assert_eq!(store.transport_members(transfer.id).unwrap(), members);
+        assert_eq!(
+            store.registry_object_binding(object.id).unwrap(),
+            Some((server_object_id, "incoming/pack/payload".into()))
+        );
+        assert_eq!(
+            store.upload_session(object.id).unwrap(),
+            Some(("incoming/pack/payload".into(), "upload-pack".into()))
+        );
+        assert_eq!(
+            store.parts_for_file(object.id).unwrap()[0].status,
+            PartStatus::Complete
+        );
+        assert_eq!(
+            store.files_for_transfer(transfer.id).unwrap()[0].bytes_completed,
+            0
+        );
     }
 
     #[test]
@@ -623,6 +820,49 @@ mod tests {
         let path = dir.path().join("courier.db");
         drop(TransferStore::open(&path).unwrap());
         drop(TransferStore::open(&path).unwrap());
+    }
+
+    #[test]
+    fn endpoint_migration_preserves_the_previous_registry_for_bound_transfers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("courier-v8.db");
+        let connection = Connection::open(&path).unwrap();
+        for migration in [
+            include_str!("../migrations/001_initial.sql"),
+            include_str!("../migrations/002_upload_sessions.sql"),
+            include_str!("../migrations/003_registry_state.sql"),
+            include_str!("../migrations/004_registry_secrets_external.sql"),
+            include_str!("../migrations/005_hash_algorithm.sql"),
+            include_str!("../migrations/006_manifest_version.sql"),
+            include_str!("../migrations/007_transport_objects.sql"),
+            include_str!("../migrations/008_manifest_v3_only.sql"),
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+        let transfer_id = Uuid::new_v4();
+        connection
+            .execute(
+                "INSERT INTO transfers (id,server_transfer_id,source_root,created_at,updated_at,status,file_count,original_bytes,manifest_version) VALUES (?1,'ISC-TR-OLD','/tmp','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','complete',0,0,3)",
+                [transfer_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO registry_sessions (base_url,expires_at,refresh_expires_at,projects_json,created_at) VALUES ('https://registry.example.test','2030-01-01T00:00:00Z','2030-02-01T00:00:00Z','[]','2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = TransferStore::open(&path).unwrap();
+        assert_eq!(
+            store.active_registry().unwrap().as_deref(),
+            Some("https://registry.example.test")
+        );
+        assert_eq!(
+            store.transfer_registry(transfer_id).unwrap().as_deref(),
+            Some("https://registry.example.test")
+        );
     }
 
     #[test]
@@ -637,6 +877,12 @@ mod tests {
         let server_file_id = Uuid::new_v4();
         store
             .bind_registry_transfer(transfer.id, "ISC-TR-TEST")
+            .unwrap();
+        store
+            .bind_transfer_registry(transfer.id, "https://registry.example.test")
+            .unwrap();
+        store
+            .set_active_registry("https://registry.example.test")
             .unwrap();
         store
             .bind_registry_file(file.id, server_file_id, "incoming/opaque/payload")
@@ -661,6 +907,14 @@ mod tests {
         assert_eq!(
             store.registry_file_binding(file.id).unwrap(),
             Some((server_file_id, "incoming/opaque/payload".into()))
+        );
+        assert_eq!(
+            store.transfer_registry(transfer.id).unwrap().as_deref(),
+            Some("https://registry.example.test")
+        );
+        assert_eq!(
+            store.active_registry().unwrap().as_deref(),
+            Some("https://registry.example.test")
         );
         assert!(
             store

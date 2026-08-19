@@ -154,7 +154,7 @@ impl Transfer {
             status: TransferStatus::Draft,
             file_count: 0,
             original_bytes: 0,
-            manifest_version: 2,
+            manifest_version: 3,
         }
     }
 }

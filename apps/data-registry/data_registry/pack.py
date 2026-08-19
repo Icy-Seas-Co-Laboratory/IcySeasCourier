@@ -49,6 +49,8 @@ def iter_pack_members(source: BinaryIO) -> Iterator[PackMember]:
         while True:
             header_size = struct.unpack("<I", _read_exact(decoder, 4))[0]
             if header_size == 0:
+                if decoder.read(1):
+                    raise PackFormatError("Courier pack contains trailing decoded bytes")
                 return
             if header_size > MAXIMUM_HEADER_BYTES:
                 raise PackFormatError("Courier pack member header is too large")
