@@ -11,17 +11,19 @@ Courier Desktop
   ├─ https://courier.icyseascolab.io ─┐
   └─ https://s3.icyseascolab.io ──────┤ Cloudflare edge
                                       │
-                           outbound Cloudflare Tunnel
+                  host-managed Cloudflare Tunnel
+                                      │
+                   loopback ports 8020 and 8333
                                       │
                 ┌─────────────────────┴─────────────────────┐
                 │ dedicated courier-edge Docker network     │
-                │ Registry                         SeaweedFS │
+                │ gateway → Registry               SeaweedFS │
                 └──────────────┬──────────────────────┬─────┘
                                │ courier-backend       │
                          PostgreSQL             verification worker
 ```
 
-The tunnel makes outbound connections, so the host needs no public inbound port. Registry and S3 diagnostic ports bind to loopback by default and are configurable to avoid collisions. PostgreSQL and the SeaweedFS master port exist only on the internal `courier-backend` network. Courier's admin console and admin API independently enforce the configured client networks even when traffic arrived through Cloudflare.
+The tunnel makes outbound connections, so the host needs no public inbound port. A small Courier gateway owns loopback port 8020 and forwards to Registry's private container port 8010 while preserving proxy headers. The S3 API owns loopback port 8333. PostgreSQL and the SeaweedFS master port exist only on the internal `courier-backend` network. Courier's admin console and admin API independently enforce the configured client networks even when traffic arrived through a proxy.
 
 ## Prerequisites
 
@@ -43,36 +45,34 @@ chmod 600 .env
 
 Keep the default single-process rate limits initially. They can be adjusted in `.env` without introducing a shared rate-limit service.
 
-The default Compose project name is `icy-seas-courier`, so its networks, containers, and named volumes do not collide with unrelated Compose projects. PostgreSQL has no host port. If ports 8010 or 8333 are already occupied on loopback, change `REGISTRY_PORT` or `SEAWEEDFS_S3_PORT`; the container ports and Cloudflare routes do not change.
+The default Compose project name is `icy-seas-courier`, so its networks, containers, and named volumes do not collide with unrelated Compose projects. PostgreSQL has no host port. If ports 8020 or 8333 are already occupied on loopback, change `REGISTRY_PORT` or `SEAWEEDFS_S3_PORT` and update the corresponding host-managed tunnel origin. Container ports do not change.
 
-The edge network defaults to `172.30.50.0/24`, with `cloudflared` at `172.30.50.10`. If that subnet overlaps another Docker or host network, choose an unused private `/24`, update `CLOUDFLARED_IPV4_ADDRESS`, and update both proxy allowlists to the new cloudflared address.
+The edge network defaults to `172.30.50.0/24`, with the Courier gateway at `172.30.50.10`. If that subnet overlaps another Docker or host network, choose an unused private `/24`, update `COURIER_GATEWAY_IPV4_ADDRESS`, and update both proxy allowlists to the new gateway address.
 
 ## Configure the Cloudflare Tunnel
 
-Create a remotely managed tunnel in Cloudflare and configure two published application routes:
+In your host-managed Cloudflare Tunnel, configure two published application routes. These are host loopback origins, not Docker service names:
 
 ```text
-courier.icyseascolab.io  ->  http://data-registry:8010
-s3.icyseascolab.io       ->  http://seaweedfs:8333
+courier.icyseascolab.io  ->  http://localhost:8020
+s3.icyseascolab.io       ->  http://localhost:8333
 ```
 
 The S3 hostname is required. The Registry returns presigned URLs built from `REGISTRY_S3_PUBLIC_ENDPOINT_URL`, and Courier uploads dataset parts directly to those URLs; the Registry never proxies dataset bytes. Keep path-style S3 routing and preserve the public hostname. Do not put an interactive Cloudflare Access login in front of either Courier route because the desktop client and presigned S3 `PUT` requests do not implement that login flow.
 
-Cloudflare supplies the original scheme and client address headers. Only the fixed cloudflared container address is trusted to supply them. The Registry prefers `CF-Connecting-IP` over `X-Forwarded-For` for Cloudflare traffic.
+Cloudflare supplies the original scheme and client address headers. The loopback gateway preserves those headers and has a fixed Docker address; Registry trusts only that address to supply them. Registry prefers `CF-Connecting-IP` over `X-Forwarded-For` for Cloudflare traffic. This is what allows `REGISTRY_REQUIRE_HTTPS=true` while the local tunnel origin remains HTTP.
 
 Cloudflare Free and Pro plans limit request bodies to 100 MB. Courier therefore uses 64 MiB multipart parts. A cache-bypass rule for `s3.icyseascolab.io` is recommended; S3 upload requests must not be transformed. Confirm that zone settings do not reduce the maximum upload size below 64 MiB.
 
-Copy the remotely managed tunnel token into `CLOUDFLARE_TUNNEL_TOKEN` in `.env`. Anyone holding this token can run the tunnel, so handle it as a credential and rotate it if exposed.
-
 ## Start and validate services
 
-Back up existing state before upgrading. Build the shared Registry image first, then start the isolated stack and tunnel:
+Back up existing state before upgrading. Build the shared Registry image first, then start the isolated stack. The manually managed tunnel runs separately on the host:
 
 ```bash
 docker compose build data-registry
-docker compose --profile cloudflare up -d postgres seaweedfs data-registry ingest-worker cloudflared
+docker compose up -d postgres seaweedfs data-registry courier-gateway ingest-worker
 docker compose ps
-docker compose logs --tail=100 data-registry ingest-worker cloudflared
+docker compose logs --tail=100 courier-gateway data-registry ingest-worker
 ```
 
 The Registry container applies Alembic migrations before starting. Validate through the public HTTPS endpoint:
@@ -83,11 +83,22 @@ curl --fail https://courier.icyseascolab.io/health
 curl --fail https://courier.icyseascolab.io/ready
 ```
 
-Complete the beta acceptance transfer from a separate client to prove that a presigned multipart upload traverses the S3 tunnel and reaches independent verification. Confirm that `/admin/` and `/api/v1/admin/overview` return `403` from a client outside `REGISTRY_ADMIN_ALLOWED_NETWORKS`. Also confirm that ports 8010 and 8333 are loopback-only and that ports 5432 and 9333 are not published on the host.
+Complete the beta acceptance transfer from a separate client to prove that a presigned multipart upload traverses the S3 tunnel and reaches independent verification. Confirm that `/admin/` and `/api/v1/admin/overview` return `403` from a client outside `REGISTRY_ADMIN_ALLOWED_NETWORKS`. Also confirm that ports 8020 and 8333 are loopback-only and that ports 8010, 5432, and 9333 are not published on the host.
+
+## Admin access over Tailscale
+
+Being connected to Tailscale does not make a request to the public Cloudflare hostname originate from a Tailscale address; Cloudflare sees the client's public egress address. Keep public admin requests blocked and give the host a separate tailnet-only HTTPS endpoint instead:
+
+```bash
+sudo tailscale serve --bg --https=443 http://127.0.0.1:8020
+tailscale serve status
+```
+
+Open the `https://<courier-host>.<tailnet>.ts.net/admin/` URL printed by Tailscale, not the public Cloudflare hostname. Tailscale terminates HTTPS and proxies to Courier's loopback gateway, while tailnet access-control rules still apply. Courier's default admin range covers Tailscale's full `100.64.0.0/10` IPv4 allocation; narrow it to approved device addresses if desired. Do not change `REGISTRY_BIND_ADDRESS` to `0.0.0.0`.
 
 ## Create beta access
 
-Open `https://courier.icyseascolab.io/admin/` from an address explicitly included in `REGISTRY_ADMIN_ALLOWED_NETWORKS`:
+Open the tailnet-only HTTPS admin URL described above from an approved VPN client:
 
 1. Create an active project with its stable project code.
 2. Issue a single-use invitation with an expiry and a suitable maximum transfer size.

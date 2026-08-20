@@ -24,7 +24,7 @@
   }
 
   let step: Step = "invite";
-  let registryUrl = "http://127.0.0.1:8010";
+  let registryUrl = "http://127.0.0.1:8020";
   let invitation = "";
   let projectId = "";
   let projects: RegistryProject[] = [];

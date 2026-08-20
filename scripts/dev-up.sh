@@ -11,9 +11,9 @@ else
 fi
 
 if docker buildx version >/dev/null 2>&1; then
-  $COMPOSE up --build -d postgres seaweedfs data-registry ingest-worker
+  $COMPOSE up --build -d postgres seaweedfs data-registry courier-gateway ingest-worker
 else
-  DOCKER_BUILDKIT=0 $COMPOSE up --build -d postgres seaweedfs data-registry ingest-worker
+  DOCKER_BUILDKIT=0 $COMPOSE up --build -d postgres seaweedfs data-registry courier-gateway ingest-worker
 fi
 
 printf '%s\n' "Waiting for Icy Seas Data Registry..."
@@ -28,6 +28,6 @@ until $COMPOSE exec -T data-registry python -c \
   sleep 1
 done
 
-REGISTRY_PORT=${REGISTRY_PORT:-8010}
+REGISTRY_PORT=${REGISTRY_PORT:-8020}
 printf '%s\n' "Registry ready: http://127.0.0.1:${REGISTRY_PORT}/docs"
 printf '%s\n' "Run ./scripts/dev-e2e.sh for a complete manifest and object-upload smoke test."

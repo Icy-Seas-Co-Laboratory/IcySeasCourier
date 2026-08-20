@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     admin_requests_per_minute: int = 120
     client_requests_per_minute: int = 600
     rate_limit_maximum_clients: int = 2_048
-    admin_allowed_networks: str = "127.0.0.1/32,::1/128,100.64.0.0/16"
+    admin_allowed_networks: str = "127.0.0.1/32,::1/128,100.64.0.0/10"
     trusted_proxy_networks: str = ""
     require_https: bool = False
 

@@ -74,9 +74,9 @@ The FastAPI/PostgreSQL control plane supports projects, hashed upload invitation
 ./scripts/dev-e2e.sh
 ```
 
-OpenAPI documentation is available at `http://127.0.0.1:8010/docs` in development. Dataset bytes continue to travel directly to S3-compatible storage; the Registry does not proxy them.
+OpenAPI documentation is available at `http://127.0.0.1:8020/docs` in development. Dataset bytes continue to travel directly to S3-compatible storage; the Registry does not proxy them.
 
-The Registry Operations Console is available at `http://127.0.0.1:8010/admin/` and is rejected unless the client address is loopback or in `100.64.0.0/16`.
+The Registry Operations Console is available at `http://127.0.0.1:8020/admin/` and is rejected unless the client address is loopback or in Tailscale's `100.64.0.0/10` range.
 For the default development stack, unlock it with the local-only admin key
 `development-only-change-me`.
 

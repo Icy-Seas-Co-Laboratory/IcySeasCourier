@@ -2,7 +2,7 @@
 
 ## Operations console
 
-Start the development stack and open `http://127.0.0.1:8010/admin/`. Sign in with
+Start the development stack and open `http://127.0.0.1:8020/admin/`. Sign in with
 the configured `REGISTRY_ADMIN_API_KEY` (`development-only-change-me` for the
 default local stack). The console provides health metrics, project and invitation
 administration, searchable transfer status, per-file verification evidence,
@@ -44,7 +44,7 @@ From the repository root, the local vertical slice is:
 ./scripts/dev-e2e.sh
 ```
 
-The smoke test creates a project and single-use invitation, exchanges it for a scoped Courier session, submits an immutable manifest, uploads one real part directly to SeaweedFS, completes the multipart object, and finalizes the transfer. FastAPI handles only metadata and authorization. The host API defaults to `http://127.0.0.1:8010`; set `REGISTRY_PORT` to change it.
+The smoke test creates a project and single-use invitation, exchanges it for a scoped Courier session, submits an immutable manifest, uploads one real part directly to SeaweedFS, completes the multipart object, and finalizes the transfer. FastAPI handles only metadata and authorization. The host gateway defaults to `http://127.0.0.1:8020`; set `REGISTRY_PORT` to change it. Registry remains private on container port 8010.
 
 The desktop uses these Registry APIs and stores rotating credentials in the operating system vault while preserving non-secret recovery state in SQLite.
 
@@ -52,7 +52,7 @@ Production configuration refuses the documented development admin key, token pep
 
 ## Network security
 
-The admin console and `/api/v1/admin` routes accept direct clients only from loopback or `100.64.0.0/16` by default. Forwarded client headers are ignored unless the immediate peer is explicitly listed in `REGISTRY_TRUSTED_PROXY_NETWORKS`. For a trusted Cloudflare peer, the Registry uses `CF-Connecting-IP`; other trusted proxies fall back to `X-Forwarded-For`. Keep the trusted-proxy list empty when Uvicorn is directly exposed. Production mode also requires HTTPS and non-development Registry and SeaweedFS credentials.
+The admin console and `/api/v1/admin` routes accept direct clients only from loopback or Tailscale's `100.64.0.0/10` range by default. Forwarded client headers are ignored unless the immediate peer is explicitly listed in `REGISTRY_TRUSTED_PROXY_NETWORKS`. For a trusted Cloudflare peer, the Registry uses `CF-Connecting-IP`; other trusted proxies fall back to `X-Forwarded-For`. Keep the trusted-proxy list empty when Uvicorn is directly exposed. Production mode also requires HTTPS and non-development Registry and SeaweedFS credentials.
 
 SeaweedFS is local and authenticated. The Compose stack passes its access and secret keys to `weed mini`; omitting credentials would put SeaweedFS into its development-only anonymous mode. Set `REGISTRY_S3_PUBLIC_ENDPOINT_URL` to the S3 URL reachable by Courier clients. A Cloudflare deployment uses a separate `https://s3.icyseascolab.io` tunnel route because dataset parts travel directly to SeaweedFS. PostgreSQL and the SeaweedFS master port are not published by Compose; Registry and S3 diagnostic ports bind to loopback by default.
 

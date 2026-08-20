@@ -202,7 +202,7 @@ fn normalize_registry_url(value: &str) -> Result<String, String> {
 
 fn default_registry_url() -> Result<String, String> {
     normalize_registry_url(
-        &std::env::var("COURIER_REGISTRY_URL").unwrap_or_else(|_| "http://127.0.0.1:8010".into()),
+        &std::env::var("COURIER_REGISTRY_URL").unwrap_or_else(|_| "http://127.0.0.1:8020".into()),
     )
 }
 
@@ -1013,8 +1013,8 @@ mod tests {
             "https://registry.example.test:8443"
         );
         assert_eq!(
-            normalize_registry_url("http://127.0.0.1:8010").unwrap(),
-            "http://127.0.0.1:8010"
+            normalize_registry_url("http://127.0.0.1:8020").unwrap(),
+            "http://127.0.0.1:8020"
         );
         assert!(normalize_registry_url("http://100.64.1.2:8010").is_err());
         assert!(normalize_registry_url("https://user@registry.example.test").is_err());

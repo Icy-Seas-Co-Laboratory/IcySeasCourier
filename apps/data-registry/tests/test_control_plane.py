@@ -66,7 +66,7 @@ def test_admin_network_is_limited_to_loopback_and_vpn(client: TestClient) -> Non
             ).status_code
             == 403
         )
-    with TestClient(client.app, client=("100.64.22.9", 50000)) as vpn:
+    with TestClient(client.app, client=("100.100.22.9", 50000)) as vpn:
         assert vpn.get("/admin/").status_code == 200
 
 

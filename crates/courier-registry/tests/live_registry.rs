@@ -14,7 +14,7 @@ use courier_transfer::{MultipartLimits, complete_uploaded_file, plan_parts, uplo
 #[ignore = "requires the local Registry stack and COURIER_TEST_INVITATION"]
 async fn rust_client_completes_registry_authorized_upload() {
     let base_url =
-        env::var("COURIER_REGISTRY_URL").unwrap_or_else(|_| "http://127.0.0.1:8010".into());
+        env::var("COURIER_REGISTRY_URL").unwrap_or_else(|_| "http://127.0.0.1:8020".into());
     let invitation = env::var("COURIER_TEST_INVITATION").expect("test invitation is required");
     let exchanged = RegistryClient::unauthenticated(&base_url)
         .exchange_invitation(&invitation, "courier-rust-e2e")

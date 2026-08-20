@@ -11,7 +11,7 @@ This demonstration exercises the desktop workflow, Registry control plane, Postg
 The script checks prerequisites, starts the complete service stack, prepares a small synthetic CTD package, issues a fresh single-use invitation, prints a concise presenter walkthrough, and launches Courier. Use `--no-launch` to prepare everything without opening the desktop application.
 
 During the demonstration, open the Registry Operations Console at
-`http://127.0.0.1:8010/admin/`. The launcher prints the local development admin
+`http://127.0.0.1:8020/admin/`. The launcher prints the local development admin
 key. Use the console to show the incoming transfer, its transition through
 verification, the immutable manifest digest, file-level checksum evidence, and
 the corresponding audit events.
