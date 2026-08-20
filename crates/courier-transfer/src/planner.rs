@@ -13,7 +13,8 @@ pub struct MultipartLimits {
 impl Default for MultipartLimits {
     fn default() -> Self {
         Self {
-            target_part_size: 128 * 1024 * 1024,
+            // Stay below Cloudflare's 100 MB request limit on Free and Pro plans.
+            target_part_size: 64 * 1024 * 1024,
             minimum_part_size: 5 * 1024 * 1024,
             maximum_part_size: 5 * 1024 * 1024 * 1024,
             maximum_parts: 10_000,
@@ -108,6 +109,15 @@ mod tests {
         let parts = plan_parts(Uuid::nil(), 25, limits).unwrap();
         assert_eq!(parts.len(), 3);
         assert_eq!((parts[2].source_offset, parts[2].source_length), (20, 5));
+    }
+
+    #[test]
+    fn default_parts_fit_through_cloudflare_free_and_pro() {
+        assert_eq!(
+            MultipartLimits::default().target_part_size,
+            64 * 1024 * 1024
+        );
+        assert!(MultipartLimits::default().target_part_size < 100_000_000);
     }
 
     #[test]

@@ -282,6 +282,17 @@ def test_health_is_process_liveness_only(client: TestClient) -> None:
     assert client.get("/health").json() == {"status": "ok"}
 
 
+def test_root_serves_courier_landing_page(client: TestClient) -> None:
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "Icy Seas Courier" in response.text
+    assert "independently verified" in response.text
+    assert "default-src 'none'" in response.headers["content-security-policy"]
+    assert client.get("/favicon.svg").headers["content-type"].startswith("image/svg+xml")
+
+
 def test_request_body_and_authentication_rate_limits(
     client: TestClient, settings: Settings
 ) -> None:

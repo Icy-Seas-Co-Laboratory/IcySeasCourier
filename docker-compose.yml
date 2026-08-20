@@ -5,10 +5,10 @@ services:
       POSTGRES_DB: registry
       POSTGRES_USER: registry
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-registry}
-    ports:
-      - "127.0.0.1:5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    networks:
+      - courier-backend
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U registry -d registry"]
       interval: 3s
@@ -23,10 +23,14 @@ services:
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-development}
       S3_BUCKET: ${REGISTRY_S3_BUCKET:-icy-seas-incoming}
     ports:
-      - "${SEAWEEDFS_BIND_ADDRESS:-0.0.0.0}:8333:8333"
-      - "127.0.0.1:9333:9333"
+      - "${SEAWEEDFS_BIND_ADDRESS:-127.0.0.1}:${SEAWEEDFS_S3_PORT:-8333}:8333"
+    expose:
+      - "9333"
     volumes:
       - "${SEAWEEDFS_DATA_PATH:-seaweedfs-data}:/data"
+    networks:
+      - courier-backend
+      - courier-edge
 
   data-registry:
     image: icy-seas-data-registry:dev
@@ -53,7 +57,10 @@ services:
       REGISTRY_REQUIRE_HTTPS: ${REGISTRY_REQUIRE_HTTPS:-false}
       FORWARDED_ALLOW_IPS: ${REGISTRY_FORWARDED_ALLOW_IPS:-127.0.0.1}
     ports:
-      - "${REGISTRY_BIND_ADDRESS:-0.0.0.0}:${REGISTRY_PORT:-8010}:8000"
+      - "${REGISTRY_BIND_ADDRESS:-127.0.0.1}:${REGISTRY_PORT:-8010}:8000"
+    networks:
+      - courier-backend
+      - courier-edge
     depends_on:
       postgres:
         condition: service_healthy
@@ -67,6 +74,8 @@ services:
 
   ingest-worker:
     image: icy-seas-data-registry:dev
+    build:
+      context: apps/data-registry
     command: ["python", "-m", "data_registry.worker"]
     environment:
       REGISTRY_ENVIRONMENT: ${REGISTRY_ENVIRONMENT:-development}
@@ -83,7 +92,33 @@ services:
       data-registry:
         condition: service_healthy
     restart: unless-stopped
+    networks:
+      - courier-backend
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.7.3
+    profiles: ["cloudflare"]
+    command: ["tunnel", "--no-autoupdate", "--metrics", "0.0.0.0:2000", "run"]
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      data-registry:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      courier-edge:
+        ipv4_address: ${CLOUDFLARED_IPV4_ADDRESS:-172.30.50.10}
 
 volumes:
   postgres-data:
   seaweedfs-data:
+
+networks:
+  courier-backend:
+    internal: true
+  courier-edge:
+    ipam:
+      config:
+        - subnet: ${COURIER_EDGE_SUBNET:-172.30.50.0/24}

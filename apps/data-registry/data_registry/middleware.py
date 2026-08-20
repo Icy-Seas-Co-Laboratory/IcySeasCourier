@@ -62,7 +62,12 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         except ValueError:
             return None
         if any(peer in network for network in self.trusted_proxies):
-            forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+            # Cloudflare supplies a single, normalized client address here. Prefer it
+            # over X-Forwarded-For, whose leftmost value may have existed before the
+            # request reached Cloudflare. Other trusted proxies fall back to XFF.
+            forwarded = request.headers.get("cf-connecting-ip", "").strip()
+            if not forwarded:
+                forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
             if forwarded:
                 try:
                     forwarded_address = ipaddress.ip_address(forwarded)

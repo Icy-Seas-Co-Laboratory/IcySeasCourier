@@ -1,100 +1,93 @@
 # Courier closed-beta setup and deployment
 
-This runbook describes a small, controlled Courier beta using one Registry process, one verification worker, PostgreSQL, and local SeaweedFS. It is not a high-availability design. Beta users and operators must connect through the approved VPN.
+This runbook describes a small, controlled Courier beta using one Registry process, one verification worker, PostgreSQL, local SeaweedFS, and a Cloudflare Tunnel. It is not a high-availability design.
 
 ## Deployment topology
 
-Use one dedicated Linux host with persistent local storage:
+Use one maintained Linux host with persistent local storage. It may run other Compose projects because Courier does not publish PostgreSQL or the SeaweedFS master port and uses project-scoped volumes and networks:
 
 ```text
-VPN client
-  ├─ HTTPS registry name ── reverse proxy ── 127.0.0.1:8010 ── Registry
-  └─ HTTPS objects name  ── reverse proxy ── 127.0.0.1:8333 ── SeaweedFS S3
-                                                   │
-                          PostgreSQL + SeaweedFS local volumes
-                                                   │
-                                      one verification worker
+Courier Desktop
+  ├─ https://courier.icyseascolab.io ─┐
+  └─ https://s3.icyseascolab.io ──────┤ Cloudflare edge
+                                      │
+                           outbound Cloudflare Tunnel
+                                      │
+                ┌─────────────────────┴─────────────────────┐
+                │ dedicated courier-edge Docker network     │
+                │ Registry                         SeaweedFS │
+                └──────────────┬──────────────────────┬─────┘
+                               │ courier-backend       │
+                         PostgreSQL             verification worker
 ```
 
-Expose only the reverse proxy on the VPN interface. Keep PostgreSQL, the Registry backend, the SeaweedFS S3 backend, and the SeaweedFS master port bound to loopback. Courier's admin console and admin API independently reject addresses outside loopback and `100.64.0.0/16`.
+The tunnel makes outbound connections, so the host needs no public inbound port. Registry and S3 diagnostic ports bind to loopback by default and are configurable to avoid collisions. PostgreSQL and the SeaweedFS master port exist only on the internal `courier-backend` network. Courier's admin console and admin API independently enforce the configured client networks even when traffic arrived through Cloudflare.
 
 ## Prerequisites
 
 - A maintained Linux host with Docker Engine and Compose.
-- Two VPN-resolvable HTTPS names, one for the Registry and one for SeaweedFS S3.
-- TLS certificates accepted by beta client computers.
+- A remotely managed Cloudflare Tunnel with routes for `courier.icyseascolab.io` and `s3.icyseascolab.io`.
 - Enough local space for incoming datasets, multipart staging, PostgreSQL, and operational headroom.
 - A second storage location for backups. A backup on the Courier host is not sufficient.
-- A signed and notarized Courier beta build for each supported desktop platform.
+- A signed and notarized Courier beta build for each supported desktop platform. See [Courier Desktop releases](desktop-releases.md) for the build and Apple-signing workflow.
 
 ## Configure the host
 
-Copy `.env.example` to `.env`, restrict it to the deployment account, and replace every development value. Generate URL-safe secrets rather than passwords requiring database-URL escaping.
+Copy `.env.beta.example` to `.env`, restrict it to the deployment account, and replace every `CHANGE_ME` value. Generate URL-safe secrets rather than passwords requiring database-URL escaping.
 
-```dotenv
-REGISTRY_ENVIRONMENT=beta
-POSTGRES_PASSWORD=<unique-url-safe-password>
-REGISTRY_ADMIN_API_KEY=<unique-random-secret>
-REGISTRY_TOKEN_PEPPER=<unique-random-secret>
-
-AWS_ACCESS_KEY_ID=<unique-seaweed-access-key>
-AWS_SECRET_ACCESS_KEY=<unique-seaweed-secret-key>
-REGISTRY_S3_BUCKET=icy-seas-incoming
-REGISTRY_S3_PUBLIC_ENDPOINT_URL=https://objects.example.internal
-
-REGISTRY_REQUIRE_HTTPS=true
-REGISTRY_BIND_ADDRESS=127.0.0.1
-SEAWEEDFS_BIND_ADDRESS=127.0.0.1
-REGISTRY_ADMIN_ALLOWED_NETWORKS=127.0.0.1/32,::1/128,100.64.0.0/16
-
-# Replace these with the immediate reverse-proxy source address or narrow CIDR
-# as observed inside the Registry container. Never trust all addresses.
-REGISTRY_TRUSTED_PROXY_NETWORKS=<proxy-source-address>/32
-REGISTRY_FORWARDED_ALLOW_IPS=127.0.0.1,<proxy-source-address>/32
+```bash
+cp .env.beta.example .env
+chmod 600 .env
+# Edit .env and replace every CHANGE_ME value before continuing.
 ```
 
 Keep the default single-process rate limits initially. They can be adjusted in `.env` without introducing a shared rate-limit service.
 
-## Configure TLS and proxying
+The default Compose project name is `icy-seas-courier`, so its networks, containers, and named volumes do not collide with unrelated Compose projects. PostgreSQL has no host port. If ports 8010 or 8333 are already occupied on loopback, change `REGISTRY_PORT` or `SEAWEEDFS_S3_PORT`; the container ports and Cloudflare routes do not change.
 
-The reverse proxy must preserve `Host`, set `X-Forwarded-Proto: https`, and supply the original client address in `X-Forwarded-For`. A minimal Caddy-style topology is:
+The edge network defaults to `172.30.50.0/24`, with `cloudflared` at `172.30.50.10`. If that subnet overlaps another Docker or host network, choose an unused private `/24`, update `CLOUDFLARED_IPV4_ADDRESS`, and update both proxy allowlists to the new cloudflared address.
 
-```caddyfile
-registry.example.internal {
-    reverse_proxy 127.0.0.1:8010
-}
+## Configure the Cloudflare Tunnel
 
-objects.example.internal {
-    reverse_proxy 127.0.0.1:8333
-}
+Create a remotely managed tunnel in Cloudflare and configure two published application routes:
+
+```text
+courier.icyseascolab.io  ->  http://data-registry:8000
+s3.icyseascolab.io       ->  http://seaweedfs:8333
 ```
 
-Use the actual VPN names and the organization's certificate mechanism. Determine the immediate proxy address visible inside the Registry container and use only that address in `REGISTRY_TRUSTED_PROXY_NETWORKS`. Include that address and `127.0.0.1` in `REGISTRY_FORWARDED_ALLOW_IPS`; loopback is needed by the container health check. Incorrect proxy trust either blocks legitimate admin access or permits spoofed client addresses.
+The S3 hostname is required. The Registry returns presigned URLs built from `REGISTRY_S3_PUBLIC_ENDPOINT_URL`, and Courier uploads dataset parts directly to those URLs; the Registry never proxies dataset bytes. Keep path-style S3 routing and preserve the public hostname. Do not put an interactive Cloudflare Access login in front of either Courier route because the desktop client and presigned S3 `PUT` requests do not implement that login flow.
 
-The host firewall should allow HTTPS only on loopback and the VPN interface. Ports 5432, 8010, 8333, and 9333 should not accept traffic from other interfaces.
+Cloudflare supplies the original scheme and client address headers. Only the fixed cloudflared container address is trusted to supply them. The Registry prefers `CF-Connecting-IP` over `X-Forwarded-For` for Cloudflare traffic.
+
+Cloudflare Free and Pro plans limit request bodies to 100 MB. Courier therefore uses 64 MiB multipart parts. A cache-bypass rule for `s3.icyseascolab.io` is recommended; S3 upload requests must not be transformed. Confirm that zone settings do not reduce the maximum upload size below 64 MiB.
+
+Copy the remotely managed tunnel token into `CLOUDFLARE_TUNNEL_TOKEN` in `.env`. Anyone holding this token can run the tunnel, so handle it as a credential and rotate it if exposed.
 
 ## Start and validate services
 
-Back up existing state before upgrading. Then build and start the stack:
+Back up existing state before upgrading. Build the shared Registry image first, then start the isolated stack and tunnel:
 
 ```bash
-docker compose up --build -d postgres seaweedfs data-registry ingest-worker
+docker compose build data-registry
+docker compose --profile cloudflare up -d postgres seaweedfs data-registry ingest-worker cloudflared
 docker compose ps
-docker compose logs --tail=100 data-registry ingest-worker
+docker compose logs --tail=100 data-registry ingest-worker cloudflared
 ```
 
 The Registry container applies Alembic migrations before starting. Validate through the public HTTPS endpoint:
 
 ```bash
-curl --fail https://registry.example.internal/health
-curl --fail https://registry.example.internal/ready
+curl --fail https://courier.icyseascolab.io/
+curl --fail https://courier.icyseascolab.io/health
+curl --fail https://courier.icyseascolab.io/ready
 ```
 
-From a VPN client, confirm that the admin console loads and accepts the admin key. From a non-VPN address, confirm that `/admin/` and `/api/v1/admin/overview` return `403`. Also confirm that ports 8010, 8333, 9333, and 5432 are unreachable directly from the network.
+Complete the beta acceptance transfer from a separate client to prove that a presigned multipart upload traverses the S3 tunnel and reaches independent verification. Confirm that `/admin/` and `/api/v1/admin/overview` return `403` from a client outside `REGISTRY_ADMIN_ALLOWED_NETWORKS`. Also confirm that ports 8010 and 8333 are loopback-only and that ports 5432 and 9333 are not published on the host.
 
 ## Create beta access
 
-Open `https://registry.example.internal/admin/` from localhost or the VPN:
+Open `https://courier.icyseascolab.io/admin/` from an address explicitly included in `REGISTRY_ADMIN_ALLOWED_NETWORKS`:
 
 1. Create an active project with its stable project code.
 2. Issue a single-use invitation with an expiry and a suitable maximum transfer size.
@@ -107,10 +100,10 @@ Ask testers to leave source files in place and unchanged until the transfer reac
 
 ## Beta acceptance test
 
-Before inviting external testers, complete this sequence from a separate VPN-connected computer:
+Before inviting external testers, complete this sequence from a separate beta client computer:
 
 1. Install the signed beta package on a clean user account.
-2. Enter the HTTPS Registry address and a single-use invitation.
+2. Enter `https://courier.icyseascolab.io` and a single-use invitation.
 3. Upload nested, Unicode, empty, and small files that produce at least one transport pack.
 4. Upload a file larger than the 8 MiB pack-member threshold.
 5. Pause during upload, quit Courier, reopen it, and resume.

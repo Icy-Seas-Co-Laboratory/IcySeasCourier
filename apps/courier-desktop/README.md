@@ -14,3 +14,7 @@ npm run tauri dev
 The interface validates and stores the selected Registry endpoint, exchanges Registry invitations, presents only authorized projects, registers immutable manifests, and uploads directly through short-lived part-specific URLs. Each new transfer is bound to its originating Registry so changing the active endpoint cannot redirect a resume. It also provides native directory selection, real Rust inventory, live progress, cooperative pause, and reconciliation-backed resume.
 
 Enter the supplied HTTPS Registry address in Courier. `COURIER_REGISTRY_URL` remains a development default only; it is no longer required for a packaged application. Plain HTTP is accepted only for loopback development. Courier stores rotating access and refresh credentials in the operating system credential vault. Local SQLite contains only the active endpoint, per-transfer Registry assignment, session expiry/project metadata, and Registry transfer/object identities, allowing idempotent registration and accepted-part reconciliation after restart. Dataset bytes never pass through FastAPI.
+
+## Releases
+
+Signed macOS DMGs, a Windows NSIS installer, and a Linux AppImage are produced by the version-tagged GitHub Actions release workflow. See [Courier Desktop releases](../../docs/desktop-releases.md) for Apple signing setup, release creation, and verification.

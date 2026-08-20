@@ -52,8 +52,8 @@ Production configuration refuses the documented development admin key, token pep
 
 ## Network security
 
-The admin console and `/api/v1/admin` routes accept direct clients only from loopback or `100.64.0.0/16` by default. `X-Forwarded-For` is ignored unless the immediate peer is explicitly listed in `REGISTRY_TRUSTED_PROXY_NETWORKS`. Keep that list empty when Uvicorn is directly exposed. Production mode also requires HTTPS and non-development Registry and SeaweedFS credentials.
+The admin console and `/api/v1/admin` routes accept direct clients only from loopback or `100.64.0.0/16` by default. Forwarded client headers are ignored unless the immediate peer is explicitly listed in `REGISTRY_TRUSTED_PROXY_NETWORKS`. For a trusted Cloudflare peer, the Registry uses `CF-Connecting-IP`; other trusted proxies fall back to `X-Forwarded-For`. Keep the trusted-proxy list empty when Uvicorn is directly exposed. Production mode also requires HTTPS and non-development Registry and SeaweedFS credentials.
 
-SeaweedFS is local and authenticated. The Compose stack passes its access and secret keys to `weed mini`; omitting credentials would put SeaweedFS into its development-only anonymous mode. Set `REGISTRY_S3_PUBLIC_ENDPOINT_URL` to the S3 URL reachable by VPN Courier clients, and restrict ports 8010 and 8333 at the host firewall to loopback and the VPN interface.
+SeaweedFS is local and authenticated. The Compose stack passes its access and secret keys to `weed mini`; omitting credentials would put SeaweedFS into its development-only anonymous mode. Set `REGISTRY_S3_PUBLIC_ENDPOINT_URL` to the S3 URL reachable by Courier clients. A Cloudflare deployment uses a separate `https://s3.icyseascolab.io` tunnel route because dataset parts travel directly to SeaweedFS. PostgreSQL and the SeaweedFS master port are not published by Compose; Registry and S3 diagnostic ports bind to loopback by default.
 
 See the repository's [closed-beta deployment runbook](../../docs/beta-deployment.md) for the TLS proxy, Compose environment, firewall, invitation, acceptance-test, backup, and rollback procedure.
