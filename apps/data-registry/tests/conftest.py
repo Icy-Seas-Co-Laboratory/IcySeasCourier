@@ -36,6 +36,9 @@ class FakeObjectStorage:
         assert self.uploads[object_key] == upload_id
         return f"https://objects.test/{object_key}?uploadId={upload_id}&partNumber={part_number}"
 
+    def authorize_download(self, object_key: str) -> str:
+        return f"https://objects.test/{object_key}?download=1"
+
     def complete_multipart(self, object_key: str, upload_id: str, parts: list[dict]) -> str:
         assert self.uploads[object_key] == upload_id
         assert parts
@@ -43,6 +46,9 @@ class FakeObjectStorage:
 
     def open_object(self, object_key: str):
         return io.BytesIO(self.objects[object_key])
+
+    def object_size(self, object_key: str) -> int:
+        return len(self.objects[object_key])
 
     def object_exists(self, object_key: str) -> bool:
         return object_key in self.objects

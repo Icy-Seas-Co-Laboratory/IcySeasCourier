@@ -16,6 +16,17 @@ Configuration = Annotated[Settings, Depends(get_settings)]
 Storage = Annotated[ObjectStorage, Depends(get_object_storage)]
 
 
+def require_admin_session_token(
+    settings: Configuration,
+    authorization: Annotated[str | None, Header()] = None,
+) -> str:
+    if authorization is not None and authorization.startswith("Bearer "):
+        token = authorization.removeprefix("Bearer ")
+        if valid_admin_session_token(token, settings):
+            return token
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="admin session required")
+
+
 def require_admin(
     settings: Configuration,
     authorization: Annotated[str | None, Header()] = None,
@@ -62,4 +73,5 @@ def require_courier_session(
 
 
 AdminActor = Annotated[str, Depends(require_admin)]
+AdminSessionToken = Annotated[str, Depends(require_admin_session_token)]
 CourierIdentity = Annotated[CourierSession, Depends(require_courier_session)]

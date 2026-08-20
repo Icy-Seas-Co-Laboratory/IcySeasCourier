@@ -61,6 +61,8 @@ services:
       FORWARDED_ALLOW_IPS: ${REGISTRY_FORWARDED_ALLOW_IPS:-127.0.0.1,172.30.50.10}
     expose:
       - "8010"
+    volumes:
+      - "${REGISTRY_EXPORT_PATH:-./exports}:/exports"
     networks:
       - courier-backend
       - courier-edge

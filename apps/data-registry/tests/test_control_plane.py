@@ -1,4 +1,5 @@
 import hashlib
+import uuid
 from datetime import UTC, datetime, timedelta
 
 from conftest import FakeObjectStorage
@@ -7,6 +8,7 @@ from pydantic import SecretStr, ValidationError
 from sqlalchemy.orm import Session, sessionmaker
 
 from data_registry.config import Settings
+from data_registry.models import Transfer, TransferObject
 from data_registry.verification import claim_transfer, verify_claim
 
 ADMIN = {"X-Admin-Key": "test-admin-key"}
@@ -76,6 +78,8 @@ def test_admin_console_and_operational_read_models(client: TestClient) -> None:
     assert "Operations Console" in console.text
     assert "[hidden] { display: none !important; }" in console.text
     assert 'id="login-submit"' in console.text
+    assert 'id="totp-field" class="login-factor" hidden' in console.text
+    assert "Checking administrator setup" in console.text
 
     create_project(client)
     invitation = create_invitation(client)
@@ -124,6 +128,12 @@ def test_admin_transfer_listing_and_retry_guards(client: TestClient) -> None:
     detail = client.get(f"/api/v1/admin/transfers/{transfer['public_id']}", headers=ADMIN)
     assert detail.status_code == 200
     assert detail.json()["source_name"] == "admin-console-dataset"
+    assert (
+        client.post(
+            f"/api/v1/admin/transfers/{transfer['public_id']}/downloads", headers=ADMIN
+        ).status_code
+        == 409
+    )
 
     retry = client.post(f"/api/v1/admin/transfers/{transfer['public_id']}/retry", headers=ADMIN)
     assert retry.status_code == 409
@@ -276,6 +286,106 @@ def test_project_scope_and_transfer_size_are_enforced(client: TestClient) -> Non
         json={**base, "project_code": "P26014", "original_bytes": 101},
     )
     assert too_large.status_code == 413
+
+
+def test_download_invitation_is_read_only_and_lists_verified_project_datasets(
+    client: TestClient,
+    database_factory: sessionmaker[Session],
+) -> None:
+    create_project(client)
+    upload_invitation = create_invitation(client)
+    upload_session = exchange(client, upload_invitation["invitation_code"])
+    upload_headers = {"Authorization": f"Bearer {upload_session['access_token']}"}
+    created = client.post(
+        "/api/v1/transfers",
+        headers=upload_headers,
+        json={
+            "project_code": "P26014",
+            "source_name": "client-delivery",
+            "file_count": 1,
+            "original_bytes": 4,
+            "courier_version": "0.1.0",
+            "idempotency_key": "download-project-dataset",
+        },
+    ).json()
+    object_id = "c7ba5127-9325-45b4-bc0d-cf67a694f0fd"
+    manifest = {
+        "files": [
+            {
+                "path": "delivery.txt",
+                "size": 4,
+                "mtime": datetime.now(UTC).isoformat(),
+                "digest": {"algorithm": "sha256", "value": "0" * 64},
+                "transport": {"object_id": object_id, "member_index": 0},
+            }
+        ]
+    }
+    with database_factory() as database:
+        transfer = database.query(Transfer).filter_by(public_id=created["public_id"]).one()
+        transfer.status = "complete"
+        transfer.verified_at = datetime.now(UTC)
+        transfer.manifest = manifest
+        transfer.manifest_sha256 = "1" * 64
+        transfer.transport_objects.append(
+            TransferObject(
+                id=uuid.UUID(object_id),
+                kind="file",
+                compression="none",
+                encoding_version=1,
+                original_bytes=4,
+                object_key="projects/P26014/client-delivery/payload",
+                status="verified",
+            )
+        )
+        database.commit()
+
+    invitation = client.post(
+        "/api/v1/admin/invitations",
+        headers=ADMIN,
+        json={
+            "purpose": "download",
+            "project_codes": ["P26014"],
+            "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            "maximum_uses": 1,
+            "created_by": "registry-test@icyseas.co",
+        },
+    )
+    assert invitation.status_code == 201
+    assert invitation.json()["purpose"] == "download"
+    session = exchange(client, invitation.json()["invitation_code"])
+    assert session["purpose"] == "download"
+    headers = {"Authorization": f"Bearer {session['access_token']}"}
+
+    authorization = client.get("/api/v1/auth/session", headers=headers)
+    assert authorization.json()["purpose"] == "download"
+    datasets = client.get("/api/v1/downloads", headers=headers)
+    assert datasets.status_code == 200
+    assert [item["transfer_id"] for item in datasets.json()] == [created["public_id"]]
+    plan = client.post(f"/api/v1/downloads/{created['public_id']}", headers=headers)
+    assert plan.status_code == 200
+    assert plan.json()["manifest"] == manifest
+    assert plan.json()["objects"][0]["url"] is None
+    authorization = client.post(
+        f"/api/v1/downloads/{created['public_id']}/objects/{object_id}/authorize",
+        headers=headers,
+    )
+    assert authorization.status_code == 200
+    assert authorization.json()["url"].endswith("?download=1")
+
+    forbidden_upload = client.post(
+        "/api/v1/transfers",
+        headers=headers,
+        json={
+            "project_code": "P26014",
+            "source_name": "not-allowed",
+            "file_count": 0,
+            "original_bytes": 0,
+            "courier_version": "0.1.0",
+            "idempotency_key": "download-cannot-upload",
+        },
+    )
+    assert forbidden_upload.status_code == 403
+    assert client.get("/api/v1/downloads", headers=upload_headers).status_code == 403
 
 
 def test_health_is_process_liveness_only(client: TestClient) -> None:
@@ -436,6 +546,18 @@ def test_manifest_is_immutable_and_drives_scoped_multipart_lifecycle(
     verified = client.get(f"/api/v1/transfers/{transfer_id}", headers=headers)
     assert verified.json()["status"] == "complete"
     assert verified.json()["files"][0]["verified_sha256"] == hashlib.sha256(content).hexdigest()
+
+    detail = client.get(f"/api/v1/admin/transfers/{transfer_id}", headers=ADMIN)
+    assert detail.json()["original_bytes"] == len(content)
+    assert detail.json()["transport_bytes"] == len(content)
+    download = client.post(f"/api/v1/admin/transfers/{transfer_id}/downloads", headers=ADMIN)
+    assert download.status_code == 200
+    assert download.json()["contains_packs"] is False
+    assert "curl --fail --location" in download.json()["shell_command"]
+    assert "python -m data_registry.retrieve" in download.json()["server_retrieve_command"]
+    assert download.json()["objects"][0]["transport_bytes"] == len(content)
+    overview = client.get("/api/v1/admin/overview", headers=ADMIN)
+    assert overview.json()["transport_bytes"] == len(content)
 
 
 def test_production_rejects_development_secrets() -> None:

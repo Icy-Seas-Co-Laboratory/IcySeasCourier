@@ -98,6 +98,48 @@ impl TransferStore {
         Ok(())
     }
 
+    /// Reconciles an asynchronous Registry response without allowing a delayed response to
+    /// move a transfer backward from a terminal state.
+    pub fn reconcile_registry_status(&self, id: Uuid, remote: TransferStatus) -> Result<()> {
+        let allowed_current = match remote {
+            TransferStatus::Verifying => &[TransferStatus::Finalizing][..],
+            TransferStatus::Complete | TransferStatus::Failed => {
+                &[TransferStatus::Finalizing, TransferStatus::Verifying][..]
+            }
+            _ => &[],
+        };
+        let current = self
+            .get_transfer(id)?
+            .ok_or_else(|| CourierError::TransferNotFound(id.to_string()))?;
+        if current.status == remote
+            || matches!(
+                current.status,
+                TransferStatus::Complete | TransferStatus::Failed | TransferStatus::Cancelled
+            )
+        {
+            return Ok(());
+        }
+        if !allowed_current.contains(&current.status) {
+            return Err(CourierError::InvalidTransition {
+                from: current.status.to_string(),
+                to: remote.to_string(),
+            });
+        }
+
+        let placeholders = allowed_current
+            .iter()
+            .map(|status| format!("'{}'", status))
+            .collect::<Vec<_>>()
+            .join(",");
+        self.conn.execute(
+            &format!(
+                "UPDATE transfers SET status=?1, updated_at=?2 WHERE id=?3 AND status IN ({placeholders})"
+            ),
+            params![remote.to_string(), Utc::now().to_rfc3339(), id.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn replace_inventory(&mut self, transfer_id: Uuid, files: &[FileRecord]) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -131,6 +173,13 @@ impl TransferStore {
         let rows = stmt.query_map([], row_to_transfer)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    pub fn delete_transfer(&self, id: Uuid) -> Result<bool> {
+        let deleted = self
+            .conn
+            .execute("DELETE FROM transfers WHERE id=?1", [id.to_string()])?;
+        Ok(deleted > 0)
     }
 
     pub fn incomplete_transfers(&self) -> Result<Vec<Transfer>> {
@@ -678,6 +727,67 @@ mod tests {
             status: FileStatus::Ready,
             bytes_completed: 0,
         }
+    }
+
+    fn finalizing_transfer(store: &TransferStore) -> Transfer {
+        let transfer = Transfer::draft(PathBuf::from("/tmp"), None);
+        store.create_transfer(&transfer).unwrap();
+        for status in [
+            TransferStatus::Inventorying,
+            TransferStatus::Ready,
+            TransferStatus::Uploading,
+            TransferStatus::Finalizing,
+        ] {
+            store.transition(transfer.id, status).unwrap();
+        }
+        transfer
+    }
+
+    #[test]
+    fn registry_status_reconciliation_ignores_a_late_verifying_response() {
+        let store = TransferStore::open_in_memory().unwrap();
+        let transfer = finalizing_transfer(&store);
+
+        store
+            .reconcile_registry_status(transfer.id, TransferStatus::Complete)
+            .unwrap();
+        store
+            .reconcile_registry_status(transfer.id, TransferStatus::Verifying)
+            .unwrap();
+
+        assert_eq!(
+            store.get_transfer(transfer.id).unwrap().unwrap().status,
+            TransferStatus::Complete
+        );
+    }
+
+    #[test]
+    fn registry_status_reconciliation_rejects_unrelated_local_states() {
+        let store = TransferStore::open_in_memory().unwrap();
+        let transfer = Transfer::draft(PathBuf::from("/tmp"), None);
+        store.create_transfer(&transfer).unwrap();
+
+        let error = store
+            .reconcile_registry_status(transfer.id, TransferStatus::Verifying)
+            .unwrap_err();
+
+        assert!(matches!(error, CourierError::InvalidTransition { .. }));
+    }
+
+    #[test]
+    fn deleting_a_transfer_cascades_its_local_inventory() {
+        let mut store = TransferStore::open_in_memory().unwrap();
+        let transfer = Transfer::draft(PathBuf::from("/tmp"), None);
+        store.create_transfer(&transfer).unwrap();
+        let file = fixture_file(transfer.id);
+        store
+            .replace_inventory(transfer.id, std::slice::from_ref(&file))
+            .unwrap();
+
+        assert!(store.delete_transfer(transfer.id).unwrap());
+        assert!(store.get_transfer(transfer.id).unwrap().is_none());
+        assert!(store.files_for_transfer(transfer.id).unwrap().is_empty());
+        assert!(!store.delete_transfer(transfer.id).unwrap());
     }
 
     #[test]

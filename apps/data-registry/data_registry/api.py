@@ -1,5 +1,6 @@
 import hashlib
 import json
+import shlex
 import uuid
 from datetime import UTC, datetime, timedelta
 from urllib.parse import quote, urlencode
@@ -10,7 +11,14 @@ from sqlalchemy.exc import IntegrityError
 
 from .audit import record_event
 from .db import engine
-from .dependencies import AdminActor, Configuration, CourierIdentity, Database, Storage
+from .dependencies import (
+    AdminActor,
+    AdminSessionToken,
+    Configuration,
+    CourierIdentity,
+    Database,
+    Storage,
+)
 from .models import (
     AdminSecurity,
     AuditEvent,
@@ -25,6 +33,8 @@ from .models import (
 from .schemas import (
     AdminAuthenticationRequest,
     AdminAuthenticationStatus,
+    AdminDownloadObject,
+    AdminDownloadPlan,
     AdminInvitationResponse,
     AdminOverviewResponse,
     AdminSessionResponse,
@@ -36,6 +46,9 @@ from .schemas import (
     AuditEventResponse,
     CompleteMultipartRequest,
     CompleteMultipartResponse,
+    DownloadDatasetSummary,
+    DownloadObject,
+    DownloadPlan,
     FinalizeTransferResponse,
     HealthResponse,
     InvitationCreate,
@@ -48,6 +61,7 @@ from .schemas import (
     PartsResponse,
     ProjectCreate,
     ProjectResponse,
+    SessionAuthorization,
     SessionRefresh,
     SessionResponse,
     SystemConfigResponse,
@@ -77,6 +91,8 @@ client = APIRouter(prefix="/api/v1", tags=["courier"])
 
 
 def owned_transfer(database: Database, identity: CourierIdentity, transfer_id: str) -> Transfer:
+    if identity.invitation.purpose != "upload":
+        raise HTTPException(status_code=403, detail="invitation is read-only")
     transfer = database.scalar(select(Transfer).where(Transfer.public_id == transfer_id))
     if transfer is None:
         raise HTTPException(status_code=404, detail="transfer not found")
@@ -255,6 +271,11 @@ def create_admin_session(
     return _admin_session(settings)
 
 
+@admin.post("/authentication/renew", response_model=AdminSessionResponse)
+def renew_admin_session(_: AdminSessionToken, settings: Configuration) -> AdminSessionResponse:
+    return _admin_session(settings)
+
+
 @admin.post("/projects", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
 def create_project(payload: ProjectCreate, database: Database, actor: AdminActor) -> Project:
     project = Project(**payload.model_dump())
@@ -304,6 +325,8 @@ def admin_overview(
         completed_transfers=statuses.get("complete", 0),
         original_bytes=database.scalar(select(func.coalesce(func.sum(Transfer.original_bytes), 0)))
         or 0,
+        transport_bytes=database.scalar(select(func.coalesce(func.sum(TransportPart.size), 0)))
+        or 0,
         hash_algorithm=settings.hash_algorithm,
     )
 
@@ -324,9 +347,25 @@ def list_invitations(database: Database, _: AdminActor) -> list[AdminInvitationR
             created_by=item.created_by,
             created_at=item.created_at,
             revoked_at=item.revoked_at,
+            purpose=item.purpose,
         )
         for item in invitations
     ]
+
+
+def known_transport_bytes(transfer: Transfer) -> int | None:
+    if transfer.transport_bytes is not None:
+        return transfer.transport_bytes
+    if transfer.manifest_sha256 is None:
+        return None
+    if not transfer.transport_objects:
+        return 0
+    if any(item.status not in {"uploaded", "verified"} for item in transfer.transport_objects):
+        return None
+    sizes = [part.size for item in transfer.transport_objects for part in item.parts]
+    if any(size is None for size in sizes):
+        return None
+    return sum(size for size in sizes if size is not None)
 
 
 def transfer_summary(transfer: Transfer) -> AdminTransferSummary:
@@ -337,6 +376,7 @@ def transfer_summary(transfer: Transfer) -> AdminTransferSummary:
         status=transfer.status,
         file_count=transfer.file_count,
         original_bytes=transfer.original_bytes,
+        transport_bytes=known_transport_bytes(transfer),
         courier_version=transfer.courier_version,
         created_at=transfer.created_at,
         completed_at=transfer.completed_at,
@@ -376,6 +416,69 @@ def admin_transfer_detail(
         manifest_sha256=transfer.manifest_sha256,
         verification_started_at=transfer.verification_started_at,
         files=[VerificationFileResponse.model_validate(item) for item in transfer.files],
+    )
+
+
+@admin.post("/transfers/{transfer_id}/downloads", response_model=AdminDownloadPlan)
+def create_admin_download_plan(
+    transfer_id: str,
+    database: Database,
+    actor: AdminActor,
+    storage: Storage,
+) -> AdminDownloadPlan:
+    transfer = database.scalar(select(Transfer).where(Transfer.public_id == transfer_id))
+    if transfer is None:
+        raise HTTPException(status_code=404, detail="transfer not found")
+    if transfer.status != "complete":
+        raise HTTPException(status_code=409, detail="only verified transfers can be downloaded")
+
+    directory = f"{transfer.public_id}-transport"
+    objects = []
+    commands = [f"mkdir -p {shlex.quote(directory)}"]
+    for item in sorted(transfer.transport_objects, key=lambda value: str(value.id)):
+        extension = "iscpack.zst" if item.kind == "pack" else "payload"
+        filename = f"{item.id}.{extension}"
+        url = storage.authorize_download(item.object_key)
+        transport_bytes = (
+            sum(part.size for part in item.parts if part.size is not None)
+            if all(part.size is not None for part in item.parts)
+            else None
+        )
+        objects.append(
+            AdminDownloadObject(
+                object_id=item.id,
+                kind=item.kind,
+                compression=item.compression,
+                original_bytes=item.original_bytes,
+                transport_bytes=transport_bytes,
+                filename=filename,
+                url=url,
+            )
+        )
+        destination = f"{directory}/{filename}"
+        commands.append(
+            f"curl --fail --location --output {shlex.quote(destination)} {shlex.quote(url)}"
+        )
+    record_event(
+        database,
+        actor=actor,
+        action="transfer.download_urls_issued",
+        object_type="transfer",
+        object_id=transfer.public_id,
+        metadata={"object_count": len(objects), "expires_in_seconds": storage.url_lifetime},
+    )
+    database.commit()
+    return AdminDownloadPlan(
+        transfer_id=transfer.public_id,
+        expires_in_seconds=storage.url_lifetime,
+        contains_packs=any(item.kind == "pack" for item in transfer.transport_objects),
+        server_retrieve_command=(
+            "docker compose exec data-registry python -m data_registry.retrieve "
+            f"{shlex.quote(transfer.public_id)} "
+            f"{shlex.quote(f'/exports/{transfer.public_id}')}"
+        ),
+        shell_command="\n".join(commands),
+        objects=objects,
     )
 
 
@@ -440,6 +543,7 @@ def create_invitation(
     code = generate_invitation_code()
     invitation = UploadInvitation(
         token_hash=hash_token(code, settings),
+        purpose=payload.purpose,
         expires_at=payload.expires_at,
         maximum_transfer_bytes=payload.maximum_transfer_bytes,
         maximum_uses=payload.maximum_uses,
@@ -454,7 +558,7 @@ def create_invitation(
         action="invitation.created",
         object_type="upload_invitation",
         object_id=str(invitation.id),
-        metadata={"project_codes": payload.project_codes},
+        metadata={"project_codes": payload.project_codes, "purpose": payload.purpose},
     )
     database.commit()
     return InvitationResponse(
@@ -463,6 +567,7 @@ def create_invitation(
         expires_at=invitation.expires_at,
         project_codes=sorted(project.project_code for project in projects),
         maximum_uses=invitation.maximum_uses,
+        purpose=invitation.purpose,
     )
 
 
@@ -533,6 +638,7 @@ def exchange_invitation(
         expires_at=courier_session.expires_at,
         refresh_expires_at=refresh_expires_at,
         projects=[ProjectResponse.model_validate(project) for project in invitation.projects],
+        purpose=invitation.purpose,
     )
 
 
@@ -580,7 +686,141 @@ def refresh_session(
             ProjectResponse.model_validate(project)
             for project in courier_session.invitation.projects
         ],
+        purpose=courier_session.invitation.purpose,
     )
+
+
+@client.get("/auth/session", response_model=SessionAuthorization)
+def session_authorization(identity: CourierIdentity) -> SessionAuthorization:
+    return SessionAuthorization(
+        projects=[
+            ProjectResponse.model_validate(project) for project in identity.invitation.projects
+        ],
+        purpose=identity.invitation.purpose,
+    )
+
+
+def downloadable_dataset(transfer: Transfer) -> DownloadDatasetSummary:
+    return DownloadDatasetSummary(
+        transfer_id=transfer.public_id,
+        project_code=transfer.project.project_code,
+        source_name=transfer.source_name,
+        file_count=transfer.file_count,
+        original_bytes=transfer.original_bytes,
+        transport_bytes=known_transport_bytes(transfer),
+        verified_at=transfer.verified_at,
+        hash_algorithm=transfer.hash_algorithm,
+    )
+
+
+def require_download_invitation(identity: CourierIdentity) -> set[uuid.UUID]:
+    if identity.invitation.purpose != "download":
+        raise HTTPException(status_code=403, detail="invitation does not allow downloads")
+    return {project.id for project in identity.invitation.projects}
+
+
+@client.get("/downloads", response_model=list[DownloadDatasetSummary])
+def list_downloadable_datasets(
+    database: Database, identity: CourierIdentity
+) -> list[DownloadDatasetSummary]:
+    project_ids = require_download_invitation(identity)
+    transfers = database.scalars(
+        select(Transfer)
+        .where(Transfer.project_id.in_(project_ids), Transfer.status == "complete")
+        .order_by(Transfer.verified_at.desc())
+    ).unique()
+    return [downloadable_dataset(transfer) for transfer in transfers]
+
+
+@client.post("/downloads/{transfer_id}", response_model=DownloadPlan)
+def create_download_plan(
+    transfer_id: str, database: Database, identity: CourierIdentity, storage: Storage
+) -> DownloadPlan:
+    project_ids = require_download_invitation(identity)
+    transfer = database.scalar(select(Transfer).where(Transfer.public_id == transfer_id))
+    if transfer is None or transfer.project_id not in project_ids:
+        raise HTTPException(status_code=404, detail="dataset not found")
+    if transfer.status != "complete" or transfer.verified_at is None or transfer.manifest is None:
+        raise HTTPException(status_code=409, detail="dataset is not verified and downloadable")
+    objects = [
+        DownloadObject(
+            object_id=item.id,
+            kind=item.kind,
+            compression=item.compression,
+            encoding_version=item.encoding_version,
+            original_bytes=item.original_bytes,
+            transport_bytes=(
+                sum(part.size for part in item.parts if part.size is not None)
+                if all(part.size is not None for part in item.parts)
+                else None
+            ),
+        )
+        for item in sorted(transfer.transport_objects, key=lambda value: str(value.id))
+    ]
+    record_event(
+        database,
+        actor=f"courier:{identity.client_identifier}",
+        action="transfer.client_download_planned",
+        object_type="transfer",
+        object_id=transfer.public_id,
+        metadata={"project_code": transfer.project.project_code, "object_count": len(objects)},
+    )
+    database.commit()
+    return DownloadPlan(
+        dataset=downloadable_dataset(transfer),
+        expires_in_seconds=storage.url_lifetime,
+        manifest=transfer.manifest,
+        objects=objects,
+    )
+
+
+@client.post(
+    "/downloads/{transfer_id}/objects/{object_id}/authorize",
+    response_model=DownloadObject,
+)
+def authorize_download_object(
+    transfer_id: str,
+    object_id: uuid.UUID,
+    database: Database,
+    identity: CourierIdentity,
+    storage: Storage,
+) -> DownloadObject:
+    project_ids = require_download_invitation(identity)
+    transfer = database.scalar(select(Transfer).where(Transfer.public_id == transfer_id))
+    if transfer is None or transfer.project_id not in project_ids:
+        raise HTTPException(status_code=404, detail="dataset not found")
+    if transfer.status != "complete" or transfer.verified_at is None:
+        raise HTTPException(status_code=409, detail="dataset is not verified and downloadable")
+    item = database.scalar(
+        select(TransferObject).where(
+            TransferObject.transfer_id == transfer.id, TransferObject.id == object_id
+        )
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail="download object not found")
+    result = DownloadObject(
+        object_id=item.id,
+        kind=item.kind,
+        compression=item.compression,
+        encoding_version=item.encoding_version,
+        original_bytes=item.original_bytes,
+        transport_bytes=(
+            sum(part.size for part in item.parts if part.size is not None)
+            if all(part.size is not None for part in item.parts)
+            else None
+        ),
+        url=storage.authorize_download(item.object_key),
+    )
+    record_event(
+        database,
+        actor=f"courier:{identity.client_identifier}",
+        action="transfer.client_download_object_authorized",
+        object_type="transfer",
+        object_id=transfer.public_id,
+        metadata={"object_id": str(item.id), "expires_in_seconds": storage.url_lifetime},
+    )
+    database.commit()
+    return result
 
 
 @client.post("/transfers", response_model=TransferResponse, status_code=status.HTTP_201_CREATED)
@@ -591,6 +831,8 @@ def create_transfer(
     response: Response,
     settings: Configuration,
 ) -> Transfer:
+    if identity.invitation.purpose != "upload":
+        raise HTTPException(status_code=403, detail="download invitations are read-only")
     if payload.file_count > settings.maximum_transfer_files:
         raise HTTPException(status_code=413, detail="transfer exceeds Registry file-count limit")
     allowed = {project.project_code: project for project in identity.invitation.projects}
@@ -880,6 +1122,17 @@ def complete_multipart(
     transport_object.completed_at = datetime.now(UTC)
     for transfer_file in transport_object.files:
         transfer_file.status = "uploaded"
+    if all(
+        item.status in {"uploaded", "verified"}
+        for item in transport_object.transfer.transport_objects
+    ):
+        sizes = [
+            part.size for item in transport_object.transfer.transport_objects for part in item.parts
+        ]
+        if all(size is not None for size in sizes):
+            transport_object.transfer.transport_bytes = sum(
+                size for size in sizes if size is not None
+            )
     database.commit()
     return CompleteMultipartResponse(file_id=object_id, status="uploaded", etag=etag)
 

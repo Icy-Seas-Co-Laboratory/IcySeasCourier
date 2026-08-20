@@ -52,6 +52,13 @@ def test_first_admin_login_enrolls_totp_and_returns_a_short_lived_session(
         ).status_code
         == 200
     )
+    renewed = client.post(
+        "/api/v1/admin/authentication/renew",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert renewed.status_code == 200
+    assert renewed.json()["access_token"].startswith("isca_")
+    assert renewed.json()["access_token"] != token
 
     repeated_setup = client.post(
         "/api/v1/admin/authentication/setup",
@@ -64,6 +71,19 @@ def test_first_admin_login_enrolls_totp_and_returns_a_short_lived_session(
         json={"admin_key": "test-admin-key", "totp_code": code},
     )
     assert replayed_code.status_code == 401
+
+
+def test_admin_session_renewal_requires_an_existing_bearer_session(
+    client: TestClient,
+) -> None:
+    assert client.post("/api/v1/admin/authentication/renew").status_code == 401
+    assert (
+        client.post(
+            "/api/v1/admin/authentication/renew",
+            headers={"X-Admin-Key": "test-admin-key"},
+        ).status_code
+        == 401
+    )
 
 
 def test_static_admin_key_is_not_an_api_session_outside_development(

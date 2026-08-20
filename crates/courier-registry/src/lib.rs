@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    path::Component,
+    path::{Component, Path},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -20,6 +20,8 @@ use uuid::Uuid;
 pub enum RegistryError {
     #[error("Registry request failed: {0}")]
     Transport(#[from] reqwest::Error),
+    #[error("Registry download I/O failed: {0}")]
+    Io(#[from] std::io::Error),
     #[error("Registry rejected the request ({status}): {detail}")]
     Rejected { status: StatusCode, detail: String },
     #[error("Registry response did not match local transfer state: {0}")]
@@ -50,6 +52,51 @@ pub struct RegistrySession {
     pub expires_at: DateTime<Utc>,
     pub refresh_expires_at: DateTime<Utc>,
     pub projects: Vec<RegistryProject>,
+    pub purpose: RegistryInvitationPurpose,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RegistryInvitationPurpose {
+    Upload,
+    Download,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RegistryAuthorization {
+    pub projects: Vec<RegistryProject>,
+    pub purpose: RegistryInvitationPurpose,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RegistryDownloadDataset {
+    pub transfer_id: String,
+    pub project_code: String,
+    pub source_name: String,
+    pub file_count: u64,
+    pub original_bytes: u64,
+    pub transport_bytes: Option<u64>,
+    pub verified_at: DateTime<Utc>,
+    pub hash_algorithm: HashAlgorithm,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct RegistryDownloadObject {
+    pub object_id: Uuid,
+    pub kind: String,
+    pub compression: String,
+    pub encoding_version: u8,
+    pub original_bytes: u64,
+    pub transport_bytes: Option<u64>,
+    pub url: Option<String>,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct RegistryDownloadPlan {
+    pub dataset: RegistryDownloadDataset,
+    pub expires_in_seconds: u64,
+    pub manifest: serde_json::Value,
+    pub objects: Vec<RegistryDownloadObject>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -208,6 +255,77 @@ impl RegistryClient {
                 .get(format!("{}/api/v1/system/config", self.base_url)),
         )
         .await
+    }
+
+    pub async fn session_authorization(&self) -> Result<RegistryAuthorization, RegistryError> {
+        self.send_json(
+            self.authorized(
+                self.http
+                    .get(format!("{}/api/v1/auth/session", self.base_url)),
+            )?,
+        )
+        .await
+    }
+
+    pub async fn downloadable_datasets(
+        &self,
+    ) -> Result<Vec<RegistryDownloadDataset>, RegistryError> {
+        self.send_json(
+            self.authorized(self.http.get(format!("{}/api/v1/downloads", self.base_url)))?,
+        )
+        .await
+    }
+
+    pub async fn download_plan(
+        &self,
+        transfer_id: &str,
+    ) -> Result<RegistryDownloadPlan, RegistryError> {
+        self.send_json(
+            self.authorized(
+                self.http
+                    .post(format!("{}/api/v1/downloads/{transfer_id}", self.base_url)),
+            )?,
+        )
+        .await
+    }
+
+    pub async fn authorize_download_object(
+        &self,
+        transfer_id: &str,
+        object_id: Uuid,
+    ) -> Result<RegistryDownloadObject, RegistryError> {
+        self.send_json(self.authorized(self.http.post(format!(
+            "{}/api/v1/downloads/{transfer_id}/objects/{object_id}/authorize",
+            self.base_url
+        )))?)
+        .await
+    }
+
+    pub async fn download_object(
+        &self,
+        url: &str,
+        destination: &Path,
+        mut progress: impl FnMut(u64),
+    ) -> Result<u64, RegistryError> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut response = self.http.get(url).send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(RegistryError::Rejected {
+                status,
+                detail: "object storage rejected the download".into(),
+            });
+        }
+        let mut output = tokio::fs::File::create(destination).await?;
+        let mut received = 0_u64;
+        while let Some(chunk) = response.chunk().await? {
+            output.write_all(&chunk).await?;
+            received = received.saturating_add(chunk.len() as u64);
+            progress(received);
+        }
+        output.flush().await?;
+        Ok(received)
     }
     pub fn unauthenticated(base_url: impl Into<String>) -> Self {
         Self {
@@ -727,6 +845,7 @@ impl MultipartStore for RegistryMultipartStore {
 fn map_registry_error(error: RegistryError) -> StoreError {
     match error {
         RegistryError::Transport(error) => map_transport(error),
+        RegistryError::Io(error) => StoreError::Permanent(error.to_string()),
         RegistryError::Rejected { status, detail } => map_status(status, detail),
         RegistryError::State(detail) => StoreError::Permanent(detail),
     }
@@ -828,7 +947,7 @@ mod tests {
                     0 => ("401 Unauthorized", r#"{"detail":"expired"}"#),
                     1 => (
                         "200 OK",
-                        r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_at":"2030-01-01T00:00:00Z","refresh_expires_at":"2030-02-01T00:00:00Z","projects":[]}"#,
+                        r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_at":"2030-01-01T00:00:00Z","refresh_expires_at":"2030-02-01T00:00:00Z","projects":[],"purpose":"upload"}"#,
                     ),
                     _ => (
                         "200 OK",

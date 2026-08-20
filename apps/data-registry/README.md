@@ -15,7 +15,7 @@ stack. Supported values are `sha256` (default), `xxhash3` (128-bit XXH3), and
 algorithm in manifest v3. Changing the setting affects new transfers; existing
 manifests retain their recorded algorithm.
 
-The Data Registry is Courier's control plane. It manages projects, upload invitations, short-lived access sessions with rotating refresh credentials, transfers, provenance, and audit events. Dataset bytes never pass through FastAPI.
+The Data Registry is Courier's control plane. It manages projects, distinct upload and read-only download invitations, short-lived access sessions with rotating refresh credentials, transfers, provenance, and audit events. Download invitations dynamically list only completed, verified transfers in their authorized projects. Dataset bytes never pass through FastAPI: the API issues short-lived object URLs and Courier performs verified reconstruction locally.
 
 ## Development
 

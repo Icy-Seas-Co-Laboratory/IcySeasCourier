@@ -9,8 +9,8 @@ pub mod retry;
 pub use db::TransferStore;
 pub use error::{CourierError, Result};
 pub use inventory::{
-    InventoryOptions, InventoryProgress, inventory_transfer, inventory_transfer_observed,
-    verify_source_unchanged,
+    InventoryOptions, InventoryProgress, digest_file, inventory_transfer,
+    inventory_transfer_observed, verify_source_unchanged,
 };
 pub use model::{
     FileRecord, FileStatus, HashAlgorithm, PartRecord, PartStatus, RegistrySessionRecord, Transfer,

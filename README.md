@@ -58,7 +58,7 @@ npm run check
 npm run tauri dev
 ```
 
-The desktop exchanges Registry invitations, presents only authorized projects, groups files up to 8 MiB into deterministic 64 MiB target zstd transport packs, registers immutable v3 manifests, and uploads through short-lived part-specific URLs. Pack files, multipart state, and rotating Registry sessions are cached for pause/resume recovery; pack files are removed after Registry verification completes. Courier displays live confirmed logical-byte progress, keeps credentials in the operating system vault, and never describes an object-store upload as a verified dataset.
+The desktop exchanges project-scoped Registry invitations. Upload invitations present only authorized projects, group files up to 8 MiB into deterministic 64 MiB target zstd transport packs, register immutable v3 manifests, and upload through short-lived part-specific URLs. Read-only download invitations list the project's completed, verified datasets and restore a selected dataset through short-lived S3 URLs. Courier rejects unsafe paths, reconstructs packs, verifies every logical file against the immutable manifest, and atomically publishes the chosen destination. Credentials remain in the operating-system vault, and Courier never describes an object-store upload or unverified restoration as a verified dataset.
 
 ## Status language
 
@@ -66,7 +66,7 @@ Courier deliberately distinguishes `uploaded` from `complete`. Local upload comp
 
 ## Data Registry
 
-The FastAPI/PostgreSQL control plane supports projects, hashed upload invitations, rotating renewable Courier sessions, scoped and idempotent transfer creation, immutable canonical v3 manifests, opaque transport object keys, narrowly scoped multipart authorization, audit events, schema migrations, request limits, security headers, and health/readiness endpoints.
+The FastAPI/PostgreSQL control plane supports projects, hashed upload and read-only download invitations, rotating renewable Courier sessions, scoped and idempotent transfer creation, immutable canonical v3 manifests, opaque transport object keys, narrowly scoped multipart and download authorization, audit events, schema migrations, request limits, security headers, and health/readiness endpoints.
 
 ```bash
 ./scripts/dev-up.sh

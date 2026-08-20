@@ -37,4 +37,17 @@ export interface RegistryAuthorization {
   expiresAt: string;
   projects: RegistryProject[];
   hashAlgorithm: "sha256" | "xxhash3" | "blake3";
+  purpose: "upload" | "download";
+  downloads: DownloadDataset[];
+}
+
+export interface DownloadDataset {
+  transfer_id: string;
+  project_code: string;
+  source_name: string;
+  file_count: number;
+  original_bytes: number;
+  transport_bytes: number | null;
+  verified_at: string;
+  hash_algorithm: "sha256" | "xxhash3" | "blake3";
 }

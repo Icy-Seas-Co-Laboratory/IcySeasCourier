@@ -69,6 +69,7 @@ class UploadInvitation(Base):
     __tablename__ = "upload_invitations"
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    purpose: Mapped[str] = mapped_column(String(20), default="upload")
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     maximum_transfer_bytes: Mapped[int | None] = mapped_column(BigInteger)
     maximum_uses: Mapped[int | None] = mapped_column(Integer)

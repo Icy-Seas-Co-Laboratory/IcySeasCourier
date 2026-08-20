@@ -118,11 +118,11 @@ docker compose exec postgres psql -U registry -d registry \
 Open the tailnet-only admin URL described above from an approved VPN client and complete TOTP authentication:
 
 1. Create an active project with its stable project code.
-2. Issue a single-use invitation with an expiry and a suitable maximum transfer size.
+2. Choose the invitation access type. Use **Upload datasets** for contributors, or **Download verified datasets** for a read-only client delivery. Select the authorized project(s), expiry, and use limit; upload invitations may also set a maximum transfer size.
 3. Send the tester the Registry HTTPS address and invitation code through an approved channel.
 4. Never send the admin key to a beta tester.
 
-In Courier, the tester enters the Registry address and invitation code. Courier requires HTTPS for non-loopback Registry addresses, saves the selected endpoint, stores credentials in the operating-system vault, and binds every new transfer to that Registry. Changing the active Registry later does not redirect existing transfers.
+In Courier, the tester enters the Registry address and invitation code. Courier requires HTTPS for non-loopback Registry addresses, saves the selected endpoint, and stores credentials in the operating-system vault. Upload invitations open the source workflow. Download invitations show only completed, independently verified datasets belonging to the authorized projects.
 
 Ask testers to leave source files in place and unchanged until the transfer reaches **Complete**. `Finalizing` and `Verifying` do not mean that scientific integrity has been confirmed.
 
@@ -142,6 +142,53 @@ Before inviting external testers, complete this sequence from a separate beta cl
 10. Confirm that completed pack caches disappear from the client after status refresh.
 
 Record the Courier version, Registry image/version, operating system, dataset shape, transfer ID, and outcome for every acceptance run.
+
+## Retrieve a verified dataset
+
+For client delivery, issue a **Download verified datasets** invitation for the
+project. The client enters it in Courier, selects an available dataset and a local
+destination, and Courier downloads the transport objects directly from S3. It
+rejects unsafe or colliding manifest paths, reconstructs `ISCPACK1` packs, checks
+every original size and digest, preserves file modification times, and atomically
+publishes the destination only after all checks succeed. A failed attempt removes
+its private partial directory. The invitation is project-scoped, so other projects
+and incomplete or failed transfers are never listed.
+
+The administrator-only server retrieval command remains available for operational
+recovery and managed-storage workflows:
+
+The supported retrieval path reconstructs logical files from their S3 transport
+objects, validates every file against the immutable manifest, and publishes the
+result only after the complete transfer succeeds. Configure
+`REGISTRY_EXPORT_PATH` as an absolute host directory with enough space for the
+uncompressed dataset, then run the command offered by the transfer detail in the
+admin console. Its form is:
+
+```bash
+docker compose exec data-registry python -m data_registry.retrieve \
+  ISC-TR-EXAMPLE /exports/ISC-TR-EXAMPLE
+```
+
+The corresponding host directory contains:
+
+```text
+ISC-TR-EXAMPLE/
+  data/                 # reconstructed original directory tree
+  courier-metadata/
+    manifest.json       # immutable transfer manifest
+    retrieval.json      # retrieval receipt and byte totals
+```
+
+The destination must not already exist. A failed reconstruction removes its
+partial directory. Successful retrieval is written to the Registry audit log.
+Move or copy the completed directory to its managed working-storage destination
+over SSH/rsync or another authenticated operator channel; do not treat the export
+directory as archive or backup storage.
+
+For diagnostics, the admin console can also issue 15-minute presigned S3 GET
+commands for the raw transport objects. Those commands do not restore original
+paths, and `.iscpack.zst` objects require Courier-aware unpacking, so they are not
+the normal dataset retrieval workflow.
 
 ## Backup and restore
 

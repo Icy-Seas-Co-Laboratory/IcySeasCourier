@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     path::{Path, PathBuf},
     sync::{
@@ -12,12 +12,12 @@ use std::{
 use courier_core::{
     FileRecord, FileStatus, HashAlgorithm, InventoryOptions, RegistrySessionRecord, RetryPolicy,
     Transfer, TransferStatus, TransferStore, TransportMemberRecord, TransportObjectKind,
-    TransportObjectRecord, inventory_transfer_observed,
+    TransportObjectRecord, digest_file, inventory_transfer_observed,
 };
-use courier_pack::{PackOptions, encode_pack, plan_packs};
+use courier_pack::{PackOptions, decode_pack, encode_pack, plan_packs};
 use courier_registry::{
-    ManifestTransportPlan, RegistryClient, RegistryMultipartStore, RegistryObjectBinding,
-    RegistryProject,
+    ManifestTransportPlan, RegistryClient, RegistryDownloadDataset, RegistryDownloadPlan,
+    RegistryInvitationPurpose, RegistryMultipartStore, RegistryObjectBinding, RegistryProject,
 };
 use courier_transfer::{
     MultipartLimits, PartUploadEvent, UploadError, UploadObserver, complete_uploaded_file,
@@ -28,9 +28,20 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use url::{Host, Url};
 use uuid::Uuid;
 
-#[derive(Default)]
 struct RuntimeState {
     controls: Mutex<HashMap<Uuid, Arc<AtomicBool>>>,
+    credentials: Arc<Mutex<HashMap<String, RegistryCredentials>>>,
+    session_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Default for RuntimeState {
+    fn default() -> Self {
+        Self {
+            controls: Mutex::new(HashMap::new()),
+            credentials: Arc::new(Mutex::new(HashMap::new())),
+            session_gate: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -56,11 +67,67 @@ struct InventoryProgressEvent {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct TransferSizes {
+    original_bytes: u64,
+    transport_bytes: Option<u64>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct RegistryAuthorization {
     registry_url: String,
     expires_at: chrono::DateTime<chrono::Utc>,
     projects: Vec<RegistryProject>,
     hash_algorithm: HashAlgorithm,
+    purpose: RegistryInvitationPurpose,
+    downloads: Vec<RegistryDownloadDataset>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadProgressEvent {
+    transfer_id: String,
+    received_bytes: u64,
+    total_bytes: u64,
+    restored_files: u64,
+    total_files: u64,
+    current_file: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadResult {
+    transfer_id: String,
+    destination: String,
+    restored_files: u64,
+    original_bytes: u64,
+    transport_bytes: u64,
+}
+
+#[derive(Deserialize)]
+struct DownloadManifest {
+    files: Vec<DownloadManifestFile>,
+}
+
+#[derive(Deserialize)]
+struct DownloadManifestFile {
+    path: String,
+    size: u64,
+    mtime: chrono::DateTime<chrono::Utc>,
+    digest: DownloadDigest,
+    transport: DownloadTransport,
+}
+
+#[derive(Deserialize)]
+struct DownloadDigest {
+    algorithm: HashAlgorithm,
+    value: String,
+}
+
+#[derive(Deserialize)]
+struct DownloadTransport {
+    object_id: Uuid,
+    member_index: u32,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -82,9 +149,28 @@ fn save_credentials(base_url: &str, credentials: &RegistryCredentials) -> Result
         .map_err(display)
 }
 
-fn load_credentials(base_url: &str) -> Result<Option<RegistryCredentials>, String> {
+fn load_credentials(
+    base_url: &str,
+    cache: &Mutex<HashMap<String, RegistryCredentials>>,
+) -> Result<Option<RegistryCredentials>, String> {
+    if let Some(credentials) = cache
+        .lock()
+        .map_err(|_| "Registry credential cache is unavailable".to_string())?
+        .get(base_url)
+        .cloned()
+    {
+        return Ok(Some(credentials));
+    }
     match credential_entry(base_url)?.get_password() {
-        Ok(encoded) => serde_json::from_str(&encoded).map(Some).map_err(display),
+        Ok(encoded) => {
+            let credentials: RegistryCredentials =
+                serde_json::from_str(&encoded).map_err(display)?;
+            cache
+                .lock()
+                .map_err(|_| "Registry credential cache is unavailable".to_string())?
+                .insert(base_url.to_owned(), credentials.clone());
+            Ok(Some(credentials))
+        }
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(error) => Err(display(error)),
     }
@@ -106,14 +192,17 @@ fn persist_registry_session(
     store: &TransferStore,
     base_url: &str,
     session: &courier_registry::RegistrySession,
+    cache: &Mutex<HashMap<String, RegistryCredentials>>,
 ) -> Result<(), String> {
-    save_credentials(
-        base_url,
-        &RegistryCredentials {
-            access_token: session.access_token.clone(),
-            refresh_token: session.refresh_token.clone(),
-        },
-    )?;
+    let credentials = RegistryCredentials {
+        access_token: session.access_token.clone(),
+        refresh_token: session.refresh_token.clone(),
+    };
+    save_credentials(base_url, &credentials)?;
+    cache
+        .lock()
+        .map_err(|_| "Registry credential cache is unavailable".to_string())?
+        .insert(base_url.to_owned(), credentials);
     store
         .save_registry_session(&session_record(base_url.to_owned(), session)?)
         .map_err(display)
@@ -123,12 +212,17 @@ async fn active_registry_session(
     store: &TransferStore,
     base_url: &str,
     database: &std::path::Path,
+    credential_cache: &Arc<Mutex<HashMap<String, RegistryCredentials>>>,
+    session_gate: &Arc<tokio::sync::Mutex<()>>,
 ) -> Result<(RegistryClient, RegistrySessionRecord), String> {
+    // Credential refresh tokens rotate. Keep lookup and refresh serialized so concurrent
+    // status polls cannot prompt repeatedly or attempt to reuse the same refresh token.
+    let _session_guard = session_gate.lock().await;
     let metadata = store
         .registry_session(base_url)
         .map_err(display)?
         .ok_or_else(|| "Enter a Registry invitation to authorize this device".to_string())?;
-    let credentials = load_credentials(base_url)?.ok_or_else(|| {
+    let credentials = load_credentials(base_url, credential_cache)?.ok_or_else(|| {
         "Registry credentials are unavailable in the operating system credential vault; enter a new invitation"
             .to_string()
     })?;
@@ -138,6 +232,7 @@ async fn active_registry_session(
     if metadata.expires_at > chrono::Utc::now() + chrono::Duration::minutes(5) {
         let observer_database = database.to_path_buf();
         let observer_url = base_url.to_owned();
+        let observer_cache = credential_cache.clone();
         return Ok((
             RegistryClient::renewable(
                 base_url,
@@ -145,7 +240,7 @@ async fn active_registry_session(
                 credentials.refresh_token,
                 Arc::new(move |session| {
                     let store = TransferStore::open(&observer_database).map_err(display)?;
-                    persist_registry_session(&store, &observer_url, session)
+                    persist_registry_session(&store, &observer_url, session, &observer_cache)
                 }),
             ),
             metadata,
@@ -155,10 +250,11 @@ async fn active_registry_session(
         .refresh_session(&credentials.refresh_token)
         .await
         .map_err(display)?;
-    persist_registry_session(store, base_url, &refreshed)?;
+    persist_registry_session(store, base_url, &refreshed, credential_cache)?;
     let metadata = session_record(base_url.to_owned(), &refreshed)?;
     let observer_database = database.to_path_buf();
     let observer_url = base_url.to_owned();
+    let observer_cache = credential_cache.clone();
     Ok((
         RegistryClient::renewable(
             base_url,
@@ -166,7 +262,7 @@ async fn active_registry_session(
             refreshed.refresh_token,
             Arc::new(move |session| {
                 let store = TransferStore::open(&observer_database).map_err(display)?;
-                persist_registry_session(&store, &observer_url, session)
+                persist_registry_session(&store, &observer_url, session, &observer_cache)
             }),
         ),
         metadata,
@@ -227,6 +323,7 @@ async fn registry_endpoint(app: AppHandle) -> Result<String, String> {
 #[tauri::command]
 async fn exchange_invitation(
     app: AppHandle,
+    runtime: State<'_, RuntimeState>,
     registry_url: String,
     invitation_code: String,
 ) -> Result<RegistryAuthorization, String> {
@@ -235,10 +332,20 @@ async fn exchange_invitation(
         .exchange_invitation(invitation_code.trim(), "courier-desktop")
         .await
         .map_err(display)?;
+    let downloads = if remote.purpose == RegistryInvitationPurpose::Download {
+        RegistryClient::authenticated(&base_url, &remote.access_token)
+            .downloadable_datasets()
+            .await
+            .map_err(display)?
+    } else {
+        Vec::new()
+    };
     let authorization = RegistryAuthorization {
         registry_url: base_url.clone(),
         expires_at: remote.expires_at,
         projects: remote.projects.clone(),
+        purpose: remote.purpose,
+        downloads,
         hash_algorithm: RegistryClient::unauthenticated(&base_url)
             .system_config()
             .await
@@ -246,9 +353,10 @@ async fn exchange_invitation(
             .hash_algorithm,
     };
     let database = database_path(&app)?;
+    let credential_cache = runtime.credentials.clone();
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         let store = TransferStore::open(&database).map_err(display)?;
-        persist_registry_session(&store, &base_url, &remote)?;
+        persist_registry_session(&store, &base_url, &remote, &credential_cache)?;
         store.set_active_registry(&base_url).map_err(display)
     })
     .await
@@ -258,23 +366,46 @@ async fn exchange_invitation(
 }
 
 #[tauri::command]
-async fn current_authorization(app: AppHandle) -> Result<Option<RegistryAuthorization>, String> {
+async fn current_authorization(
+    app: AppHandle,
+    runtime: State<'_, RuntimeState>,
+) -> Result<Option<RegistryAuthorization>, String> {
     let database = database_path(&app)?;
+    let credential_cache = runtime.credentials.clone();
+    let session_gate = runtime.session_gate.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let store = TransferStore::open(&database).map_err(display)?;
         let base_url = configured_registry_url(&store)?;
         tauri::async_runtime::block_on(async {
-            match active_registry_session(&store, &base_url, &database).await {
-                Ok((_, record)) => Ok(Some(RegistryAuthorization {
-                    registry_url: base_url.clone(),
-                    expires_at: record.expires_at,
-                    projects: serde_json::from_str(&record.projects_json).map_err(display)?,
-                    hash_algorithm: RegistryClient::unauthenticated(&base_url)
-                        .system_config()
-                        .await
-                        .map_err(display)?
-                        .hash_algorithm,
-                })),
+            match active_registry_session(
+                &store,
+                &base_url,
+                &database,
+                &credential_cache,
+                &session_gate,
+            )
+            .await
+            {
+                Ok((client, record)) => {
+                    let remote = client.session_authorization().await.map_err(display)?;
+                    let downloads = if remote.purpose == RegistryInvitationPurpose::Download {
+                        client.downloadable_datasets().await.map_err(display)?
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(Some(RegistryAuthorization {
+                        registry_url: base_url.clone(),
+                        expires_at: record.expires_at,
+                        projects: remote.projects,
+                        purpose: remote.purpose,
+                        downloads,
+                        hash_algorithm: RegistryClient::unauthenticated(&base_url)
+                            .system_config()
+                            .await
+                            .map_err(display)?
+                            .hash_algorithm,
+                    }))
+                }
                 Err(error)
                     if error.contains("enter a new invitation")
                         || error.contains("Enter a Registry invitation") =>
@@ -287,6 +418,311 @@ async fn current_authorization(app: AppHandle) -> Result<Option<RegistryAuthoriz
     })
     .await
     .map_err(|error| format!("Session lookup failed: {error}"))?
+}
+
+fn safe_relative_path(root: &Path, value: &str) -> Result<PathBuf, String> {
+    if value.is_empty() || value.contains('\\') {
+        return Err(format!("Manifest contains an unsafe path: {value}"));
+    }
+    let path = Path::new(value);
+    if path
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!("Manifest contains an unsafe path: {value}"));
+    }
+    Ok(root.join(path))
+}
+
+fn safe_dataset_name(source_name: &str, transfer_id: &str) -> String {
+    let candidate = Path::new(source_name);
+    match (candidate.file_name(), candidate.components().count()) {
+        (Some(name), 1) if !name.is_empty() => name.to_string_lossy().into_owned(),
+        _ => transfer_id.to_owned(),
+    }
+}
+
+fn validate_download_manifest(manifest: &DownloadManifest) -> Result<(), String> {
+    let mut paths = HashSet::new();
+    for file in &manifest.files {
+        safe_relative_path(Path::new("."), &file.path)?;
+        if !paths.insert(file.path.to_lowercase()) {
+            return Err(format!(
+                "Manifest contains a duplicate or case-colliding path: {}",
+                file.path
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_restored_file(path: &Path, file: &DownloadManifestFile) -> Result<(), String> {
+    let metadata = path.metadata().map_err(display)?;
+    if metadata.len() != file.size {
+        return Err(format!("Restored size mismatch for {}", file.path));
+    }
+    let actual = digest_file(path, file.digest.algorithm).map_err(display)?;
+    if actual != file.digest.value {
+        return Err(format!("Restored digest mismatch for {}", file.path));
+    }
+    filetime::set_file_mtime(
+        path,
+        filetime::FileTime::from_unix_time(
+            file.mtime.timestamp(),
+            file.mtime.timestamp_subsec_nanos(),
+        ),
+    )
+    .map_err(display)
+}
+
+fn emit_download_progress(
+    app: &AppHandle,
+    plan: &RegistryDownloadPlan,
+    received_bytes: u64,
+    restored_files: u64,
+    current_file: String,
+) {
+    let _ = app.emit(
+        "courier://download-progress",
+        DownloadProgressEvent {
+            transfer_id: plan.dataset.transfer_id.clone(),
+            received_bytes,
+            total_bytes: plan.dataset.transport_bytes.unwrap_or(0),
+            restored_files,
+            total_files: plan.dataset.file_count,
+            current_file,
+        },
+    );
+}
+
+async fn restore_download_plan(
+    app: &AppHandle,
+    client: &RegistryClient,
+    plan: &RegistryDownloadPlan,
+    partial: &Path,
+) -> Result<(u64, u64), String> {
+    let manifest: DownloadManifest =
+        serde_json::from_value(plan.manifest.clone()).map_err(display)?;
+    validate_download_manifest(&manifest)?;
+    if manifest.files.len() as u64 != plan.dataset.file_count {
+        return Err("Download manifest file count does not match the verified dataset".into());
+    }
+
+    let cache = partial.join(".courier-transport");
+    fs::create_dir_all(&cache).map_err(display)?;
+    let mut by_object: HashMap<Uuid, Vec<&DownloadManifestFile>> = HashMap::new();
+    for file in &manifest.files {
+        by_object
+            .entry(file.transport.object_id)
+            .or_default()
+            .push(file);
+    }
+    for files in by_object.values_mut() {
+        files.sort_by_key(|file| file.transport.member_index);
+    }
+
+    let mut received_total = 0_u64;
+    let mut restored = 0_u64;
+    for object in &plan.objects {
+        let authorization = client
+            .authorize_download_object(&plan.dataset.transfer_id, object.object_id)
+            .await
+            .map_err(display)?;
+        let url = authorization
+            .url
+            .ok_or_else(|| "Registry omitted the authorized object URL".to_string())?;
+        let cache_path = cache.join(object.object_id.to_string());
+        let before = received_total;
+        let app_for_progress = app.clone();
+        let transfer_for_progress = plan.dataset.transfer_id.clone();
+        let total_transport = plan.dataset.transport_bytes.unwrap_or(0);
+        let total_files = plan.dataset.file_count;
+        let restored_before = restored;
+        let received = client
+            .download_object(&url, &cache_path, move |object_received| {
+                let _ = app_for_progress.emit(
+                    "courier://download-progress",
+                    DownloadProgressEvent {
+                        transfer_id: transfer_for_progress.clone(),
+                        received_bytes: before.saturating_add(object_received),
+                        total_bytes: total_transport,
+                        restored_files: restored_before,
+                        total_files,
+                        current_file: "Downloading verified transport…".into(),
+                    },
+                );
+            })
+            .await
+            .map_err(display)?;
+        if let Some(expected) = object.transport_bytes
+            && received != expected
+        {
+            return Err(format!(
+                "Downloaded object {} has an unexpected size",
+                object.object_id
+            ));
+        }
+        received_total = received_total.saturating_add(received);
+        let expected_files = by_object
+            .remove(&object.object_id)
+            .ok_or_else(|| format!("Manifest does not reference object {}", object.object_id))?;
+
+        match object.kind.as_str() {
+            "file" => {
+                if expected_files.len() != 1 || expected_files[0].transport.member_index != 0 {
+                    return Err(format!(
+                        "Standalone object {} has invalid membership",
+                        object.object_id
+                    ));
+                }
+                let file = expected_files[0];
+                let destination = safe_relative_path(partial, &file.path)?;
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent).map_err(display)?;
+                }
+                fs::copy(&cache_path, &destination).map_err(display)?;
+                verify_restored_file(&destination, file)?;
+                restored = restored.saturating_add(1);
+                emit_download_progress(app, plan, received_total, restored, file.path.clone());
+            }
+            "pack" => {
+                let mut seen = 0_usize;
+                decode_pack(
+                    File::open(&cache_path).map_err(display)?,
+                    |header, reader| {
+                        let file = expected_files.get(seen).ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "pack has extra members",
+                            )
+                        })?;
+                        if header.path != file.path
+                            || header.size != file.size
+                            || header.digest_algorithm != file.digest.algorithm
+                            || header.digest != file.digest.value
+                            || file.transport.member_index as usize != seen
+                        {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "pack member does not match the immutable manifest",
+                            )
+                            .into());
+                        }
+                        let destination =
+                            safe_relative_path(partial, &file.path).map_err(|error| {
+                                std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                            })?;
+                        if let Some(parent) = destination.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        let mut output = File::create(&destination)?;
+                        let copied = std::io::copy(reader, &mut output)?;
+                        if copied != file.size {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "pack member size mismatch",
+                            )
+                            .into());
+                        }
+                        verify_restored_file(&destination, file).map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                        })?;
+                        seen += 1;
+                        Ok(())
+                    },
+                )
+                .map_err(display)?;
+                if seen != expected_files.len() {
+                    return Err(format!(
+                        "Pack {} omitted manifest members",
+                        object.object_id
+                    ));
+                }
+                restored = restored.saturating_add(seen as u64);
+                let current = expected_files
+                    .last()
+                    .map(|file| file.path.clone())
+                    .unwrap_or_default();
+                emit_download_progress(app, plan, received_total, restored, current);
+            }
+            value => {
+                return Err(format!(
+                    "Unsupported Courier transport object kind: {value}"
+                ));
+            }
+        }
+        fs::remove_file(&cache_path).map_err(display)?;
+    }
+    if !by_object.is_empty() || restored != manifest.files.len() as u64 {
+        return Err("Download plan omitted one or more manifest files".into());
+    }
+    fs::remove_dir(&cache).map_err(display)?;
+    let metadata = partial.join("courier-metadata");
+    fs::create_dir_all(&metadata).map_err(display)?;
+    fs::write(
+        metadata.join("manifest.json"),
+        serde_json::to_vec_pretty(&plan.manifest).map_err(display)?,
+    )
+    .map_err(display)?;
+    Ok((restored, received_total))
+}
+
+#[tauri::command]
+async fn download_dataset(
+    app: AppHandle,
+    runtime: State<'_, RuntimeState>,
+    transfer_id: String,
+    destination_directory: String,
+) -> Result<DownloadResult, String> {
+    let database = database_path(&app)?;
+    let credential_cache = runtime.credentials.clone();
+    let session_gate = runtime.session_gate.clone();
+    let (client, _) = tauri::async_runtime::spawn_blocking(move || {
+        let store = TransferStore::open(&database).map_err(display)?;
+        let base_url = configured_registry_url(&store)?;
+        tauri::async_runtime::block_on(active_registry_session(
+            &store,
+            &base_url,
+            &database,
+            &credential_cache,
+            &session_gate,
+        ))
+    })
+    .await
+    .map_err(|error| format!("Session lookup failed: {error}"))??;
+    let plan = client.download_plan(&transfer_id).await.map_err(display)?;
+    let parent = PathBuf::from(destination_directory);
+    if !parent.is_dir() {
+        return Err("Choose an existing destination folder".into());
+    }
+    let name = safe_dataset_name(&plan.dataset.source_name, &plan.dataset.transfer_id);
+    let destination = parent.join(&name);
+    if destination.exists() {
+        return Err(format!(
+            "A file or folder named {name} already exists at the destination"
+        ));
+    }
+    let partial = parent.join(format!(".{name}.courier-partial-{}", Uuid::new_v4()));
+    fs::create_dir(&partial).map_err(display)?;
+    let restored = restore_download_plan(&app, &client, &plan, &partial).await;
+    let (restored_files, transport_bytes) = match restored {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&partial);
+            return Err(error);
+        }
+    };
+    fs::rename(&partial, &destination).map_err(|error| {
+        let _ = fs::remove_dir_all(&partial);
+        display(error)
+    })?;
+    Ok(DownloadResult {
+        transfer_id: plan.dataset.transfer_id,
+        destination: destination.to_string_lossy().into_owned(),
+        restored_files,
+        original_bytes: plan.dataset.original_bytes,
+        transport_bytes,
+    })
 }
 
 struct DesktopObserver {
@@ -370,7 +806,7 @@ fn modified_ns(path: &Path) -> Result<i64, String> {
         .map_err(display)
 }
 
-fn remove_completed_pack_cache(store: &TransferStore, transfer_id: Uuid) {
+fn remove_pack_cache(store: &TransferStore, transfer_id: Uuid) {
     let Ok(objects) = store.transport_objects(transfer_id) else {
         return;
     };
@@ -382,10 +818,7 @@ fn remove_completed_pack_cache(store: &TransferStore, transfer_id: Uuid) {
         if let Err(error) = fs::remove_file(&path)
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            eprintln!(
-                "Could not remove completed Courier pack {}: {error}",
-                path.display()
-            );
+            eprintln!("Could not remove Courier pack {}: {error}", path.display());
         }
     }
     directories.sort();
@@ -395,10 +828,25 @@ fn remove_completed_pack_cache(store: &TransferStore, transfer_id: Uuid) {
             && error.kind() != std::io::ErrorKind::NotFound
         {
             eprintln!(
-                "Could not remove completed Courier pack directory {}: {error}",
+                "Could not remove Courier pack directory {}: {error}",
                 directory.display()
             );
         }
+    }
+}
+
+fn remove_transfer_pack_directory(database: &Path, transfer_id: Uuid) -> Result<(), String> {
+    let cache_root = database
+        .parent()
+        .ok_or_else(|| "Courier data directory is unavailable".to_string())?;
+    let directory = cache_root.join("packs").join(transfer_id.to_string());
+    match fs::remove_dir_all(&directory) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Could not remove Courier pack cache {}: {error}",
+            directory.display()
+        )),
     }
 }
 
@@ -592,8 +1040,70 @@ async fn list_transfers(app: AppHandle) -> Result<Vec<Transfer>, String> {
 }
 
 #[tauri::command]
-async fn refresh_transfer_status(app: AppHandle, transfer_id: Uuid) -> Result<Transfer, String> {
+async fn transfer_sizes(app: AppHandle, transfer_id: Uuid) -> Result<TransferSizes, String> {
     let database = database_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = TransferStore::open(database).map_err(display)?;
+        let transfer = store
+            .get_transfer(transfer_id)
+            .map_err(display)?
+            .ok_or_else(|| format!("Transfer not found: {transfer_id}"))?;
+        let objects = store.transport_objects(transfer_id).map_err(display)?;
+        let transport_bytes = objects
+            .iter()
+            .map(|object| object.transport_bytes)
+            .collect::<Option<Vec<_>>>()
+            .map(|sizes| sizes.into_iter().sum());
+        Ok(TransferSizes {
+            original_bytes: transfer.original_bytes,
+            transport_bytes,
+        })
+    })
+    .await
+    .map_err(|error| format!("Transfer size lookup failed: {error}"))?
+}
+
+#[tauri::command]
+async fn clear_transfers(app: AppHandle, status: TransferStatus) -> Result<usize, String> {
+    if !matches!(
+        status,
+        TransferStatus::Inventorying | TransferStatus::Complete
+    ) {
+        return Err("Only inventorying or completed transfers can be cleared".into());
+    }
+    let database = database_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = TransferStore::open(&database).map_err(display)?;
+        let targets = store
+            .list_transfers()
+            .map_err(display)?
+            .into_iter()
+            .filter(|transfer| transfer.status == status)
+            .collect::<Vec<_>>();
+        let mut removed = 0;
+        for transfer in targets {
+            // Pack files are Courier-owned cache. Original source paths are never removed.
+            remove_pack_cache(&store, transfer.id);
+            remove_transfer_pack_directory(&database, transfer.id)?;
+            if store.delete_transfer(transfer.id).map_err(display)? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    })
+    .await
+    .map_err(|error| format!("Transfer cleanup failed: {error}"))?
+}
+
+#[tauri::command]
+async fn refresh_transfer_status(
+    app: AppHandle,
+    runtime: State<'_, RuntimeState>,
+    transfer_id: Uuid,
+) -> Result<Transfer, String> {
+    let database = database_path(&app)?;
+    let credential_cache = runtime.credentials.clone();
+    let session_gate = runtime.session_gate.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let store = TransferStore::open(&database).map_err(display)?;
         let transfer = store
@@ -608,29 +1118,31 @@ async fn refresh_transfer_status(app: AppHandle, transfer_id: Uuid) -> Result<Tr
             None => configured_registry_url(&store)?,
         };
         tauri::async_runtime::block_on(async {
-            let (client, _) = active_registry_session(&store, &base_url, &database).await?;
+            let (client, _) = active_registry_session(
+                &store,
+                &base_url,
+                &database,
+                &credential_cache,
+                &session_gate,
+            )
+            .await?;
             let remote = client
                 .transfer_status(server_transfer_id)
                 .await
                 .map_err(display)?;
-            let mut current = transfer.status;
             let target = match remote.status.as_str() {
                 "verifying" => Some(TransferStatus::Verifying),
                 "complete" => Some(TransferStatus::Complete),
                 "failed" => Some(TransferStatus::Failed),
                 _ => None,
             };
-            if target == Some(TransferStatus::Complete) && current == TransferStatus::Finalizing {
+            if let Some(target) = target {
                 store
-                    .transition(transfer_id, TransferStatus::Verifying)
+                    .reconcile_registry_status(transfer_id, target)
                     .map_err(display)?;
-                current = TransferStatus::Verifying;
-            }
-            if let Some(target) = target.filter(|target| *target != current) {
-                store.transition(transfer_id, target).map_err(display)?;
             }
             if remote.status == "complete" {
-                remove_completed_pack_cache(&store, transfer_id);
+                remove_pack_cache(&store, transfer_id);
             }
             store
                 .get_transfer(transfer_id)
@@ -655,10 +1167,19 @@ async fn start_upload(
         .lock()
         .map_err(|_| "Upload controls are unavailable".to_string())?
         .insert(transfer_id, pause.clone());
+    let credential_cache = runtime.credentials.clone();
+    let session_gate = runtime.session_gate.clone();
 
     let worker_app = app.clone();
     let worker = tauri::async_runtime::spawn_blocking(move || {
-        run_upload(worker_app, database, transfer_id, pause)
+        run_upload(
+            worker_app,
+            database,
+            transfer_id,
+            pause,
+            credential_cache,
+            session_gate,
+        )
     })
     .await;
 
@@ -675,6 +1196,8 @@ fn run_upload(
     database: PathBuf,
     transfer_id: Uuid,
     pause: Arc<AtomicBool>,
+    credential_cache: Arc<Mutex<HashMap<String, RegistryCredentials>>>,
+    session_gate: Arc<tokio::sync::Mutex<()>>,
 ) -> Result<Transfer, String> {
     let store = TransferStore::open(&database).map_err(display)?;
     let transfer = store
@@ -762,7 +1285,14 @@ fn run_upload(
             Some(value) => normalize_registry_url(&value)?,
             None => configured_registry_url(&store)?,
         };
-        let (client, _) = active_registry_session(&store, &base_url, &database).await?;
+        let (client, _) = active_registry_session(
+            &store,
+            &base_url,
+            &database,
+            &credential_cache,
+            &session_gate,
+        )
+        .await?;
         let project_code = transfer
             .project_id
             .as_deref()
@@ -987,8 +1517,11 @@ pub fn run() {
             registry_endpoint,
             exchange_invitation,
             current_authorization,
+            download_dataset,
             create_inventory,
             list_transfers,
+            transfer_sizes,
+            clear_transfers,
             refresh_transfer_status,
             start_upload,
             pause_upload
@@ -1019,6 +1552,38 @@ mod tests {
         assert!(normalize_registry_url("http://100.64.1.2:8010").is_err());
         assert!(normalize_registry_url("https://user@registry.example.test").is_err());
         assert!(normalize_registry_url("https://registry.example.test/prefix").is_err());
+    }
+
+    #[test]
+    fn download_manifest_paths_are_strictly_relative_and_collision_safe() {
+        let root = Path::new("/tmp/courier-destination");
+        assert_eq!(
+            safe_relative_path(root, "casts/001.csv").unwrap(),
+            root.join("casts/001.csv")
+        );
+        for unsafe_path in ["../secret", "/absolute", "casts\\windows.csv", "./file"] {
+            assert!(safe_relative_path(root, unsafe_path).is_err());
+        }
+
+        let file = |path: &str| DownloadManifestFile {
+            path: path.into(),
+            size: 0,
+            mtime: chrono::Utc::now(),
+            digest: DownloadDigest {
+                algorithm: HashAlgorithm::Sha256,
+                value: "0".repeat(64),
+            },
+            transport: DownloadTransport {
+                object_id: Uuid::nil(),
+                member_index: 0,
+            },
+        };
+        assert!(
+            validate_download_manifest(&DownloadManifest {
+                files: vec![file("Data.csv"), file("data.csv")],
+            })
+            .is_err()
+        );
     }
 
     #[test]

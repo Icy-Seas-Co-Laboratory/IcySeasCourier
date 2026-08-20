@@ -73,8 +73,10 @@ def verify_claim(
         raise RuntimeError("verification claim disappeared")
     verified_files = 0
     verified_bytes = 0
+    transport_bytes = 0
     try:
         for transport_object in transfer.transport_objects:
+            transport_bytes += storage.object_size(transport_object.object_key)
             object_results = verify_transport_object(storage, transport_object)
             for transfer_file, size, digest in object_results:
                 transfer_file.verified_size = size
@@ -86,6 +88,7 @@ def verify_claim(
                 verified_bytes += size
             transport_object.status = "verified"
         transfer.status = "complete"
+        transfer.transport_bytes = transport_bytes
         transfer.verified_at = datetime.now(UTC)
         transfer.verification_error = None
         attempt.status = "complete"

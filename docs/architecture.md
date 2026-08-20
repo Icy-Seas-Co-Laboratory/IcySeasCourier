@@ -31,3 +31,13 @@ Desktop progress is emitted only after a part ETag is committed locally. Pause i
 ## Registry and transport boundary
 
 The Rust Courier client connects to Registry invitation exchange, renewable session rotation (including renewal during active uploads), transfer registration, immutable v3 manifest submission, Registry-issued multipart authorization, and verification status. During inventory it groups eligible small files into cached, deterministic `ISCPACK1` zstd objects while leaving singleton and large files standalone. SQLite remains the recovery source of truth for logical-to-transport membership, multipart progress, non-secret metadata, and Registry identities; rotating access and refresh credentials live in the operating system credential vault. The PostgreSQL-backed ingest worker claims finalized transfers, streams standalone objects or reconstructs packs, records verification evidence for each logical file, and alone advances a transfer to `complete`.
+
+Project-scoped invitations carry one explicit capability: upload, or read-only
+download. A download session dynamically lists only `complete` transfers in its
+authorized projects. Its download plan combines the immutable logical manifest
+with short-lived URLs for the current transport representation; Courier performs
+safe-path reconstruction and verifies every restored digest locally. This keeps
+the project permission and logical-file contract stable when a future processing
+service adds an unpacked `icy-seas-staging` representation: clients and downstream
+tools can select a representation without treating packed incoming objects as the
+logical dataset or broadening access beyond the project.

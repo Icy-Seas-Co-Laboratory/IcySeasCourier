@@ -51,6 +51,14 @@ class ObjectStorage:
             HttpMethod="PUT",
         )
 
+    def authorize_download(self, object_key: str) -> str:
+        return self.public.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": self.bucket, "Key": object_key},
+            ExpiresIn=self.url_lifetime,
+            HttpMethod="GET",
+        )
+
     def complete_multipart(
         self, object_key: str, upload_id: str, parts: list[dict[str, Any]]
     ) -> str:
@@ -65,6 +73,10 @@ class ObjectStorage:
     def open_object(self, object_key: str):
         result = self.internal.get_object(Bucket=self.bucket, Key=object_key)
         return result["Body"]
+
+    def object_size(self, object_key: str) -> int:
+        result = self.internal.head_object(Bucket=self.bucket, Key=object_key)
+        return int(result["ContentLength"])
 
     def object_exists(self, object_key: str) -> bool:
         try:

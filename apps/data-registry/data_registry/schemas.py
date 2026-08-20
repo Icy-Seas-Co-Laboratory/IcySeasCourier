@@ -61,6 +61,7 @@ class ProjectResponse(ORMModel):
 
 
 class InvitationCreate(BaseModel):
+    purpose: Literal["upload", "download"] = "upload"
     project_codes: list[str] = Field(min_length=1)
     expires_at: datetime
     maximum_transfer_bytes: int | None = Field(default=None, ge=0)
@@ -74,6 +75,12 @@ class InvitationCreate(BaseModel):
             raise ValueError("project codes must be unique")
         return values
 
+    @model_validator(mode="after")
+    def download_limits_are_read_only(self) -> "InvitationCreate":
+        if self.purpose == "download" and self.maximum_transfer_bytes is not None:
+            raise ValueError("download invitations cannot set an upload size limit")
+        return self
+
 
 class InvitationResponse(BaseModel):
     id: uuid.UUID
@@ -81,6 +88,7 @@ class InvitationResponse(BaseModel):
     expires_at: datetime
     project_codes: list[str]
     maximum_uses: int | None
+    purpose: Literal["upload", "download"]
 
 
 class AdminInvitationResponse(BaseModel):
@@ -93,6 +101,7 @@ class AdminInvitationResponse(BaseModel):
     created_by: str
     created_at: datetime
     revoked_at: datetime | None
+    purpose: Literal["upload", "download"]
 
 
 class AdminTransferSummary(BaseModel):
@@ -102,6 +111,7 @@ class AdminTransferSummary(BaseModel):
     status: str
     file_count: int
     original_bytes: int
+    transport_bytes: int | None
     courier_version: str
     created_at: datetime
     completed_at: datetime | None
@@ -115,6 +125,25 @@ class AdminTransferDetail(AdminTransferSummary):
     manifest_sha256: str | None
     verification_started_at: datetime | None
     files: list["VerificationFileResponse"]
+
+
+class AdminDownloadObject(BaseModel):
+    object_id: uuid.UUID
+    kind: str
+    compression: str
+    original_bytes: int
+    transport_bytes: int | None
+    filename: str
+    url: str
+
+
+class AdminDownloadPlan(BaseModel):
+    transfer_id: str
+    expires_in_seconds: int
+    contains_packs: bool
+    server_retrieve_command: str
+    shell_command: str
+    objects: list[AdminDownloadObject]
 
 
 class AuditEventResponse(ORMModel):
@@ -135,6 +164,7 @@ class AdminOverviewResponse(BaseModel):
     failed_transfers: int
     completed_transfers: int
     original_bytes: int
+    transport_bytes: int
     hash_algorithm: str
 
 
@@ -151,6 +181,40 @@ class SessionResponse(BaseModel):
     expires_at: datetime
     refresh_expires_at: datetime
     projects: list[ProjectResponse]
+    purpose: Literal["upload", "download"]
+
+
+class SessionAuthorization(BaseModel):
+    projects: list[ProjectResponse]
+    purpose: Literal["upload", "download"]
+
+
+class DownloadDatasetSummary(BaseModel):
+    transfer_id: str
+    project_code: str
+    source_name: str
+    file_count: int
+    original_bytes: int
+    transport_bytes: int | None
+    verified_at: datetime
+    hash_algorithm: HashAlgorithm
+
+
+class DownloadObject(BaseModel):
+    object_id: uuid.UUID
+    kind: str
+    compression: str
+    encoding_version: int
+    original_bytes: int
+    transport_bytes: int | None
+    url: str | None = None
+
+
+class DownloadPlan(BaseModel):
+    dataset: DownloadDatasetSummary
+    expires_in_seconds: int
+    manifest: dict
+    objects: list[DownloadObject]
 
 
 class SessionRefresh(BaseModel):

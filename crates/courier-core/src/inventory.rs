@@ -214,6 +214,11 @@ where
     })
 }
 
+/// Computes a Courier-compatible digest for an existing file.
+pub fn digest_file(path: &Path, algorithm: HashAlgorithm) -> Result<String> {
+    hash_file(path, 1024 * 1024, algorithm, |_| {})
+}
+
 fn modified_ns(metadata: &std::fs::Metadata) -> Result<i64> {
     let duration = metadata
         .modified()
