@@ -52,7 +52,7 @@ The edge network defaults to `172.30.50.0/24`, with `cloudflared` at `172.30.50.
 Create a remotely managed tunnel in Cloudflare and configure two published application routes:
 
 ```text
-courier.icyseascolab.io  ->  http://data-registry:8000
+courier.icyseascolab.io  ->  http://data-registry:8010
 s3.icyseascolab.io       ->  http://seaweedfs:8333
 ```
 

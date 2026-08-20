@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 from datetime import UTC, datetime, timedelta
 
-BASE_URL = os.getenv("E2E_REGISTRY_URL", "http://127.0.0.1:8000")
+BASE_URL = os.getenv("E2E_REGISTRY_URL", "http://127.0.0.1:8010")
 ADMIN_KEY = os.getenv("REGISTRY_ADMIN_API_KEY", "development-only-change-me")
 PROJECT_CODE = os.getenv("DEMO_PROJECT_CODE", "P26014")
 

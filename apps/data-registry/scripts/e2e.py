@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 import blake3
 import xxhash
 
-BASE_URL = os.getenv("E2E_REGISTRY_URL", "http://127.0.0.1:8000")
+BASE_URL = os.getenv("E2E_REGISTRY_URL", "http://127.0.0.1:8010")
 ADMIN_KEY = os.getenv("REGISTRY_ADMIN_API_KEY", "development-only-change-me")
 S3_CONNECT_HOST = os.getenv("E2E_S3_CONNECT_HOST")
 

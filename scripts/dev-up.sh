@@ -19,7 +19,7 @@ fi
 printf '%s\n' "Waiting for Icy Seas Data Registry..."
 attempt=0
 until $COMPOSE exec -T data-registry python -c \
-  "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready')" >/dev/null 2>&1; do
+  "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/ready')" >/dev/null 2>&1; do
   attempt=$((attempt + 1))
   if [ "$attempt" -ge 40 ]; then
     $COMPOSE logs --tail=100 data-registry
