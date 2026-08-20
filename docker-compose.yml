@@ -26,7 +26,7 @@ services:
       - "${SEAWEEDFS_BIND_ADDRESS:-0.0.0.0}:8333:8333"
       - "127.0.0.1:9333:9333"
     volumes:
-      - seaweedfs-data:/data
+      - "${SEAWEEDFS_DATA_PATH:-seaweedfs-data}:/data"
 
   data-registry:
     image: icy-seas-data-registry:dev
