@@ -63,6 +63,7 @@ struct InventoryProgressEvent {
     bytes_analyzed: u64,
     total_bytes: u64,
     current_path: String,
+    phase: &'static str,
 }
 
 #[derive(Clone, Serialize)]
@@ -985,6 +986,7 @@ async fn create_inventory(
                         bytes_analyzed: progress.bytes_analyzed,
                         total_bytes: progress.total_bytes,
                         current_path: progress.current_path.to_string_lossy().into_owned(),
+                        phase: "analyzing",
                     },
                 );
             },
@@ -993,6 +995,18 @@ async fn create_inventory(
                 store
                     .replace_inventory(transfer.id, &files)
                     .map_err(display)?;
+                let _ = worker_app.emit(
+                    "courier://inventory-progress",
+                    InventoryProgressEvent {
+                        transfer_id: transfer.id,
+                        files_analyzed: files.len() as u64,
+                        total_files: files.len() as u64,
+                        bytes_analyzed: files.iter().map(|file| file.size).sum(),
+                        total_bytes: files.iter().map(|file| file.size).sum(),
+                        current_path: "Creating compressed, resumable transport packages".into(),
+                        phase: "packaging",
+                    },
+                );
                 let cache_root = database
                     .parent()
                     .ok_or_else(|| "Courier data directory is unavailable".to_string())?;
@@ -1216,6 +1230,13 @@ fn run_upload(
         TransferStatus::Uploading => {}
         status => return Err(format!("Cannot upload a transfer in state {status}")),
     }
+    emit_upload_activity(
+        &app,
+        transfer_id,
+        0,
+        transfer.original_bytes,
+        "Preparing secure Registry session",
+    );
 
     let retry = RetryPolicy::default();
     let files = store.files_for_transfer(transfer_id).map_err(display)?;
@@ -1293,6 +1314,13 @@ fn run_upload(
             &session_gate,
         )
         .await?;
+        emit_upload_activity(
+            &app,
+            transfer_id,
+            confirmed.load(Ordering::Relaxed),
+            transfer.original_bytes,
+            "Registering dataset and immutable manifest",
+        );
         let project_code = transfer
             .project_id
             .as_deref()
@@ -1390,13 +1418,20 @@ fn run_upload(
                         source.relative_path.to_string_lossy().into_owned()
                     }
                     TransportObjectKind::Pack => {
-                        format!("Packing group ({} files)", object_members.len())
+                        format!("Uploading packed group ({} files)", object_members.len())
                     }
                 },
                 object_original_bytes: object.original_bytes,
                 object_transport_bytes: source.size,
                 object_confirmed_transport_bytes: AtomicU64::new(0),
             };
+            emit_upload_activity(
+                &app,
+                transfer_id,
+                confirmed.load(Ordering::Relaxed),
+                transfer.original_bytes,
+                &observer.current_file,
+            );
             upload_missing_parts_observed(&store, &remote, source, &retry, &observer)
                 .await
                 .map_err(display)?;
@@ -1414,6 +1449,13 @@ fn run_upload(
                 Ordering::Relaxed,
             );
         }
+        emit_upload_activity(
+            &app,
+            transfer_id,
+            confirmed.load(Ordering::Relaxed),
+            transfer.original_bytes,
+            "Finalizing upload with the Registry",
+        );
         client
             .finalize_transfer(&server_transfer_id)
             .await
@@ -1477,6 +1519,25 @@ fn pause_upload(runtime: State<'_, RuntimeState>, transfer_id: Uuid) -> Result<(
         .ok_or_else(|| "Transfer is not currently uploading".to_string())?;
     pause.store(true, Ordering::Relaxed);
     Ok(())
+}
+
+fn emit_upload_activity(
+    app: &AppHandle,
+    transfer_id: Uuid,
+    confirmed_bytes: u64,
+    total_bytes: u64,
+    current_file: &str,
+) {
+    let _ = app.emit(
+        "courier://progress",
+        TransferProgressEvent {
+            transfer_id,
+            confirmed_bytes,
+            total_bytes,
+            current_file: current_file.to_owned(),
+            status: "uploading",
+        },
+    );
 }
 
 fn emit_status(

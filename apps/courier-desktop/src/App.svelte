@@ -21,6 +21,7 @@
     bytesAnalyzed: number;
     totalBytes: number;
     currentPath: string;
+    phase: "analyzing" | "packaging";
   }
   interface TransferSizes {
     originalBytes: number;
@@ -40,6 +41,14 @@
     restoredFiles: number;
     originalBytes: number;
     transportBytes: number;
+  }
+  interface ActivityState {
+    title: string;
+    detail: string;
+    startedAt: number;
+    updatedAt: number;
+    active: boolean;
+    outcome: "working" | "success" | "warning";
   }
 
   let step: Step = "invite";
@@ -65,14 +74,19 @@
   let selectedDownloadId = "";
   let downloadProgress: DownloadProgressEvent | null = null;
   let downloadResult: DownloadResult | null = null;
+  let autoStartUpload = false;
+  let clock = Date.now();
+  let activity: ActivityState | null = null;
 
   onMount(() => {
+    autoStartUpload = window.localStorage.getItem("courier.autoStartUpload") === "true";
     void loadTransfers();
     void loadRegistryEndpoint();
     void restoreAuthorization();
     let unlistenProgress: UnlistenFn | undefined;
     let unlistenInventory: UnlistenFn | undefined;
     let unlistenDownload: UnlistenFn | undefined;
+    const heartbeatTimer = window.setInterval(() => (clock = Date.now()), 1000);
     const statusTimer = window.setInterval(() => {
       if (step === "transfers") void refreshActiveTransfers();
       else void refreshVerificationStatus();
@@ -82,20 +96,83 @@
       confirmedBytes = payload.confirmedBytes;
       currentFile = payload.currentFile;
       current = { ...current, status: payload.status };
+      if (payload.status === "uploading") {
+        touchActivity("Uploading dataset", payload.currentFile || "Transferring the next confirmed part");
+      } else if (payload.status === "finalizing") {
+        touchActivity("Upload received", "Waiting for independent Registry verification");
+      } else if (payload.status === "paused") {
+        finishActivity("Upload paused", "Confirmed parts are safely recorded", "warning");
+      } else if (payload.status === "interrupted") {
+        finishActivity("Upload interrupted", "Confirmed parts remain available for resume", "warning");
+      }
     }).then((dispose) => (unlistenProgress = dispose));
     void listen<InventoryProgressEvent>("courier://inventory-progress", ({ payload }) => {
-      if (busy && step === "source") inventoryProgress = payload;
+      if (busy && step === "source") {
+        inventoryProgress = payload;
+        touchActivity(
+          payload.phase === "packaging" ? "Packaging dataset" : "Analyzing dataset",
+          payload.currentPath || (payload.phase === "packaging" ? "Creating compressed transport packages" : "Discovering files and computing integrity digests"),
+        );
+      }
     }).then((dispose) => (unlistenInventory = dispose));
     void listen<DownloadProgressEvent>("courier://download-progress", ({ payload }) => {
-      if (payload.transferId === selectedDownloadId) downloadProgress = payload;
+      if (payload.transferId === selectedDownloadId) {
+        downloadProgress = payload;
+        touchActivity("Retrieving and verifying dataset", payload.currentFile || "Downloading verified transport");
+      }
     }).then((dispose) => (unlistenDownload = dispose));
     return () => {
       window.clearInterval(statusTimer);
+      window.clearInterval(heartbeatTimer);
       unlistenProgress?.();
       unlistenInventory?.();
       unlistenDownload?.();
     };
   });
+
+  function beginActivity(title: string, detail: string) {
+    const timestamp = Date.now();
+    activity = { title, detail, startedAt: timestamp, updatedAt: timestamp, active: true, outcome: "working" };
+  }
+
+  function touchActivity(title: string, detail: string) {
+    const timestamp = Date.now();
+    activity = {
+      title,
+      detail,
+      startedAt: activity?.active ? activity.startedAt : timestamp,
+      updatedAt: timestamp,
+      active: true,
+      outcome: "working",
+    };
+  }
+
+  function finishActivity(title: string, detail: string, outcome: "success" | "warning" = "success") {
+    const timestamp = Date.now();
+    activity = { title, detail, startedAt: activity?.startedAt ?? timestamp, updatedAt: timestamp, active: false, outcome };
+  }
+
+  function duration(seconds: number): string {
+    const value = Math.max(0, Math.floor(seconds));
+    if (value < 60) return `${value}s`;
+    const minutes = Math.floor(value / 60);
+    const remainder = value % 60;
+    return `${minutes}m ${remainder.toString().padStart(2, "0")}s`;
+  }
+
+  function activityAge(): string {
+    if (!activity) return "";
+    return duration((clock - activity.updatedAt) / 1000);
+  }
+
+  function activityElapsed(): string {
+    if (!activity) return "";
+    return duration((clock - activity.startedAt) / 1000);
+  }
+
+  function saveAutoStartPreference() {
+    window.localStorage.setItem("courier.autoStartUpload", String(autoStartUpload));
+  }
 
   async function loadRegistryEndpoint() {
     try {
@@ -109,7 +186,15 @@
     if (refreshingCurrent || !current || (current.status !== "finalizing" && current.status !== "verifying")) return;
     refreshingCurrent = true;
     try {
+      touchActivity("Independent verification", "Checking Registry verification status");
       current = await invoke<Transfer>("refresh_transfer_status", { transferId: current.id });
+      if (current.status === "complete") {
+        finishActivity("Dataset verified", "Every logical file matched the immutable manifest");
+      } else if (current.status === "failed") {
+        finishActivity("Verification failed", "Open the transfer record for verification evidence", "warning");
+      } else {
+        touchActivity("Independent verification", "Registry is reconstructing and checking the uploaded dataset");
+      }
       await loadTransfers();
     } catch (reason) {
       error = message(reason);
@@ -149,6 +234,7 @@
       return;
     }
     busy = true;
+    beginActivity("Authorizing Courier", "Connecting securely to the Registry");
     try {
       const authorization = await invoke<RegistryAuthorization>("exchange_invitation", {
         registryUrl: registryUrl.trim(),
@@ -157,8 +243,10 @@
       applyAuthorization(authorization);
       invitation = "";
       step = authorization.purpose === "download" ? "downloads" : "source";
+      finishActivity("Courier authorized", `${projects.length} project ${projects.length === 1 ? "scope" : "scopes"} available`);
     } catch (reason) {
       error = message(reason);
+      finishActivity("Authorization failed", error, "warning");
     } finally {
       busy = false;
     }
@@ -186,15 +274,18 @@
     error = "";
     busy = true;
     step = "download-progress";
+    beginActivity("Preparing dataset retrieval", "Requesting the verified manifest and destination plan");
     try {
       downloadResult = await invoke<DownloadResult>("download_dataset", {
         transferId: dataset.transfer_id,
         destinationDirectory: selected,
       });
       step = "download-complete";
+      finishActivity("Dataset retrieved and verified", `${downloadResult.restoredFiles.toLocaleString()} files restored successfully`);
     } catch (reason) {
       error = message(reason);
       step = "downloads";
+      finishActivity("Dataset retrieval stopped", error, "warning");
     } finally {
       busy = false;
     }
@@ -279,6 +370,7 @@
     busy = true;
     error = "";
     inventoryProgress = null;
+    beginActivity("Analyzing dataset", "Discovering files and computing integrity digests");
     try {
       current = await invoke<Transfer>("create_inventory", {
         sourcePath,
@@ -287,9 +379,16 @@
       });
       await loadTransferSizes(current.id);
       await loadTransfers();
-      step = "review";
+      if (autoStartUpload) {
+        touchActivity("Analysis complete", "Automatic upload is starting");
+        await startUpload();
+      } else {
+        finishActivity("Analysis complete", `${current.file_count.toLocaleString()} files are ready for review`);
+        step = "review";
+      }
     } catch (reason) {
       error = message(reason);
+      finishActivity("Analysis stopped", error, "warning");
     } finally {
       busy = false;
     }
@@ -301,6 +400,7 @@
     inventoryProgress = null;
     packagedBytes = null;
     error = "";
+    activity = null;
     step = "source";
   }
 
@@ -334,11 +434,18 @@
     current = { ...current, status: "uploading" };
     error = "";
     uploadCommandRunning = true;
+    beginActivity("Preparing secure upload", "Registering the dataset and reconciling any confirmed parts");
     try {
       current = await invoke<Transfer>("start_upload", { transferId: current.id });
+      if (current.status === "finalizing" || current.status === "verifying") {
+        touchActivity("Upload received", "Registry verification is starting; status is checked every two seconds");
+      } else if (current.status === "complete") {
+        finishActivity("Dataset verified", "Every logical file matched the immutable manifest");
+      }
       await loadTransfers();
     } catch (reason) {
       error = message(reason);
+      finishActivity("Upload stopped", error, "warning");
       await loadTransfers();
     } finally {
       uploadCommandRunning = false;
@@ -396,6 +503,16 @@
     {/if}
 
     {#if error}<div class="notice error dismissible" role="alert"><span>{error}</span><button aria-label="Dismiss error" onclick={() => (error = "")}>×</button></div>{/if}
+
+    {#if activity}
+      <aside class:working={activity.active} class:success={activity.outcome === "success"} class:warning={activity.outcome === "warning"} class="activity-monitor" aria-live="polite">
+        <span class="activity-indicator" aria-hidden="true">{activity.active ? "" : activity.outcome === "success" ? "✓" : "!"}</span>
+        <div class="activity-copy"><strong>{activity.title}</strong><span>{activity.detail}</span></div>
+        <div class="activity-time">
+          {#if activity.active}<strong>{activityAge() === "0s" ? "Working now" : `Still working · update ${activityAge()} ago`}</strong><span>Active for {activityElapsed()}</span>{:else}<strong>{activity.outcome === "success" ? "Complete" : "Attention needed"}</strong><span>{formatTimestamp(new Date(activity.updatedAt).toISOString())}</span>{/if}
+        </div>
+      </aside>
+    {/if}
 
     {#if step === "invite"}
       <section class="panel compact">
@@ -482,14 +599,15 @@
         {#if busy}
           <div class="analysis-progress" role="status" aria-live="polite">
             <div class="analysis-heading">
-              <strong>{inventoryProgress ? `Analyzed ${inventoryProgress.filesAnalyzed.toLocaleString()} of ${inventoryProgress.totalFiles.toLocaleString()} files…` : "Discovering files…"}</strong>
+              <strong>{inventoryProgress?.phase === "packaging" ? "Creating compressed transfer packages…" : inventoryProgress ? `Analyzed ${inventoryProgress.filesAnalyzed.toLocaleString()} of ${inventoryProgress.totalFiles.toLocaleString()} files…` : "Discovering files…"}</strong>
               {#if inventoryProgress}<span>{formatBytes(inventoryProgress.bytesAnalyzed)} / {formatBytes(inventoryProgress.totalBytes)}</span>{/if}
             </div>
             <div class="progress-track" role="progressbar" aria-label="Dataset analysis progress" aria-valuenow={inventoryPercent()} aria-valuemin="0" aria-valuemax="100"><span style={`width: ${inventoryPercent()}%`}></span></div>
             {#if inventoryProgress?.currentPath}<code>{inventoryProgress.currentPath}</code>{/if}
           </div>
         {/if}
-        <div class="actions"><button class="secondary" onclick={() => (step = "invite")}>Back</button><button class="primary" disabled={busy} onclick={inventory}>{busy ? "Inventorying…" : "Review dataset"}</button></div>
+        <label class="preference-toggle"><input type="checkbox" bind:checked={autoStartUpload} onchange={saveAutoStartPreference} disabled={busy}><span><strong>Start upload automatically after analysis</strong><small>Skip the review pause when inventory, hashing, and packaging finish successfully.</small></span></label>
+        <div class="actions"><button class="secondary" onclick={() => (step = "invite")}>Back</button><button class="primary" disabled={busy} onclick={inventory}>{busy ? (inventoryProgress?.phase === "packaging" ? "Packaging…" : "Analyzing…") : autoStartUpload ? "Analyze and upload" : "Review dataset"}</button></div>
       </section>
     {:else if step === "review" && current}
       <section class="panel">
