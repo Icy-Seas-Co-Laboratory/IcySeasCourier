@@ -623,7 +623,11 @@ pub struct RegistryMultipartStore {
     client: RegistryClient,
     server_transfer_id: String,
     files: Arc<HashMap<String, Uuid>>,
+    part_progress: SharedPartProgressObserver,
 }
+
+type PartProgressObserver = Arc<dyn Fn(u64) + Send + Sync>;
+type SharedPartProgressObserver = Arc<Mutex<Option<PartProgressObserver>>>;
 
 #[derive(Deserialize)]
 struct MultipartResponse {
@@ -679,7 +683,18 @@ impl RegistryMultipartStore {
                     .map(|binding| (binding.object_key, binding.server_object_id))
                     .collect(),
             ),
+            part_progress: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn set_part_progress_observer(
+        &self,
+        observer: Option<PartProgressObserver>,
+    ) -> Result<(), StoreError> {
+        *self.part_progress.lock().map_err(|_| {
+            StoreError::Permanent("upload progress monitor is unavailable".into())
+        })? = observer;
+        Ok(())
     }
 
     fn file_id(&self, object_key: &str) -> Result<Uuid, StoreError> {
@@ -762,11 +777,33 @@ impl MultipartStore for RegistryMultipartStore {
             )
             .await?;
         let size = bytes.len() as u64;
+        let content = Arc::new(bytes);
+        let progress = self
+            .part_progress
+            .lock()
+            .map_err(|_| StoreError::Permanent("upload progress monitor is unavailable".into()))?
+            .clone();
+        let stream = futures_util::stream::unfold((content, 0_usize), move |(content, offset)| {
+            let progress = progress.clone();
+            async move {
+                if offset >= content.len() {
+                    return None;
+                }
+                const CHUNK_SIZE: usize = 256 * 1024;
+                let end = offset.saturating_add(CHUNK_SIZE).min(content.len());
+                let chunk = bytes::Bytes::copy_from_slice(&content[offset..end]);
+                if let Some(observer) = progress {
+                    observer(end as u64);
+                }
+                Some((Ok::<_, std::io::Error>(chunk), (content, end)))
+            }
+        });
         let response = self
             .client
             .http
             .put(authorization.url)
-            .body(bytes)
+            .header(reqwest::header::CONTENT_LENGTH, size)
+            .body(reqwest::Body::wrap_stream(stream))
             .send()
             .await
             .map_err(map_transport)?;
@@ -878,7 +915,7 @@ mod tests {
         io::{Read, Write},
         net::TcpListener,
         path::PathBuf,
-        sync::atomic::{AtomicBool, Ordering},
+        sync::atomic::{AtomicBool, AtomicU64, Ordering},
     };
 
     use courier_core::FileStatus;
@@ -977,6 +1014,86 @@ mod tests {
         let status = client.transfer_status("ISC-TR-TEST").await.unwrap();
         assert_eq!(status.status, "complete");
         assert!(observed.load(Ordering::SeqCst));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn registry_upload_stream_reports_live_bytes_without_changing_the_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected = vec![0x5a_u8; 900_000];
+        let expected_for_server = expected.clone();
+        let server = std::thread::spawn(move || {
+            let (mut authorization, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let count = authorization.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|value| value == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = format!(r#"{{"url":"http://{address}/object"}}"#);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            authorization.write_all(response.as_bytes()).unwrap();
+
+            let (mut upload, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let header_end = loop {
+                let count = upload.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(index) = request.windows(4).position(|value| value == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+            assert!(headers.contains(&format!("content-length: {}", expected_for_server.len())));
+            while request.len() - header_end < expected_for_server.len() {
+                let count = upload.read(&mut buffer).unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            assert_eq!(&request[header_end..], expected_for_server.as_slice());
+            upload
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nETag: \"streamed\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let object_id = Uuid::new_v4();
+        let store = RegistryMultipartStore::new(
+            RegistryClient::authenticated(format!("http://{address}"), "test-token"),
+            "ISC-TR-STREAM",
+            [RegistryObjectBinding {
+                server_object_id: object_id,
+                object_key: "opaque/object".into(),
+            }],
+        );
+        let observed = Arc::new(AtomicU64::new(0));
+        let observed_for_callback = observed.clone();
+        store
+            .set_part_progress_observer(Some(Arc::new(move |bytes| {
+                observed_for_callback.store(bytes, Ordering::SeqCst);
+            })))
+            .unwrap();
+        let result = store
+            .upload_part(
+                &UploadSession {
+                    object_key: "opaque/object".into(),
+                    upload_id: "upload-id".into(),
+                },
+                1,
+                expected.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.size, expected.len() as u64);
+        assert_eq!(observed.load(Ordering::SeqCst), expected.len() as u64);
         server.join().unwrap();
     }
 }

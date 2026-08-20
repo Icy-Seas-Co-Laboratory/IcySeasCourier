@@ -10,6 +10,7 @@
   interface ProgressEvent {
     transferId: string;
     confirmedBytes: number;
+    sentBytes: number;
     totalBytes: number;
     currentFile: string;
     status: Transfer["status"];
@@ -62,6 +63,9 @@
   let busy = false;
   let error = "";
   let confirmedBytes = 0;
+  let sentBytes = 0;
+  let uploadRate = 0;
+  let lastUploadSample: { bytes: number; at: number } | null = null;
   let currentFile = "";
   let packagedBytes: number | null = null;
   let uploadCommandRunning = false;
@@ -74,6 +78,9 @@
   let selectedDownloadId = "";
   let downloadProgress: DownloadProgressEvent | null = null;
   let downloadResult: DownloadResult | null = null;
+  let downloadRate = 0;
+  let lastDownloadSample: { bytes: number; at: number } | null = null;
+  let verificationChecks = 0;
   let autoStartUpload = false;
   let clock = Date.now();
   let activity: ActivityState | null = null;
@@ -93,7 +100,17 @@
     }, 2000);
     void listen<ProgressEvent>("courier://progress", ({ payload }) => {
       if (!current || payload.transferId !== current.id) return;
+      const sampleTime = Date.now();
+      if (lastUploadSample && payload.sentBytes >= lastUploadSample.bytes) {
+        const elapsedSeconds = (sampleTime - lastUploadSample.at) / 1000;
+        if (elapsedSeconds > 0 && payload.sentBytes > lastUploadSample.bytes) {
+          const instantaneous = (payload.sentBytes - lastUploadSample.bytes) / elapsedSeconds;
+          uploadRate = uploadRate === 0 ? instantaneous : uploadRate * 0.7 + instantaneous * 0.3;
+        }
+      }
+      lastUploadSample = { bytes: payload.sentBytes, at: sampleTime };
       confirmedBytes = payload.confirmedBytes;
+      sentBytes = payload.sentBytes;
       currentFile = payload.currentFile;
       current = { ...current, status: payload.status };
       if (payload.status === "uploading") {
@@ -117,6 +134,15 @@
     }).then((dispose) => (unlistenInventory = dispose));
     void listen<DownloadProgressEvent>("courier://download-progress", ({ payload }) => {
       if (payload.transferId === selectedDownloadId) {
+        const sampleTime = Date.now();
+        if (lastDownloadSample && payload.receivedBytes >= lastDownloadSample.bytes) {
+          const elapsedSeconds = (sampleTime - lastDownloadSample.at) / 1000;
+          if (elapsedSeconds > 0 && payload.receivedBytes > lastDownloadSample.bytes) {
+            const instantaneous = (payload.receivedBytes - lastDownloadSample.bytes) / elapsedSeconds;
+            downloadRate = downloadRate === 0 ? instantaneous : downloadRate * 0.7 + instantaneous * 0.3;
+          }
+        }
+        lastDownloadSample = { bytes: payload.receivedBytes, at: sampleTime };
         downloadProgress = payload;
         touchActivity("Retrieving and verifying dataset", payload.currentFile || "Downloading verified transport");
       }
@@ -188,12 +214,13 @@
     try {
       touchActivity("Independent verification", "Checking Registry verification status");
       current = await invoke<Transfer>("refresh_transfer_status", { transferId: current.id });
+      verificationChecks += 1;
       if (current.status === "complete") {
         finishActivity("Dataset verified", "Every logical file matched the immutable manifest");
       } else if (current.status === "failed") {
         finishActivity("Verification failed", "Open the transfer record for verification evidence", "warning");
       } else {
-        touchActivity("Independent verification", "Registry is reconstructing and checking the uploaded dataset");
+        touchActivity("Independent verification", `Status check ${verificationChecks} · Registry is reconstructing and checking the uploaded dataset`);
       }
       await loadTransfers();
     } catch (reason) {
@@ -271,6 +298,8 @@
     selectedDownloadId = dataset.transfer_id;
     downloadProgress = null;
     downloadResult = null;
+    downloadRate = 0;
+    lastDownloadSample = null;
     error = "";
     busy = true;
     step = "download-progress";
@@ -407,6 +436,9 @@
   function openTransfer(transfer: Transfer) {
     current = transfer;
     confirmedBytes = transfer.status === "finalizing" || transfer.status === "verifying" || transfer.status === "complete" ? transfer.original_bytes : 0;
+    sentBytes = confirmedBytes;
+    uploadRate = 0;
+    lastUploadSample = null;
     currentFile = "";
     packagedBytes = null;
     error = "";
@@ -434,6 +466,10 @@
     current = { ...current, status: "uploading" };
     error = "";
     uploadCommandRunning = true;
+    sentBytes = confirmedBytes;
+    uploadRate = 0;
+    lastUploadSample = null;
+    verificationChecks = 0;
     beginActivity("Preparing secure upload", "Registering the dataset and reconciling any confirmed parts");
     try {
       current = await invoke<Transfer>("start_upload", { transferId: current.id });
@@ -464,7 +500,7 @@
 
   function progressPercent(): number {
     if (!current || current.original_bytes === 0) return current && ["finalizing", "verifying", "complete"].includes(current.status) ? 100 : 0;
-    return Math.min(100, (confirmedBytes / current.original_bytes) * 100);
+    return Math.min(100, (sentBytes / current.original_bytes) * 100);
   }
 
   function inventoryPercent(): number {
@@ -552,7 +588,7 @@
         <h1 class="centered">{downloads.find((item) => item.transfer_id === selectedDownloadId)?.source_name ?? selectedDownloadId}</h1>
         <div class="progress-number">{downloadPercent().toFixed(0)}%</div>
         <div class="progress-track" role="progressbar" aria-label="Download progress" aria-valuenow={downloadPercent()} aria-valuemin="0" aria-valuemax="100"><span style={`width: ${downloadPercent()}%`}></span></div>
-        <div class="progress-details"><strong>{downloadProgress ? `${formatBytes(downloadProgress.receivedBytes)}${downloadProgress.totalBytes ? ` / ${formatBytes(downloadProgress.totalBytes)}` : ""}` : "Preparing secure download…"}</strong><span>{downloadProgress ? `${downloadProgress.restoredFiles.toLocaleString()} / ${downloadProgress.totalFiles.toLocaleString()} files restored` : "Requesting short-lived access"}</span></div>
+        <div class="progress-details"><strong>{downloadProgress ? `${formatBytes(downloadProgress.receivedBytes)}${downloadProgress.totalBytes ? ` / ${formatBytes(downloadProgress.totalBytes)}` : ""}` : "Preparing secure download…"}</strong><span>{downloadRate > 0 ? `${formatBytes(downloadRate)}/s · ` : ""}{downloadProgress ? `${downloadProgress.restoredFiles.toLocaleString()} / ${downloadProgress.totalFiles.toLocaleString()} files restored` : "Requesting short-lived access"}</span></div>
         {#if downloadProgress?.currentFile}<div class="current-file"><span>Current activity</span><code>{downloadProgress.currentFile}</code></div>{/if}
         <div class="notice info">Courier downloads the verified transport, safely reconstructs the original paths, and checks every file against the immutable manifest before making the destination visible.</div>
       </section>
@@ -632,7 +668,8 @@
         <h1 class="centered">{sourceName(current.source_root)}</h1>
         <div class="progress-number">{progressPercent().toFixed(0)}%</div>
         <div class="progress-track" role="progressbar" aria-label="Upload progress" aria-valuenow={progressPercent()} aria-valuemin="0" aria-valuemax="100"><span style={`width: ${progressPercent()}%`}></span></div>
-        <div class="progress-details"><strong>{formatBytes(confirmedBytes)} / {formatBytes(current.original_bytes)}</strong><span>{statusLabel(current.status)}</span></div>
+        <div class="progress-details"><strong>{formatBytes(sentBytes)} / {formatBytes(current.original_bytes)}</strong><span>{uploadRate > 0 && current.status === "uploading" ? `${formatBytes(uploadRate)}/s` : statusLabel(current.status)}</span></div>
+        {#if current.status === "uploading"}<div class="transfer-telemetry"><span><strong>{formatBytes(confirmedBytes)}</strong><small>Durably confirmed</small></span><span><strong>{formatBytes(Math.max(0, sentBytes - confirmedBytes))}</strong><small>Current request</small></span><span><strong>{activityAge()}</strong><small>Since last byte update</small></span></div>{/if}
         {#if currentFile}<div class="current-file"><span>Current file</span><code>{currentFile}</code></div>{/if}
         {#if current.status === "complete"}
           <div class="notice info">The Registry independently reconstructed every logical file and matched its size and {(authorization?.hashAlgorithm ?? "sha256").toUpperCase()} digest to the immutable manifest.</div>

@@ -23,6 +23,29 @@ Direct distribution outside the Mac App Store requires a paid Apple Developer Pr
 
 The application identifier is `co.icyseas.courier`. The current workflow distributes the app directly and does not submit it to the Mac App Store.
 
+### Local Mac signing
+
+Local certificate material may be staged under the repository's ignored
+`.signing/apple/` directory and imported into the login keychain. Courier's local
+build helper selects a `Developer ID Application` identity when available and
+otherwise accepts an `Apple Development` identity with an explicit warning:
+
+```bash
+cd apps/courier-desktop
+npm run tauri:build:mac-local
+```
+
+The helper intentionally fails before compiling when `security find-identity -v
+-p codesigning` reports no usable identity. A downloaded `.cer` contains only the
+public certificate; it becomes a signing identity only when Keychain also has its
+matching private key. Export that certificate and private key from the Mac that
+created the CSR as a password-protected `.p12`, or revoke/reissue it from a CSR
+created on the build Mac.
+
+An `Apple Development` signature is for local testing only. It does not replace
+the `Developer ID Application` identity and App Store Connect API key required by
+the release workflow for external distribution and notarization.
+
 ## Configure GitHub secrets
 
 Create a GitHub Actions environment named `desktop-release`, add a required reviewer, and store these as environment secrets:

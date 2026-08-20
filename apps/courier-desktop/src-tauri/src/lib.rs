@@ -6,7 +6,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::UNIX_EPOCH,
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use courier_core::{
@@ -49,6 +49,7 @@ impl Default for RuntimeState {
 struct TransferProgressEvent {
     transfer_id: Uuid,
     confirmed_bytes: u64,
+    sent_bytes: u64,
     total_bytes: u64,
     current_file: String,
     status: &'static str,
@@ -736,7 +737,7 @@ struct DesktopObserver {
     current_file: String,
     object_original_bytes: u64,
     object_transport_bytes: u64,
-    object_confirmed_transport_bytes: AtomicU64,
+    object_confirmed_transport_bytes: Arc<AtomicU64>,
 }
 
 impl UploadObserver for DesktopObserver {
@@ -758,6 +759,7 @@ impl UploadObserver for DesktopObserver {
             TransferProgressEvent {
                 transfer_id: self.transfer_id,
                 confirmed_bytes: confirmed,
+                sent_bytes: confirmed,
                 total_bytes: self.total,
                 current_file: self.current_file.clone(),
                 status: "uploading",
@@ -777,6 +779,7 @@ impl UploadObserver for DesktopObserver {
             TransferProgressEvent {
                 transfer_id: self.transfer_id,
                 confirmed_bytes: confirmed,
+                sent_bytes: confirmed,
                 total_bytes: self.total,
                 current_file: self.current_file.clone(),
                 status: "uploading",
@@ -787,12 +790,23 @@ impl UploadObserver for DesktopObserver {
 
 impl DesktopObserver {
     fn scaled(&self, transport_bytes: u64) -> u64 {
-        if self.object_transport_bytes == 0 || transport_bytes >= self.object_transport_bytes {
-            self.object_original_bytes
-        } else {
-            ((transport_bytes as u128 * self.object_original_bytes as u128)
-                / self.object_transport_bytes as u128) as u64
-        }
+        scale_transport_progress(
+            transport_bytes,
+            self.object_original_bytes,
+            self.object_transport_bytes,
+        )
+    }
+}
+
+fn scale_transport_progress(
+    transport_bytes: u64,
+    original_bytes: u64,
+    total_transport: u64,
+) -> u64 {
+    if total_transport == 0 || transport_bytes >= total_transport {
+        original_bytes
+    } else {
+        ((transport_bytes as u128 * original_bytes as u128) / total_transport as u128) as u64
     }
 }
 
@@ -1406,6 +1420,7 @@ fn run_upload(
                 .get(&object.id)
                 .ok_or_else(|| format!("Upload source missing for {}", object.id))?;
             let base_confirmed = confirmed.load(Ordering::Relaxed);
+            let object_confirmed_transport_bytes = Arc::new(AtomicU64::new(0));
             let observer = DesktopObserver {
                 app: app.clone(),
                 transfer_id,
@@ -1423,8 +1438,47 @@ fn run_upload(
                 },
                 object_original_bytes: object.original_bytes,
                 object_transport_bytes: source.size,
-                object_confirmed_transport_bytes: AtomicU64::new(0),
+                object_confirmed_transport_bytes: object_confirmed_transport_bytes.clone(),
             };
+            let progress_app = app.clone();
+            let progress_file = observer.current_file.clone();
+            let progress_object_original = object.original_bytes;
+            let progress_object_transport = source.size;
+            let progress_confirmed_transport = object_confirmed_transport_bytes.clone();
+            let progress_confirmed_logical = confirmed.clone();
+            let progress_total = transfer.original_bytes;
+            let progress_throttle = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(1)));
+            remote
+                .set_part_progress_observer(Some(Arc::new(move |part_sent| {
+                    let now = Instant::now();
+                    let Ok(mut last_emit) = progress_throttle.lock() else {
+                        return;
+                    };
+                    if now.duration_since(*last_emit) < Duration::from_millis(200) {
+                        return;
+                    }
+                    *last_emit = now;
+                    let transport_sent = progress_confirmed_transport
+                        .load(Ordering::Relaxed)
+                        .saturating_add(part_sent);
+                    let object_sent = scale_transport_progress(
+                        transport_sent,
+                        progress_object_original,
+                        progress_object_transport,
+                    );
+                    let _ = progress_app.emit(
+                        "courier://progress",
+                        TransferProgressEvent {
+                            transfer_id,
+                            confirmed_bytes: progress_confirmed_logical.load(Ordering::Relaxed),
+                            sent_bytes: base_confirmed.saturating_add(object_sent),
+                            total_bytes: progress_total,
+                            current_file: progress_file.clone(),
+                            status: "uploading",
+                        },
+                    );
+                })))
+                .map_err(display)?;
             emit_upload_activity(
                 &app,
                 transfer_id,
@@ -1435,6 +1489,7 @@ fn run_upload(
             upload_missing_parts_observed(&store, &remote, source, &retry, &observer)
                 .await
                 .map_err(display)?;
+            remote.set_part_progress_observer(None).map_err(display)?;
             if observer.should_pause() {
                 return Err(UploadError::Paused.to_string());
             }
@@ -1533,6 +1588,7 @@ fn emit_upload_activity(
         TransferProgressEvent {
             transfer_id,
             confirmed_bytes,
+            sent_bytes: confirmed_bytes,
             total_bytes,
             current_file: current_file.to_owned(),
             status: "uploading",
@@ -1552,6 +1608,7 @@ fn emit_status(
         TransferProgressEvent {
             transfer_id,
             confirmed_bytes,
+            sent_bytes: confirmed_bytes,
             total_bytes,
             current_file: String::new(),
             status,
