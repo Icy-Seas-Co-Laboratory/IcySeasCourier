@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     environment: str = "development"
     database_url: str = "postgresql+psycopg://registry:registry@127.0.0.1:5432/registry"
     admin_api_key: SecretStr = SecretStr("development-only-change-me")
+    admin_session_lifetime_seconds: int = 900
+    admin_totp_setup_lifetime_seconds: int = 600
     token_pepper: SecretStr = SecretStr("development-only-change-me-too")
     session_lifetime_seconds: int = 3600
     refresh_lifetime_seconds: int = 2_592_000
@@ -28,6 +30,7 @@ class Settings(BaseSettings):
     maximum_request_body_bytes: int = 64 * 1024 * 1024
     authentication_requests_per_minute: int = 30
     admin_requests_per_minute: int = 120
+    admin_authentication_requests_per_minute: int = 10
     client_requests_per_minute: int = 600
     rate_limit_maximum_clients: int = 2_048
     admin_allowed_networks: str = "127.0.0.1/32,::1/128,100.64.0.0/10"

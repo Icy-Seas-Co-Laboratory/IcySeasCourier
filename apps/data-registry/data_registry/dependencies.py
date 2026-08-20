@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from .config import Settings, get_settings
 from .db import get_session
 from .models import CourierSession
-from .security import hash_token, secrets_equal
+from .security import hash_token, secrets_equal, valid_admin_session_token
 from .storage import ObjectStorage, get_object_storage
 
 Database = Annotated[Session, Depends(get_session)]
@@ -18,12 +18,18 @@ Storage = Annotated[ObjectStorage, Depends(get_object_storage)]
 
 def require_admin(
     settings: Configuration,
+    authorization: Annotated[str | None, Header()] = None,
     x_admin_key: Annotated[str | None, Header()] = None,
 ) -> str:
-    expected = settings.admin_api_key.get_secret_value()
-    if x_admin_key is None or not secrets_equal(x_admin_key, expected):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid admin key")
-    return "admin"
+    if authorization is not None and authorization.startswith("Bearer "):
+        token = authorization.removeprefix("Bearer ")
+        if valid_admin_session_token(token, settings):
+            return "admin"
+    if settings.environment == "development":
+        expected = settings.admin_api_key.get_secret_value()
+        if x_admin_key is not None and secrets_equal(x_admin_key, expected):
+            return "admin"
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="admin session required")
 
 
 def require_courier_session(

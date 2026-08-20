@@ -16,6 +16,35 @@ class SystemConfigResponse(BaseModel):
     hash_algorithm: HashAlgorithm
 
 
+class AdminAuthenticationStatus(BaseModel):
+    configured: bool
+
+
+class AdminSetupStart(BaseModel):
+    admin_key: str = Field(min_length=1, max_length=1024)
+
+
+class AdminSetupResponse(BaseModel):
+    secret: str
+    provisioning_uri: str
+    expires_at: datetime
+
+
+class AdminSetupConfirm(BaseModel):
+    admin_key: str = Field(min_length=1, max_length=1024)
+    totp_code: str = Field(pattern=r"^[0-9]{6}$")
+
+
+class AdminAuthenticationRequest(AdminSetupConfirm):
+    pass
+
+
+class AdminSessionResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_at: datetime
+
+
 class ProjectCreate(BaseModel):
     project_code: str = Field(pattern=r"^P[0-9]{5}$")
     name: str = Field(min_length=1, max_length=300)

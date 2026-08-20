@@ -76,8 +76,6 @@ The FastAPI/PostgreSQL control plane supports projects, hashed upload invitation
 
 OpenAPI documentation is available at `http://127.0.0.1:8020/docs` in development. Dataset bytes continue to travel directly to S3-compatible storage; the Registry does not proxy them.
 
-The Registry Operations Console is available at `http://127.0.0.1:8020/admin/` and is rejected unless the client address is loopback or in Tailscale's `100.64.0.0/10` range.
-For the default development stack, unlock it with the local-only admin key
-`development-only-change-me`.
+The Registry Operations Console is available at `http://127.0.0.1:8020/admin/` and is rejected unless the client address is loopback or in the tailnet's `100.64.0.0/10` range. First login uses the admin key to enroll a TOTP authenticator; subsequent logins require both factors. The default development admin key is `development-only-change-me`.
 
 See [docs/demo.md](docs/demo.md) for the complete desktop demonstration workflow.

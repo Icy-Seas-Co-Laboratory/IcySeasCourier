@@ -1,4 +1,4 @@
-const state = { key: "", overview: null, projects: [], invitations: [], transfers: [], audit: [] };
+const state = { token: "", setupPending: false, overview: null, projects: [], invitations: [], transfers: [], audit: [] };
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[character]);
@@ -14,11 +14,22 @@ const badge = (status) => `<span class="status ${escapeHtml(status)}">${escapeHt
 async function api(path, options = {}) {
   const response = await fetch(`/api/v1/admin${path}`, {
     ...options,
-    headers: { "Content-Type": "application/json", "X-Admin-Key": state.key, ...(options.headers || {}) },
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${state.token}`, ...(options.headers || {}) },
   });
   if (response.status === 204) return null;
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(typeof payload.detail === "string" ? payload.detail : JSON.stringify(payload.detail || payload));
+  return payload;
+}
+
+async function authentication(path, body) {
+  const response = await fetch(`/api/v1/admin/authentication${path}`, {
+    method: body ? "POST" : "GET",
+    headers: { "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(typeof payload.detail === "string" ? payload.detail : "Authentication failed");
   return payload;
 }
 
@@ -158,20 +169,46 @@ $("#login-form").addEventListener("submit", async (event) => {
   submit.disabled = true;
   submit.textContent = "Opening…";
   setError("", true);
-  state.key = $("#admin-key").value.trim();
+  const adminKey = $("#admin-key").value.trim();
+  const totpCode = $("#totp-code").value.trim();
   try {
+    let session;
+    if (state.setupPending) {
+      session = await authentication("/setup/confirm", { admin_key: adminKey, totp_code: totpCode });
+    } else {
+      const status = await authentication("/status");
+      if (!status.configured) {
+        const setup = await authentication("/setup", { admin_key: adminKey });
+        $("#totp-secret").textContent = setup.secret;
+        $("#totp-uri").href = setup.provisioning_uri;
+        $("#totp-setup").hidden = false;
+        $("#totp-code").required = true;
+        $("#totp-code").focus();
+        state.setupPending = true;
+        submit.textContent = "Verify and finish setup";
+        return;
+      }
+      session = await authentication("/session", { admin_key: adminKey, totp_code: totpCode });
+    }
+    state.token = session.access_token;
+    state.setupPending = false;
+    $("#admin-key").value = "";
+    $("#totp-code").value = "";
+    $("#totp-setup").hidden = true;
+    $("#totp-secret").textContent = "";
+    $("#totp-uri").removeAttribute("href");
     await loadAll();
     $("#login").hidden = true;
     $("#console").hidden = false;
   } catch (error) {
-    state.key = "";
+    state.token = "";
     setError(error.message, true);
   } finally {
     submit.disabled = false;
-    submit.textContent = "Open console";
+    submit.textContent = state.setupPending ? "Verify and finish setup" : "Open console";
   }
 });
-$("#logout").addEventListener("click", () => { state.key = ""; $("#admin-key").value = ""; $("#console").hidden = true; $("#login").hidden = false; });
+$("#logout").addEventListener("click", () => { state.token = ""; $("#admin-key").value = ""; $("#totp-code").value = ""; $("#console").hidden = true; $("#login").hidden = false; });
 $("#refresh").addEventListener("click", () => loadAll().catch((error) => setError(error.message)));
 $("#transfer-search").addEventListener("input", renderTransfers); $("#transfer-filter").addEventListener("change", renderTransfers);
 $("#new-project").addEventListener("click", openProjectForm); $("#new-invitation").addEventListener("click", openInvitationForm); $("#form-dialog form").addEventListener("submit", submitDialog);
@@ -182,4 +219,4 @@ document.addEventListener("click", async (event) => {
   const revoke = event.target.closest("[data-revoke]"); if (revoke && window.confirm("Revoke this invitation? Existing sessions will no longer be accepted.")) { try { await api(`/invitations/${revoke.dataset.revoke}`, { method: "DELETE" }); toast("Invitation revoked"); await loadAll(); } catch (error) { setError(error.message); } }
   const retry = event.target.closest("[data-retry]"); if (retry && window.confirm("Queue this transfer for another independent verification attempt?")) { try { await api(`/transfers/${encodeURIComponent(retry.dataset.retry)}/retry`, { method: "POST" }); $("#detail-dialog").close(); toast("Verification retry queued"); await loadAll(); } catch (error) { setError(error.message); } }
 });
-window.setInterval(() => { if (state.key && !document.hidden) loadAll().catch((error) => setError(error.message)); }, 15000);
+window.setInterval(() => { if (state.token && !document.hidden) loadAll().catch((error) => setError(error.message)); }, 15000);

@@ -47,6 +47,15 @@ class User(TimestampMixin, Base):
     role: Mapped[str] = mapped_column(String(30), default="admin")
 
 
+class AdminSecurity(Base):
+    __tablename__ = "admin_security"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    encrypted_totp_secret: Mapped[str] = mapped_column(Text)
+    setup_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    configured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_used_totp_step: Mapped[int | None] = mapped_column(BigInteger)
+
+
 class Project(TimestampMixin, Base):
     __tablename__ = "projects"
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)

@@ -13,7 +13,7 @@ Courier Desktop
                                       │
                   host-managed Cloudflare Tunnel
                                       │
-                   loopback ports 8020 and 8333
+                loopback ports 8020, 8021, and 8333
                                       │
                 ┌─────────────────────┴─────────────────────┐
                 │ dedicated courier-edge Docker network     │
@@ -23,7 +23,7 @@ Courier Desktop
                          PostgreSQL             verification worker
 ```
 
-The tunnel makes outbound connections, so the host needs no public inbound port. A small Courier gateway owns loopback port 8020 and forwards to Registry's private container port 8010 while preserving proxy headers. The S3 API owns loopback port 8333. PostgreSQL and the SeaweedFS master port exist only on the internal `courier-backend` network. Courier's admin console and admin API independently enforce the configured client networks even when traffic arrived through a proxy.
+The tunnel makes outbound connections, so the host needs no public inbound port. A small Courier gateway owns loopback port 8020 for Cloudflare and loopback port 8021 for Headscale, forwarding both to Registry's private container port 8010. The S3 API owns loopback port 8333. PostgreSQL and the SeaweedFS master port exist only on the internal `courier-backend` network. Courier's admin console and admin API independently enforce the configured client networks even when traffic arrived through a proxy.
 
 ## Prerequisites
 
@@ -45,7 +45,7 @@ chmod 600 .env
 
 Keep the default single-process rate limits initially. They can be adjusted in `.env` without introducing a shared rate-limit service.
 
-The default Compose project name is `icy-seas-courier`, so its networks, containers, and named volumes do not collide with unrelated Compose projects. PostgreSQL has no host port. If ports 8020 or 8333 are already occupied on loopback, change `REGISTRY_PORT` or `SEAWEEDFS_S3_PORT` and update the corresponding host-managed tunnel origin. Container ports do not change.
+The default Compose project name is `icy-seas-courier`, so its networks, containers, and named volumes do not collide with unrelated Compose projects. PostgreSQL has no host port. If ports 8020, 8021, or 8333 are already occupied on loopback, change `REGISTRY_PORT`, `REGISTRY_VPN_PORT`, or `SEAWEEDFS_S3_PORT` and update the corresponding host-managed proxy origin. Container ports do not change.
 
 The edge network defaults to `172.30.50.0/24`, with the Courier gateway at `172.30.50.10`. If that subnet overlaps another Docker or host network, choose an unused private `/24`, update `COURIER_GATEWAY_IPV4_ADDRESS`, and update both proxy allowlists to the new gateway address.
 
@@ -83,22 +83,39 @@ curl --fail https://courier.icyseascolab.io/health
 curl --fail https://courier.icyseascolab.io/ready
 ```
 
-Complete the beta acceptance transfer from a separate client to prove that a presigned multipart upload traverses the S3 tunnel and reaches independent verification. Confirm that `/admin/` and `/api/v1/admin/overview` return `403` from a client outside `REGISTRY_ADMIN_ALLOWED_NETWORKS`. Also confirm that ports 8020 and 8333 are loopback-only and that ports 8010, 5432, and 9333 are not published on the host.
+Complete the beta acceptance transfer from a separate client to prove that a presigned multipart upload traverses the S3 tunnel and reaches independent verification. Confirm that `/admin/` and `/api/v1/admin/overview` return `403` from a client outside `REGISTRY_ADMIN_ALLOWED_NETWORKS`. Also confirm that ports 8020, 8021, and 8333 are loopback-only and that ports 8010, 5432, and 9333 are not published on the host.
 
-## Admin access over Tailscale
+## Admin access over Headscale
 
-Being connected to Tailscale does not make a request to the public Cloudflare hostname originate from a Tailscale address; Cloudflare sees the client's public egress address. Keep public admin requests blocked and give the host a separate tailnet-only HTTPS endpoint instead:
+Being connected to the tailnet does not make a request to the public Cloudflare hostname originate from a tailnet address; Cloudflare sees the client's public egress address. Headscale does not currently support the certificate provisioning required by Tailscale Serve HTTPS, so Courier provides a separate loopback-only origin for HTTP Serve:
 
 ```bash
-sudo tailscale serve --bg --https=443 http://127.0.0.1:8020
+sudo tailscale serve --bg --http=80 http://127.0.0.1:8021
 tailscale serve status
 ```
 
-Open the `https://<courier-host>.<tailnet>.ts.net/admin/` URL printed by Tailscale, not the public Cloudflare hostname. Tailscale terminates HTTPS and proxies to Courier's loopback gateway, while tailnet access-control rules still apply. Courier's default admin range covers Tailscale's full `100.64.0.0/10` IPv4 allocation; narrow it to approved device addresses if desired. Do not change `REGISTRY_BIND_ADDRESS` to `0.0.0.0`.
+The browser URL is HTTP, but its packets remain end-to-end encrypted by the tailnet. Port 8021 is bound only to host loopback and its gateway marks only that dedicated proxy path as transport-secure; Courier's public port does not receive this exception. Restrict port 80 on this tailnet node to approved administrators with Headscale policy. The Registry also requires the admin key and a TOTP code before issuing a 15-minute, memory-only console session.
+
+When using the repository startup helper, `./scripts/dev-up.sh --tailscale` performs the same setup without attempting privilege escalation. If the local Tailscale installation requires elevated access, the helper prints the exact `sudo tailscale serve` command instead.
+
+Open the `http://<courier-host>.<headscale-base-domain>/admin/` URL printed by Serve, not the public Cloudflare hostname. Courier's default admin range covers the tailnet's `100.64.0.0/10` IPv4 allocation; narrow it to approved device addresses if desired. Do not change `REGISTRY_BIND_ADDRESS` to `0.0.0.0`.
+
+### First administrator setup
+
+On the first visit, enter the configured `REGISTRY_ADMIN_API_KEY` and select **Open console**. Courier generates a TOTP secret and displays it once. Add the secret to an authenticator application, enter the current six-digit code, and select **Verify and finish setup**. The confirmed secret is encrypted in PostgreSQL using a key derived from `REGISTRY_TOKEN_PEPPER`; do not change the pepper without a coordinated credential recovery.
+
+Subsequent logins require both the admin key and a fresh authenticator code. Each code can be used only once, and the resulting console session expires after `REGISTRY_ADMIN_SESSION_LIFETIME_SECONDS` (15 minutes by default). The browser keeps the session only in memory.
+
+If the authenticator is lost, a server operator with database access can reset enrollment. Back up the database first, then delete only the singleton enrollment row and repeat first setup:
+
+```bash
+docker compose exec postgres psql -U registry -d registry \
+  -c 'DELETE FROM admin_security WHERE id = 1;'
+```
 
 ## Create beta access
 
-Open the tailnet-only HTTPS admin URL described above from an approved VPN client:
+Open the tailnet-only admin URL described above from an approved VPN client and complete TOTP authentication:
 
 1. Create an active project with its stable project code.
 2. Issue a single-use invitation with an expiry and a suitable maximum transfer size.

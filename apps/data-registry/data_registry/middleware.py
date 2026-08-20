@@ -118,6 +118,12 @@ class SecurityMiddleware(BaseHTTPMiddleware):
             rate_limited = self.rate_limiter.limited(
                 "authentication", str(address), self.settings.authentication_requests_per_minute
             )
+        elif path.startswith("/api/v1/admin/authentication"):
+            rate_limited = self.rate_limiter.limited(
+                "admin-authentication",
+                str(address),
+                self.settings.admin_authentication_requests_per_minute,
+            )
         elif is_admin:
             rate_limited = self.rate_limiter.limited(
                 "administration", str(address), self.settings.admin_requests_per_minute

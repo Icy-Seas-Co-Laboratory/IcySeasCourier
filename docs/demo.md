@@ -25,6 +25,14 @@ the corresponding audit events.
 
 Copy the single-use invitation printed by the second command.
 
+To make the development Registry's admin console available through Headscale, opt in when starting the stack:
+
+```bash
+./scripts/dev-up.sh --tailscale
+```
+
+The option requires an installed Tailscale CLI connected to Headscale. It configures persistent HTTP Serve to Courier's dedicated loopback-only VPN origin and prints the tailnet URL. Tailnet transport remains encrypted, but the browser URL is HTTP because Headscale cannot currently provision Serve certificates. Use it only on a tailnet whose policy restricts the intended users, especially when the Registry still has development credentials. Ordinary local development does not change host-level Tailscale state. The equivalent environment switch is `COURIER_ENABLE_TAILSCALE_SERVE=1`; use `COURIER_TAILSCALE_HTTP_PORT` only if the tailnet endpoint cannot use port 80. The script prints the matching command for disabling Serve later.
+
 ## Start Courier
 
 ```bash

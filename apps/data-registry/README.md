@@ -2,11 +2,7 @@
 
 ## Operations console
 
-Start the development stack and open `http://127.0.0.1:8020/admin/`. Sign in with
-the configured `REGISTRY_ADMIN_API_KEY` (`development-only-change-me` for the
-default local stack). The console provides health metrics, project and invitation
-administration, searchable transfer status, per-file verification evidence,
-controlled verification retry, and the Registry audit log.
+Start the development stack and open `http://127.0.0.1:8020/admin/`. On first login, enter the configured `REGISTRY_ADMIN_API_KEY` (`development-only-change-me` for the default local stack), enroll the generated TOTP secret in an authenticator, and confirm its current code. Later console logins require both factors and receive a short-lived, memory-only session. The console provides health metrics, project and invitation administration, searchable transfer status, per-file verification evidence, controlled verification retry, and the Registry audit log.
 
 The console never receives stored invitation secrets. Newly issued codes are shown
 once and the Registry retains only their keyed hashes.
@@ -31,7 +27,7 @@ uv run pytest
 uv run ruff check .
 ```
 
-Administrative endpoints require `X-Admin-Key`. Courier invitation exchange returns a separate short-lived bearer token with access limited to the invitation's projects.
+Outside development, administrative endpoints require a short-lived bearer session obtained with the admin key and a fresh TOTP code. Development retains `X-Admin-Key` compatibility for local scripts and automated tests. Courier invitation exchange returns a separate short-lived bearer token with access limited to the invitation's projects.
 
 ## Manifest and upload API
 
@@ -48,11 +44,11 @@ The smoke test creates a project and single-use invitation, exchanges it for a s
 
 The desktop uses these Registry APIs and stores rotating credentials in the operating system vault while preserving non-secret recovery state in SQLite.
 
-Production configuration refuses the documented development admin key, token pepper, and SeaweedFS credentials, and it requires HTTPS. Supply unique secrets through the deployment environment. Authentication, administration, and general client API routes use a bounded, process-local sliding-window rate limiter; this intentionally matches Courier's single-process deployment model. Configure its request rates and maximum tracked clients with `REGISTRY_AUTHENTICATION_REQUESTS_PER_MINUTE`, `REGISTRY_ADMIN_REQUESTS_PER_MINUTE`, `REGISTRY_CLIENT_REQUESTS_PER_MINUTE`, and `REGISTRY_RATE_LIMIT_MAXIMUM_CLIENTS`.
+Production configuration refuses the documented development admin key, token pepper, and SeaweedFS credentials, and it requires HTTPS. Supply unique secrets through the deployment environment. Authentication, administration, and general client API routes use a bounded, process-local sliding-window rate limiter; this intentionally matches Courier's single-process deployment model. Configure its request rates and maximum tracked clients with `REGISTRY_AUTHENTICATION_REQUESTS_PER_MINUTE`, `REGISTRY_ADMIN_AUTHENTICATION_REQUESTS_PER_MINUTE`, `REGISTRY_ADMIN_REQUESTS_PER_MINUTE`, `REGISTRY_CLIENT_REQUESTS_PER_MINUTE`, and `REGISTRY_RATE_LIMIT_MAXIMUM_CLIENTS`.
 
 ## Network security
 
-The admin console and `/api/v1/admin` routes accept direct clients only from loopback or Tailscale's `100.64.0.0/10` range by default. Forwarded client headers are ignored unless the immediate peer is explicitly listed in `REGISTRY_TRUSTED_PROXY_NETWORKS`. For a trusted Cloudflare peer, the Registry uses `CF-Connecting-IP`; other trusted proxies fall back to `X-Forwarded-For`. Keep the trusted-proxy list empty when Uvicorn is directly exposed. Production mode also requires HTTPS and non-development Registry and SeaweedFS credentials.
+The admin console and `/api/v1/admin` routes accept direct clients only from loopback or the tailnet's `100.64.0.0/10` range by default. Forwarded client headers are ignored unless the immediate peer is explicitly listed in `REGISTRY_TRUSTED_PROXY_NETWORKS`. For a trusted Cloudflare peer, the Registry uses `CF-Connecting-IP`; other trusted proxies fall back to `X-Forwarded-For`. Keep the trusted-proxy list empty when Uvicorn is directly exposed. Production mode also requires HTTPS and non-development Registry and SeaweedFS credentials.
 
 SeaweedFS is local and authenticated. The Compose stack passes its access and secret keys to `weed mini`; omitting credentials would put SeaweedFS into its development-only anonymous mode. Set `REGISTRY_S3_PUBLIC_ENDPOINT_URL` to the S3 URL reachable by Courier clients. A Cloudflare deployment uses a separate `https://s3.icyseascolab.io` tunnel route because dataset parts travel directly to SeaweedFS. PostgreSQL and the SeaweedFS master port are not published by Compose; Registry and S3 diagnostic ports bind to loopback by default.
 

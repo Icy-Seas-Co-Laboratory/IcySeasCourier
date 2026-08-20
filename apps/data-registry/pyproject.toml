@@ -7,6 +7,7 @@ dependencies = [
   "alembic==1.19.1",
   "boto3==1.43.69",
   "blake3==1.0.8",
+  "cryptography==50.0.0",
   "fastapi==0.141.1",
   "psycopg[binary]==3.3.4",
   "pydantic-settings==2.15.0",

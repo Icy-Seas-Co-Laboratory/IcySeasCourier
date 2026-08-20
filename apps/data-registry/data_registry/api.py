@@ -2,6 +2,7 @@ import hashlib
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
+from urllib.parse import quote, urlencode
 
 from fastapi import APIRouter, HTTPException, Response, status
 from sqlalchemy import func, select, text
@@ -11,6 +12,7 @@ from .audit import record_event
 from .db import engine
 from .dependencies import AdminActor, Configuration, CourierIdentity, Database, Storage
 from .models import (
+    AdminSecurity,
     AuditEvent,
     CourierSession,
     Project,
@@ -21,8 +23,14 @@ from .models import (
     UploadInvitation,
 )
 from .schemas import (
+    AdminAuthenticationRequest,
+    AdminAuthenticationStatus,
     AdminInvitationResponse,
     AdminOverviewResponse,
+    AdminSessionResponse,
+    AdminSetupConfirm,
+    AdminSetupResponse,
+    AdminSetupStart,
     AdminTransferDetail,
     AdminTransferSummary,
     AuditEventResponse,
@@ -51,10 +59,16 @@ from .schemas import (
     VerificationFileResponse,
 )
 from .security import (
+    decrypt_totp_secret,
+    encrypt_totp_secret,
+    generate_admin_session_token,
     generate_invitation_code,
     generate_refresh_token,
     generate_session_token,
+    generate_totp_secret,
     hash_token,
+    matching_totp_step,
+    secrets_equal,
 )
 
 router = APIRouter()
@@ -123,6 +137,122 @@ def ready() -> HealthResponse:
 @client.get("/system/config", response_model=SystemConfigResponse)
 def system_config(settings: Configuration) -> SystemConfigResponse:
     return SystemConfigResponse(hash_algorithm=settings.hash_algorithm)
+
+
+def _admin_security(database: Database, *, for_update: bool = False) -> AdminSecurity | None:
+    query = select(AdminSecurity).where(AdminSecurity.id == 1)
+    return database.scalar(query.with_for_update() if for_update else query)
+
+
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def _check_admin_key(value: str, settings: Configuration) -> None:
+    if not secrets_equal(value, settings.admin_api_key.get_secret_value()):
+        raise HTTPException(status_code=401, detail="invalid administrator credentials")
+
+
+def _admin_session(settings: Configuration) -> AdminSessionResponse:
+    token, expires_at = generate_admin_session_token(settings)
+    return AdminSessionResponse(access_token=token, expires_at=expires_at)
+
+
+@admin.get("/authentication/status", response_model=AdminAuthenticationStatus)
+def admin_authentication_status(database: Database) -> AdminAuthenticationStatus:
+    security = _admin_security(database)
+    return AdminAuthenticationStatus(
+        configured=security is not None and security.configured_at is not None
+    )
+
+
+@admin.post("/authentication/setup", response_model=AdminSetupResponse)
+def start_admin_totp_setup(
+    payload: AdminSetupStart, database: Database, settings: Configuration
+) -> AdminSetupResponse:
+    _check_admin_key(payload.admin_key, settings)
+    security = _admin_security(database, for_update=True)
+    if security is not None and security.configured_at is not None:
+        raise HTTPException(status_code=409, detail="administrator TOTP is already configured")
+
+    now = datetime.now(UTC)
+    expires_at = now + timedelta(seconds=settings.admin_totp_setup_lifetime_seconds)
+    secret = generate_totp_secret()
+    if security is None:
+        security = AdminSecurity(id=1, encrypted_totp_secret="")
+        database.add(security)
+    security.encrypted_totp_secret = encrypt_totp_secret(secret, settings)
+    security.setup_expires_at = expires_at
+    security.last_used_totp_step = None
+    database.commit()
+
+    issuer = "Icy Seas Courier"
+    label = quote(f"{issuer}:admin")
+    provisioning_uri = f"otpauth://totp/{label}?{urlencode({'secret': secret, 'issuer': issuer})}"
+    return AdminSetupResponse(
+        secret=secret,
+        provisioning_uri=provisioning_uri,
+        expires_at=expires_at,
+    )
+
+
+@admin.post("/authentication/setup/confirm", response_model=AdminSessionResponse)
+def confirm_admin_totp_setup(
+    payload: AdminSetupConfirm, database: Database, settings: Configuration
+) -> AdminSessionResponse:
+    _check_admin_key(payload.admin_key, settings)
+    security = _admin_security(database, for_update=True)
+    now = datetime.now(UTC)
+    if (
+        security is None
+        or security.configured_at is not None
+        or security.setup_expires_at is None
+        or _aware(security.setup_expires_at) <= now
+    ):
+        raise HTTPException(status_code=409, detail="administrator TOTP setup is unavailable")
+    secret = decrypt_totp_secret(security.encrypted_totp_secret, settings)
+    step = matching_totp_step(secret, payload.totp_code, timestamp=now.timestamp())
+    if step is None:
+        raise HTTPException(status_code=401, detail="invalid administrator credentials")
+    security.configured_at = now
+    security.setup_expires_at = None
+    security.last_used_totp_step = step
+    record_event(
+        database,
+        actor="admin",
+        action="admin.totp.configured",
+        object_type="admin_security",
+        object_id="primary",
+    )
+    database.commit()
+    return _admin_session(settings)
+
+
+@admin.post("/authentication/session", response_model=AdminSessionResponse)
+def create_admin_session(
+    payload: AdminAuthenticationRequest, database: Database, settings: Configuration
+) -> AdminSessionResponse:
+    _check_admin_key(payload.admin_key, settings)
+    security = _admin_security(database, for_update=True)
+    if security is None or security.configured_at is None:
+        raise HTTPException(status_code=409, detail="administrator TOTP setup is required")
+    now = datetime.now(UTC)
+    secret = decrypt_totp_secret(security.encrypted_totp_secret, settings)
+    step = matching_totp_step(secret, payload.totp_code, timestamp=now.timestamp())
+    if step is None or (
+        security.last_used_totp_step is not None and step <= security.last_used_totp_step
+    ):
+        raise HTTPException(status_code=401, detail="invalid or already used one-time code")
+    security.last_used_totp_step = step
+    record_event(
+        database,
+        actor="admin",
+        action="admin.session.created",
+        object_type="admin_security",
+        object_id="primary",
+    )
+    database.commit()
+    return _admin_session(settings)
 
 
 @admin.post("/projects", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)

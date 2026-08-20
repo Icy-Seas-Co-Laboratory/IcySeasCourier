@@ -18,7 +18,15 @@
       <form id="login-form">
         <label for="admin-key">Admin API key</label>
         <input id="admin-key" type="password" autocomplete="current-password" required>
-        <small>The key stays in this browser tab and is never written to local storage.</small>
+        <div id="totp-setup" class="evidence" hidden>
+          <strong>Set up your authenticator</strong>
+          <span>Add this secret to your authenticator, then enter its current code below. It will not be shown again after confirmation.</span>
+          <code id="totp-secret"></code>
+          <a id="totp-uri" href="#">Open in authenticator</a>
+        </div>
+        <label for="totp-code">Authenticator code</label>
+        <input id="totp-code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6">
+        <small>The key and authenticator code stay in this browser tab and are never written to local storage.</small>
         <button id="login-submit" class="primary" type="submit">Open console</button>
       </form>
       <div id="login-error" class="error" hidden></div>
@@ -72,6 +80,6 @@
   <dialog id="form-dialog"><form method="dialog"><div class="dialog-head"><div><p class="eyebrow" id="dialog-eyebrow"></p><h2 id="dialog-title"></h2></div><button value="cancel" aria-label="Close">×</button></div><div id="dialog-body"></div><div class="dialog-actions"><button value="cancel" class="secondary">Cancel</button><button id="dialog-submit" value="default" class="primary">Save</button></div></form></dialog>
   <dialog id="detail-dialog" class="detail-dialog"><form method="dialog"><div class="dialog-head"><div><p class="eyebrow">Transfer evidence</p><h2 id="detail-title"></h2></div><button value="cancel" aria-label="Close">×</button></div><div id="detail-body"></div><div class="dialog-actions"><button value="cancel" class="secondary">Close</button></div></form></dialog>
   <div id="toast" role="status" aria-live="polite"></div>
-  <script src="/admin/app.js?v=2" defer></script>
+  <script src="/admin/app.js?v=3" defer></script>
 </body>
 </html>
