@@ -463,7 +463,8 @@ fn normalize_registry_url(value: &str) -> Result<String, String> {
 
 fn default_registry_url() -> Result<String, String> {
     normalize_registry_url(
-        &std::env::var("COURIER_REGISTRY_URL").unwrap_or_else(|_| "http://127.0.0.1:8020".into()),
+        &std::env::var("COURIER_REGISTRY_URL")
+            .unwrap_or_else(|_| "https://courier.icyseascolab.io".into()),
     )
 }
 

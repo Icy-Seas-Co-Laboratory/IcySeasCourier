@@ -59,7 +59,7 @@
   }
 
   let step: Step = "home";
-  let registryUrl = "http://127.0.0.1:8020";
+  let registryUrl = "https://courier.icyseascolab.io";
   let invitation = "";
   let projectId = "";
   let projects: RegistryProject[] = [];
