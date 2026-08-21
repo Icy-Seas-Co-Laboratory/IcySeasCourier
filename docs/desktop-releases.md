@@ -82,8 +82,8 @@ Keep these versions identical before tagging:
 Commit the version change and create the matching tag:
 
 ```bash
-git tag courier-v0.1.0
-git push origin courier-v0.1.0
+git tag courier-v0.1.2
+git push origin courier-v0.1.2
 ```
 
 The workflow rejects a release tag that does not exactly match `courier-v<application-version>`. Create a GitHub Release for that existing tag and publish it (mark it as a prerelease while the beta is ongoing). Publication starts the workflow; the four artifacts are uploaded to that release after they build, and the macOS artifacts are notarized automatically. If a job fails, use **Re-run failed jobs** from the workflow run after correcting the issue.

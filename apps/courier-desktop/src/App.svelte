@@ -78,6 +78,7 @@
   let authorization: RegistryAuthorization | null = null;
   let refreshingTransfers = false;
   let clearingTransfers: "inventorying" | "complete" | null = null;
+  let clearingIncomplete = false;
   let refreshingCurrent = false;
   let inventoryProgress: InventoryProgressEvent | null = null;
   let downloads: DownloadDataset[] = [];
@@ -430,6 +431,68 @@
       error = message(reason);
     } finally {
       clearingTransfers = null;
+    }
+  }
+
+  function incompleteTransferCount(): number {
+    return transfers.filter((transfer) => transfer.status !== "complete").length;
+  }
+
+  async function clearIncompleteTransfers() {
+    const count = incompleteTransferCount();
+    if (count === 0 || clearingIncomplete) return;
+    const approved = await confirm(
+      `Purge ${count} incomplete transfer${count === 1 ? "" : "s"} from this Mac? Local records and temporary pack caches will be removed; original datasets and Registry uploads will not be deleted.`,
+      { title: "Purge incomplete transfers", kind: "warning" },
+    );
+    if (!approved) return;
+    error = "";
+    clearingIncomplete = true;
+    try {
+      await invoke<number>("clear_incomplete_transfers");
+      current = null;
+      await loadTransfers();
+    } catch (reason) {
+      error = message(reason);
+    } finally {
+      clearingIncomplete = false;
+    }
+  }
+
+  async function restartTransfer(transfer: Transfer) {
+    if (busy || transfer.status === "complete") return;
+    const approved = await confirm(
+      `Restart analysis for ${sourceName(transfer.source_root)}? The local transfer record and any cached transport packages will be removed; the source data will remain untouched.`,
+      { title: "Restart transfer", kind: "warning" },
+    );
+    if (!approved) return;
+    error = "";
+    try {
+      await invoke<boolean>("clear_transfer", { transferId: transfer.id });
+      current = null;
+      sourcePath = transfer.source_root;
+      projectId = transfer.project_id ?? projectId;
+      step = authorization?.purpose === "upload" ? "source" : "invite";
+      await loadTransfers();
+    } catch (reason) {
+      error = message(reason);
+    }
+  }
+
+  async function clearOneTransfer(transfer: Transfer) {
+    if (busy || transfer.status === "complete") return;
+    const approved = await confirm(
+      `Clear ${sourceName(transfer.source_root)} from this Mac? Local records and cached transport packages will be removed; the source data and Registry upload will remain untouched.`,
+      { title: "Clear transfer", kind: "warning" },
+    );
+    if (!approved) return;
+    error = "";
+    try {
+      await invoke<boolean>("clear_transfer", { transferId: transfer.id });
+      if (current?.id === transfer.id) current = null;
+      await loadTransfers();
+    } catch (reason) {
+      error = message(reason);
     }
   }
 
@@ -814,10 +877,11 @@
     {:else if step === "transfers"}
       <section class="panel wide">
         <div class="section-heading"><div><p class="eyebrow">Local state</p><h1>Transfers</h1></div><div class="heading-actions"><button class="secondary small" onclick={goHome}>Home</button><button class="secondary small" disabled={refreshingTransfers} onclick={refreshActiveTransfers}>{refreshingTransfers ? "Refreshing…" : "Refresh status"}</button><button class="primary small" onclick={() => (step = authorization ? (authorization.purpose === "download" ? "downloads" : "source") : "invite")}>{authorization?.purpose === "download" ? "Browse datasets" : "New transfer"}</button></div></div>
-        {#if transferCount("inventorying") > 0 || transferCount("complete") > 0}
+        {#if incompleteTransferCount() > 0 || transferCount("inventorying") > 0 || transferCount("complete") > 0}
           <div class="cleanup-bar">
-            <span>Remove local records</span>
+            <span>Manage local records</span>
             <div>
+              {#if incompleteTransferCount() > 0}<button class="secondary small danger" disabled={busy || clearingIncomplete || clearingTransfers !== null} onclick={clearIncompleteTransfers}>{clearingIncomplete ? "Purging…" : `Purge incomplete (${incompleteTransferCount()})`}</button>{/if}
               {#if transferCount("inventorying") > 0}<button class="secondary small" disabled={busy || clearingTransfers !== null} onclick={() => clearTransfers("inventorying")}>{clearingTransfers === "inventorying" ? "Clearing…" : `Clear inventorying (${transferCount("inventorying")})`}</button>{/if}
               {#if transferCount("complete") > 0}<button class="secondary small" disabled={clearingTransfers !== null} onclick={() => clearTransfers("complete")}>{clearingTransfers === "complete" ? "Clearing…" : `Clear completed (${transferCount("complete")})`}</button>{/if}
             </div>
@@ -826,10 +890,13 @@
         {#if transfers.length === 0}<div class="empty"><div class="state-icon">↑</div><h2>No transfers yet</h2><p>Start with an invitation and choose a dataset file or folder.</p></div>{:else}
           <div class="transfer-list">
             {#each transfers as transfer}
-              <button class="transfer-row" onclick={() => openTransfer(transfer)}>
-                <div><strong>{sourceName(transfer.source_root)}</strong><small>{transfer.project_id ?? "Project pending"} · {transfer.file_count.toLocaleString()} files · {formatBytes(transfer.original_bytes)}</small><small>Updated {formatTimestamp(transfer.updated_at)}{transfer.server_transfer_id ? ` · ${transfer.server_transfer_id}` : ""}</small></div>
-                <span class:verified={transfer.status === "complete"} class="status">{statusLabel(transfer.status)}</span>
-              </button>
+              <div class="transfer-entry">
+                <button class="transfer-row" onclick={() => openTransfer(transfer)}>
+                  <div><strong>{sourceName(transfer.source_root)}</strong><small>{transfer.project_id ?? "Project pending"} · {transfer.file_count.toLocaleString()} files · {formatBytes(transfer.original_bytes)}</small><small>Updated {formatTimestamp(transfer.updated_at)}{transfer.server_transfer_id ? ` · ${transfer.server_transfer_id}` : ""}</small></div>
+                  <span class:verified={transfer.status === "complete"} class="status">{statusLabel(transfer.status)}</span>
+                </button>
+                {#if transfer.status !== "complete"}<div class="transfer-actions">{#if authorization?.purpose === "upload"}<button class="secondary small" disabled={busy} onclick={() => restartTransfer(transfer)}>Restart analysis</button>{/if}<button class="secondary small danger" disabled={busy || clearingIncomplete} onclick={() => clearOneTransfer(transfer)}>Clear</button></div>{/if}
+              </div>
             {/each}
           </div>
         {/if}

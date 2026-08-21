@@ -155,6 +155,13 @@ fn credential_entry(base_url: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(CREDENTIAL_SERVICE, base_url).map_err(display)
 }
 
+fn invitation_scope(invitation_code: &str) -> String {
+    format!(
+        "invite:{}",
+        blake3::hash(invitation_code.trim().as_bytes()).to_hex()
+    )
+}
+
 #[cfg(target_os = "macos")]
 fn protected_keychain_options(base_url: &str) -> security_framework::passwords::PasswordOptions {
     let mut options = security_framework::passwords::PasswordOptions::new_generic_password(
@@ -180,7 +187,7 @@ fn local_development_credentials(
 #[cfg(target_os = "macos")]
 fn save_local_development_credentials(
     database: &Path,
-    base_url: &str,
+    session_id: &str,
     credentials: &RegistryCredentials,
 ) -> Result<(), String> {
     use std::io::Write;
@@ -192,7 +199,7 @@ fn save_local_development_credentials(
         Uuid::new_v4()
     ));
     let mut credentials_by_registry = local_development_credentials(database)?;
-    credentials_by_registry.insert(base_url.to_owned(), credentials.clone());
+    credentials_by_registry.insert(session_id.to_owned(), credentials.clone());
     let encoded = serde_json::to_vec(&credentials_by_registry).map_err(display)?;
     let mut output = fs::OpenOptions::new()
         .write(true)
@@ -215,70 +222,91 @@ fn save_local_development_credentials(
 
 #[cfg(target_os = "macos")]
 fn save_credentials(
-    base_url: &str,
+    session_id: &str,
     credentials: &RegistryCredentials,
     database: &Path,
 ) -> Result<(), String> {
     let encoded = serde_json::to_vec(credentials).map_err(display)?;
     let result = security_framework::passwords::set_generic_password_options(
         &encoded,
-        protected_keychain_options(base_url),
+        protected_keychain_options(session_id),
     );
     match result {
         Ok(()) => Ok(()),
-        Err(_) => save_local_development_credentials(database, base_url, credentials),
+        Err(_) => save_local_development_credentials(database, session_id, credentials),
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 fn save_credentials(
-    base_url: &str,
+    session_id: &str,
     credentials: &RegistryCredentials,
     _database: &Path,
 ) -> Result<(), String> {
     let encoded = serde_json::to_string(credentials).map_err(display)?;
-    credential_entry(base_url)?
+    credential_entry(session_id)?
         .set_password(&encoded)
         .map_err(display)
 }
 
 #[cfg(target_os = "macos")]
 fn load_persisted_credentials(
+    session_id: &str,
     base_url: &str,
     database: &Path,
 ) -> Result<Option<RegistryCredentials>, String> {
     use security_framework_sys::base::errSecItemNotFound;
 
-    match security_framework::passwords::generic_password(protected_keychain_options(base_url)) {
+    match security_framework::passwords::generic_password(protected_keychain_options(session_id)) {
         Ok(encoded) => serde_json::from_slice(&encoded).map(Some).map_err(display),
         Err(error) if error.code() == errSecItemNotFound || cfg!(debug_assertions) => {
-            if let Some(credentials) = local_development_credentials(database)?.remove(base_url) {
+            if let Some(credentials) = local_development_credentials(database)?.remove(session_id) {
                 return Ok(Some(credentials));
             }
             // Courier previously used the legacy file-based macOS keychain. Read it once,
             // then migrate to the app-scoped data-protection keychain. The old entry is
             // deliberately left in place so migration cannot destroy the only credential.
-            match credential_entry(base_url)?.get_password() {
+            match credential_entry(session_id)
+                .or_else(|_| credential_entry(base_url))?
+                .get_password()
+            {
                 Ok(encoded) => {
                     let credentials: RegistryCredentials =
                         serde_json::from_str(&encoded).map_err(display)?;
-                    save_credentials(base_url, &credentials, database)?;
+                    save_credentials(session_id, &credentials, database)?;
                     Ok(Some(credentials))
+                }
+                Err(keyring::Error::NoEntry) if session_id != base_url => {
+                    match credential_entry(base_url)?.get_password() {
+                        Ok(encoded) => serde_json::from_str(&encoded).map(Some).map_err(display),
+                        Err(keyring::Error::NoEntry) => Ok(None),
+                        Err(error) => Err(display(error)),
+                    }
                 }
                 Err(keyring::Error::NoEntry) => Ok(None),
                 Err(error) => Err(display(error)),
             }
         }
         Err(_) => {
-            if let Some(credentials) = local_development_credentials(database)?.remove(base_url) {
+            if let Some(credentials) = local_development_credentials(database)?.remove(session_id) {
                 return Ok(Some(credentials));
             }
-            match credential_entry(base_url)?.get_password() {
+            match credential_entry(session_id)
+                .or_else(|_| credential_entry(base_url))?
+                .get_password()
+            {
                 Ok(encoded) => {
                     let credentials: RegistryCredentials =
                         serde_json::from_str(&encoded).map_err(display)?;
-                    save_credentials(base_url, &credentials, database)?;
+                    save_credentials(session_id, &credentials, database)?;
                     Ok(Some(credentials))
+                }
+                Err(keyring::Error::NoEntry) if session_id != base_url => {
+                    match credential_entry(base_url)?.get_password() {
+                        Ok(encoded) => serde_json::from_str(&encoded).map(Some).map_err(display),
+                        Err(keyring::Error::NoEntry) => Ok(None),
+                        Err(error) => Err(display(error)),
+                    }
                 }
                 Err(keyring::Error::NoEntry) => Ok(None),
                 Err(error) => Err(display(error)),
@@ -289,17 +317,29 @@ fn load_persisted_credentials(
 
 #[cfg(not(target_os = "macos"))]
 fn load_persisted_credentials(
+    session_id: &str,
     base_url: &str,
     _database: &Path,
 ) -> Result<Option<RegistryCredentials>, String> {
-    match credential_entry(base_url)?.get_password() {
+    match credential_entry(session_id)
+        .or_else(|_| credential_entry(base_url))?
+        .get_password()
+    {
         Ok(encoded) => serde_json::from_str(&encoded).map(Some).map_err(display),
+        Err(keyring::Error::NoEntry) if session_id != base_url => {
+            match credential_entry(base_url)?.get_password() {
+                Ok(encoded) => serde_json::from_str(&encoded).map(Some).map_err(display),
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(error) => Err(display(error)),
+            }
+        }
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(error) => Err(display(error)),
     }
 }
 
 fn load_credentials(
+    session_id: &str,
     base_url: &str,
     cache: &Mutex<HashMap<String, RegistryCredentials>>,
     database: &Path,
@@ -307,17 +347,17 @@ fn load_credentials(
     if let Some(credentials) = cache
         .lock()
         .map_err(|_| "Registry credential cache is unavailable".to_string())?
-        .get(base_url)
+        .get(session_id)
         .cloned()
     {
         return Ok(Some(credentials));
     }
-    match load_persisted_credentials(base_url, database)? {
+    match load_persisted_credentials(session_id, base_url, database)? {
         Some(credentials) => {
             cache
                 .lock()
                 .map_err(|_| "Registry credential cache is unavailable".to_string())?
-                .insert(base_url.to_owned(), credentials.clone());
+                .insert(session_id.to_owned(), credentials.clone());
             Ok(Some(credentials))
         }
         None => Ok(None),
@@ -326,9 +366,11 @@ fn load_credentials(
 
 fn session_record(
     base_url: String,
+    session_id: String,
     session: &courier_registry::RegistrySession,
 ) -> Result<RegistrySessionRecord, String> {
     Ok(RegistrySessionRecord {
+        session_id,
         base_url,
         expires_at: session.expires_at,
         refresh_expires_at: session.refresh_expires_at,
@@ -339,6 +381,7 @@ fn session_record(
 fn persist_registry_session(
     store: &TransferStore,
     base_url: &str,
+    session_id: &str,
     session: &courier_registry::RegistrySession,
     cache: &Mutex<HashMap<String, RegistryCredentials>>,
     database: &Path,
@@ -347,18 +390,23 @@ fn persist_registry_session(
         access_token: session.access_token.clone(),
         refresh_token: session.refresh_token.clone(),
     };
-    save_credentials(base_url, &credentials, database)?;
+    save_credentials(&session_id, &credentials, database)?;
     cache
         .lock()
         .map_err(|_| "Registry credential cache is unavailable".to_string())?
-        .insert(base_url.to_owned(), credentials);
+        .insert(session_id.to_owned(), credentials);
     store
-        .save_registry_session(&session_record(base_url.to_owned(), session)?)
+        .save_registry_session(&session_record(
+            base_url.to_owned(),
+            session_id.to_owned(),
+            session,
+        )?)
         .map_err(display)
 }
 
 async fn active_registry_session(
     store: &TransferStore,
+    session_id: &str,
     base_url: &str,
     database: &std::path::Path,
     credential_cache: &Arc<Mutex<HashMap<String, RegistryCredentials>>>,
@@ -369,13 +417,13 @@ async fn active_registry_session(
     // status polls cannot prompt repeatedly or attempt to reuse the same refresh token.
     let _session_guard = session_gate.lock().await;
     let metadata = store
-        .registry_session(base_url)
+        .registry_session(session_id)
         .map_err(display)?
         .ok_or_else(|| "Enter a Registry invitation to authorize this device".to_string())?;
     if !device_unlocked.load(Ordering::Acquire) {
         return Err("Unlock saved Courier project access before continuing".into());
     }
-    let credentials = load_credentials(base_url, credential_cache, database)?.ok_or_else(|| {
+    let credentials = load_credentials(session_id, base_url, credential_cache, database)?.ok_or_else(|| {
         "Registry credentials are unavailable in the operating system credential vault; enter a new invitation"
             .to_string()
     })?;
@@ -385,6 +433,7 @@ async fn active_registry_session(
     if metadata.expires_at > chrono::Utc::now() + chrono::Duration::minutes(5) {
         let observer_database = database.to_path_buf();
         let observer_url = base_url.to_owned();
+        let observer_session_id = session_id.to_owned();
         let observer_cache = credential_cache.clone();
         return Ok((
             RegistryClient::renewable(
@@ -396,6 +445,7 @@ async fn active_registry_session(
                     persist_registry_session(
                         &store,
                         &observer_url,
+                        &observer_session_id,
                         session,
                         &observer_cache,
                         &observer_database,
@@ -409,10 +459,18 @@ async fn active_registry_session(
         .refresh_session(&credentials.refresh_token)
         .await
         .map_err(display)?;
-    persist_registry_session(store, base_url, &refreshed, credential_cache, database)?;
-    let metadata = session_record(base_url.to_owned(), &refreshed)?;
+    persist_registry_session(
+        store,
+        base_url,
+        session_id,
+        &refreshed,
+        credential_cache,
+        database,
+    )?;
+    let metadata = session_record(base_url.to_owned(), session_id.to_owned(), &refreshed)?;
     let observer_database = database.to_path_buf();
     let observer_url = base_url.to_owned();
+    let observer_session_id = session_id.to_owned();
     let observer_cache = credential_cache.clone();
     Ok((
         RegistryClient::renewable(
@@ -424,6 +482,7 @@ async fn active_registry_session(
                 persist_registry_session(
                     &store,
                     &observer_url,
+                    &observer_session_id,
                     session,
                     &observer_cache,
                     &observer_database,
@@ -541,9 +600,9 @@ async fn device_access_status(app: AppHandle) -> Result<DeviceAccessStatus, Stri
     tauri::async_runtime::spawn_blocking(move || {
         let store = TransferStore::open(database).map_err(display)?;
         let has_stored_authorization = store
-            .active_registry()
+            .active_registry_session_id()
             .map_err(display)?
-            .and_then(|base_url| store.registry_session(&base_url).ok().flatten())
+            .and_then(|session_id| store.registry_session(&session_id).ok().flatten())
             .is_some_and(|session| session.refresh_expires_at > chrono::Utc::now());
         let biometric_available = biometric_available();
         Ok(DeviceAccessStatus {
@@ -574,10 +633,15 @@ async fn authenticate_device(
     tauri::async_runtime::spawn_blocking(move || {
         authenticate_device_owner()?;
         let store = TransferStore::open(&database).map_err(display)?;
-        if let Some(base_url) = store.active_registry().map_err(display)? {
-            load_credentials(&base_url, &credential_cache, &database)?.ok_or_else(|| {
-                "Saved Registry credentials are unavailable; enter a new invitation".to_string()
-            })?;
+        if let Some(session_id) = store.active_registry_session_id().map_err(display)? {
+            let base_url = store
+                .registry_session(&session_id)
+                .map_err(display)?
+                .map(|session| session.base_url)
+                .unwrap_or_default();
+            load_credentials(&session_id, &base_url, &credential_cache, &database)?.ok_or_else(
+                || "Saved Registry credentials are unavailable; enter a new invitation".to_string(),
+            )?;
         }
         device_unlocked.store(true, Ordering::Release);
         Ok(())
@@ -605,6 +669,7 @@ async fn exchange_invitation(
     invitation_code: String,
 ) -> Result<RegistryAuthorization, String> {
     let base_url = normalize_registry_url(&registry_url)?;
+    let session_id = invitation_scope(&invitation_code);
     let remote = RegistryClient::unauthenticated(&base_url)
         .exchange_invitation(invitation_code.trim(), "courier-desktop")
         .await
@@ -634,8 +699,17 @@ async fn exchange_invitation(
     let device_unlocked = runtime.device_unlocked.clone();
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         let store = TransferStore::open(&database).map_err(display)?;
-        persist_registry_session(&store, &base_url, &remote, &credential_cache, &database)?;
-        store.set_active_registry(&base_url).map_err(display)?;
+        persist_registry_session(
+            &store,
+            &base_url,
+            &session_id,
+            &remote,
+            &credential_cache,
+            &database,
+        )?;
+        store
+            .set_active_registry_session(&session_id, &base_url)
+            .map_err(display)?;
         device_unlocked.store(true, Ordering::Release);
         Ok(())
     })
@@ -657,9 +731,14 @@ async fn current_authorization(
     tauri::async_runtime::spawn_blocking(move || {
         let store = TransferStore::open(&database).map_err(display)?;
         let base_url = configured_registry_url(&store)?;
+        let session_id = store
+            .active_registry_session_id()
+            .map_err(display)?
+            .ok_or_else(|| "Enter a Registry invitation to authorize this device".to_string())?;
         tauri::async_runtime::block_on(async {
             match active_registry_session(
                 &store,
+                &session_id,
                 &base_url,
                 &database,
                 &credential_cache,
@@ -963,8 +1042,13 @@ async fn download_dataset(
     let (client, _) = tauri::async_runtime::spawn_blocking(move || {
         let store = TransferStore::open(&database).map_err(display)?;
         let base_url = configured_registry_url(&store)?;
+        let session_id = store
+            .active_registry_session_id()
+            .map_err(display)?
+            .ok_or_else(|| "Enter a Registry invitation to authorize this device".to_string())?;
         tauri::async_runtime::block_on(active_registry_session(
             &store,
+            &session_id,
             &base_url,
             &database,
             &credential_cache,
@@ -1161,7 +1245,7 @@ fn prepare_transport_plan(
     let options = PackOptions::default();
     let plan = plan_packs(files, options).map_err(display)?;
     let pack_directory = cache_root.join("packs").join(transfer_id.to_string());
-    if !plan.packs.is_empty() {
+    if !plan.packs.is_empty() || !plan.standalone.is_empty() {
         fs::create_dir_all(&pack_directory).map_err(display)?;
     }
     let mut objects = Vec::new();
@@ -1218,22 +1302,69 @@ fn prepare_transport_plan(
     }
 
     for file in plan.standalone {
-        objects.push(TransportObjectRecord {
-            id: file.id,
-            transfer_id,
-            kind: TransportObjectKind::File,
-            compression: "none".into(),
-            encoding_version: 1,
-            original_bytes: file.size,
-            transport_bytes: Some(file.size),
-            cache_path: None,
-        });
-        members.push(TransportMemberRecord {
-            object_id: file.id,
-            file_id: file.id,
-            member_index: 0,
-        });
-        upload_sources.push(file.clone());
+        // Large files are first encoded as a one-member zstd pack. Keep the
+        // compressed representation only when it actually saves bytes; this
+        // avoids paying CPU/storage costs for already-compressed formats while
+        // still making compressible large files cheaper to transfer.
+        let object_id = Uuid::new_v4();
+        let destination = pack_directory.join(format!("{object_id}.iscpack.zst"));
+        let temporary = pack_directory.join(format!("{object_id}.tmp"));
+        let compressed_size = (|| -> Result<u64, String> {
+            let mut output = File::create(&temporary).map_err(display)?;
+            encode_pack(&[file], &mut output, options.zstd_level).map_err(display)?;
+            output.sync_all().map_err(display)?;
+            Ok(temporary.metadata().map_err(display)?.len())
+        })()?;
+        let use_compressed = compressed_size < file.size;
+        if use_compressed {
+            let transport_bytes = compressed_size;
+            fs::rename(&temporary, &destination).map_err(display)?;
+            objects.push(TransportObjectRecord {
+                id: object_id,
+                transfer_id,
+                kind: TransportObjectKind::Pack,
+                compression: "zstd".into(),
+                encoding_version: 2,
+                original_bytes: file.size,
+                transport_bytes: Some(transport_bytes),
+                cache_path: Some(destination.clone()),
+            });
+            members.push(TransportMemberRecord {
+                object_id,
+                file_id: file.id,
+                member_index: 0,
+            });
+            upload_sources.push(FileRecord {
+                id: object_id,
+                transfer_id,
+                relative_path: PathBuf::from(format!("Courier pack {object_id}")),
+                absolute_path: destination.clone(),
+                size: transport_bytes,
+                mtime_ns: modified_ns(&destination)?,
+                hash_algorithm: HashAlgorithm::Sha256,
+                sha256: String::new(),
+                status: FileStatus::Ready,
+                bytes_completed: 0,
+            });
+        } else {
+            let _ = fs::remove_file(&temporary);
+            objects.push(TransportObjectRecord {
+                id: file.id,
+                transfer_id,
+                kind: TransportObjectKind::File,
+                compression: "none".into(),
+                encoding_version: 1,
+                original_bytes: file.size,
+                transport_bytes: Some(file.size),
+                cache_path: None,
+            });
+            members.push(TransportMemberRecord {
+                object_id: file.id,
+                file_id: file.id,
+                member_index: 0,
+            });
+            upload_sources.push(file.clone());
+        }
     }
     Ok(PreparedTransportPlan {
         objects,
@@ -1257,10 +1388,14 @@ async fn create_inventory(
             .map_err(|error| format!("Could not open source: {error}"))?;
         let mut store = TransferStore::open(&database).map_err(display)?;
         let base_url = configured_registry_url(&store)?;
+        let session_id = store
+            .active_registry_session_id()
+            .map_err(display)?
+            .ok_or_else(|| "Enter a Registry invitation before preparing a transfer".to_string())?;
         let transfer = Transfer::draft(source.clone(), project_id);
         store.create_transfer(&transfer).map_err(display)?;
         store
-            .bind_transfer_registry(transfer.id, &base_url)
+            .bind_transfer_registry_session(transfer.id, &base_url, &session_id)
             .map_err(display)?;
         store
             .transition(transfer.id, TransferStatus::Inventorying)
@@ -1406,6 +1541,51 @@ async fn clear_transfers(app: AppHandle, status: TransferStatus) -> Result<usize
 }
 
 #[tauri::command]
+async fn clear_incomplete_transfers(app: AppHandle) -> Result<usize, String> {
+    let database = database_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = TransferStore::open(&database).map_err(display)?;
+        let targets = store
+            .list_transfers()
+            .map_err(display)?
+            .into_iter()
+            .filter(|transfer| transfer.status != TransferStatus::Complete)
+            .collect::<Vec<_>>();
+        let mut removed = 0;
+        for transfer in targets {
+            remove_pack_cache(&store, transfer.id);
+            remove_transfer_pack_directory(&database, transfer.id)?;
+            if store.delete_transfer(transfer.id).map_err(display)? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    })
+    .await
+    .map_err(|error| format!("Transfer cleanup failed: {error}"))?
+}
+
+#[tauri::command]
+async fn clear_transfer(app: AppHandle, transfer_id: Uuid) -> Result<bool, String> {
+    let database = database_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = TransferStore::open(&database).map_err(display)?;
+        let transfer = store
+            .get_transfer(transfer_id)
+            .map_err(display)?
+            .ok_or_else(|| format!("Transfer not found: {transfer_id}"))?;
+        if transfer.status == TransferStatus::Complete {
+            return Err("Completed transfers must be cleared from transfer history instead".into());
+        }
+        remove_pack_cache(&store, transfer.id);
+        remove_transfer_pack_directory(&database, transfer.id)?;
+        Ok(store.delete_transfer(transfer.id).map_err(display)?)
+    })
+    .await
+    .map_err(|error| format!("Transfer cleanup failed: {error}"))?
+}
+
+#[tauri::command]
 async fn refresh_transfer_status(
     app: AppHandle,
     runtime: State<'_, RuntimeState>,
@@ -1428,9 +1608,14 @@ async fn refresh_transfer_status(
             Some(value) => normalize_registry_url(&value)?,
             None => configured_registry_url(&store)?,
         };
+        let session_id = store
+            .transfer_registry_session(transfer_id)
+            .map_err(display)?
+            .ok_or_else(|| "Transfer is not bound to a Registry invitation".to_string())?;
         tauri::async_runtime::block_on(async {
             let (client, _) = active_registry_session(
                 &store,
+                &session_id,
                 &base_url,
                 &database,
                 &credential_cache,
@@ -1607,8 +1792,13 @@ fn run_upload(
             Some(value) => normalize_registry_url(&value)?,
             None => configured_registry_url(&store)?,
         };
+        let session_id = store
+            .transfer_registry_session(transfer_id)
+            .map_err(display)?
+            .ok_or_else(|| "Transfer is not bound to a Registry invitation".to_string())?;
         let (client, _) = active_registry_session(
             &store,
+            &session_id,
             &base_url,
             &database,
             &credential_cache,
@@ -1933,6 +2123,8 @@ pub fn run() {
             list_transfers,
             transfer_sizes,
             clear_transfers,
+            clear_incomplete_transfers,
+            clear_transfer,
             refresh_transfer_status,
             start_upload,
             pause_upload
@@ -2069,5 +2261,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(paths, ["a.csv", "b.csv"]);
+    }
+
+    #[test]
+    fn compressible_large_files_use_zstd_when_it_saves_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("large.bin"), vec![b'x'; 9 * 1024 * 1024]).unwrap();
+        let transfer_id = Uuid::new_v4();
+        let files = inventory_transfer(transfer_id, &source, &InventoryOptions::default()).unwrap();
+
+        let plan = prepare_transport_plan(transfer_id, &files, directory.path()).unwrap();
+
+        assert_eq!(plan.objects.len(), 1);
+        assert_eq!(plan.objects[0].kind, TransportObjectKind::Pack);
+        assert_eq!(plan.objects[0].compression, "zstd");
+        assert!(plan.objects[0].transport_bytes.unwrap() < files[0].size);
+        assert_eq!(plan.members[0].member_index, 0);
     }
 }

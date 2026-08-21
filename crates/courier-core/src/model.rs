@@ -131,10 +131,12 @@ pub struct Transfer {
     pub file_count: u64,
     pub original_bytes: u64,
     pub manifest_version: u8,
+    pub registry_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistrySessionRecord {
+    pub session_id: String,
     pub base_url: String,
     pub expires_at: DateTime<Utc>,
     pub refresh_expires_at: DateTime<Utc>,
@@ -155,6 +157,7 @@ impl Transfer {
             file_count: 0,
             original_bytes: 0,
             manifest_version: 3,
+            registry_session_id: None,
         }
     }
 }

@@ -44,6 +44,13 @@ class FakeObjectStorage:
         assert parts
         return '"completed-etag"'
 
+    def abort_multipart(self, object_key: str, upload_id: str) -> None:
+        assert self.uploads.get(object_key) == upload_id
+        self.uploads.pop(object_key, None)
+
+    def delete_object(self, object_key: str) -> None:
+        self.objects.pop(object_key, None)
+
     def open_object(self, object_key: str):
         return io.BytesIO(self.objects[object_key])
 

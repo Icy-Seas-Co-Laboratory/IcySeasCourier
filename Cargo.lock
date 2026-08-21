@@ -1287,7 +1287,7 @@ dependencies = [
 
 [[package]]
 name = "courier-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1300,7 +1300,7 @@ dependencies = [
 
 [[package]]
 name = "courier-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "blake3",
  "chrono",
@@ -1320,8 +1320,9 @@ dependencies = [
 
 [[package]]
 name = "courier-desktop"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
+ "blake3",
  "block2",
  "chrono",
  "courier-core",
@@ -1348,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "courier-pack"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "courier-core",
  "serde",
@@ -1361,7 +1362,7 @@ dependencies = [
 
 [[package]]
 name = "courier-registry"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1381,7 +1382,7 @@ dependencies = [
 
 [[package]]
 name = "courier-transfer"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "aws-config",

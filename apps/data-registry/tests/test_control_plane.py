@@ -138,6 +138,10 @@ def test_admin_transfer_listing_and_retry_guards(client: TestClient) -> None:
     retry = client.post(f"/api/v1/admin/transfers/{transfer['public_id']}/retry", headers=ADMIN)
     assert retry.status_code == 409
 
+    purged = client.delete(f"/api/v1/admin/transfers/{transfer['public_id']}", headers=ADMIN)
+    assert purged.status_code == 204
+    assert client.get("/api/v1/admin/transfers", headers=ADMIN).json() == []
+
 
 def test_invitation_exchange_and_idempotent_transfer_creation(client: TestClient) -> None:
     project = create_project(client)

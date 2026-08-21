@@ -515,6 +515,45 @@ def retry_failed_transfer(
     return transfer_summary(transfer)
 
 
+@admin.delete("/transfers/{transfer_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_transfer(
+    transfer_id: str,
+    database: Database,
+    storage: Storage,
+    actor: AdminActor,
+) -> Response:
+    """Remove a transfer and its uploaded or in-progress S3 objects."""
+    transfer = database.scalar(
+        select(Transfer).where(Transfer.public_id == transfer_id).with_for_update(of=Transfer)
+    )
+    if transfer is None:
+        raise HTTPException(status_code=404, detail="transfer not found")
+
+    object_keys = {item.object_key for item in transfer.transport_objects}
+    object_keys.update(item.object_key for item in transfer.files)
+    for item in transfer.transport_objects:
+        if item.multipart_upload_id is not None and item.status not in {"uploaded", "verified"}:
+            storage.abort_multipart(item.object_key, item.multipart_upload_id)
+        storage.delete_object(item.object_key)
+
+    action = (
+        "transfer.completed_deleted"
+        if transfer.status == "complete"
+        else "transfer.incomplete_purged"
+    )
+    record_event(
+        database,
+        actor=actor,
+        action=action,
+        object_type="transfer",
+        object_id=transfer.public_id,
+        metadata={"status": transfer.status, "object_count": len(object_keys)},
+    )
+    database.delete(transfer)
+    database.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @admin.get("/audit-events", response_model=list[AuditEventResponse])
 def list_audit_events(database: Database, _: AdminActor, limit: int = 100) -> list[AuditEvent]:
     limit = min(max(limit, 1), 500)

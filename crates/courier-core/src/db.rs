@@ -73,11 +73,16 @@ impl TransferStore {
             self.conn
                 .execute_batch(include_str!("../migrations/009_registry_endpoints.sql"))?;
         }
+        if version < 10 {
+            self.conn.execute_batch(include_str!(
+                "../migrations/010_scoped_registry_sessions.sql"
+            ))?;
+        }
         Ok(())
     }
 
     pub fn create_transfer(&self, transfer: &Transfer) -> Result<()> {
-        self.conn.execute("INSERT INTO transfers (id, server_transfer_id, project_id, source_root, created_at, updated_at, status, file_count, original_bytes, manifest_version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![transfer.id.to_string(), transfer.server_transfer_id, transfer.project_id, transfer.source_root.to_string_lossy(), transfer.created_at.to_rfc3339(), transfer.updated_at.to_rfc3339(), transfer.status.to_string(), transfer.file_count, transfer.original_bytes, transfer.manifest_version])?;
+        self.conn.execute("INSERT INTO transfers (id, server_transfer_id, project_id, source_root, created_at, updated_at, status, file_count, original_bytes, manifest_version, registry_session_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![transfer.id.to_string(), transfer.server_transfer_id, transfer.project_id, transfer.source_root.to_string_lossy(), transfer.created_at.to_rfc3339(), transfer.updated_at.to_rfc3339(), transfer.status.to_string(), transfer.file_count, transfer.original_bytes, transfer.manifest_version, transfer.registry_session_id])?;
         Ok(())
     }
 
@@ -165,11 +170,11 @@ impl TransferStore {
     }
 
     pub fn get_transfer(&self, id: Uuid) -> Result<Option<Transfer>> {
-        self.conn.query_row("SELECT id,server_transfer_id,project_id,source_root,created_at,updated_at,status,file_count,original_bytes,manifest_version FROM transfers WHERE id=?1", [id.to_string()], row_to_transfer).optional().map_err(Into::into)
+        self.conn.query_row("SELECT id,server_transfer_id,project_id,source_root,created_at,updated_at,status,file_count,original_bytes,manifest_version,registry_session_id FROM transfers WHERE id=?1", [id.to_string()], row_to_transfer).optional().map_err(Into::into)
     }
 
     pub fn list_transfers(&self) -> Result<Vec<Transfer>> {
-        let mut stmt = self.conn.prepare("SELECT id,server_transfer_id,project_id,source_root,created_at,updated_at,status,file_count,original_bytes,manifest_version FROM transfers ORDER BY created_at DESC")?;
+        let mut stmt = self.conn.prepare("SELECT id,server_transfer_id,project_id,source_root,created_at,updated_at,status,file_count,original_bytes,manifest_version,registry_session_id FROM transfers ORDER BY created_at DESC")?;
         let rows = stmt.query_map([], row_to_transfer)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
@@ -412,8 +417,21 @@ impl TransferStore {
 
     pub fn bind_transfer_registry(&self, id: Uuid, base_url: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE transfers SET registry_url=?1, updated_at=?2 WHERE id=?3",
-            params![base_url, Utc::now().to_rfc3339(), id.to_string()],
+            "UPDATE transfers SET registry_url=?1, registry_session_id=?2, updated_at=?3 WHERE id=?4",
+            params![base_url, format!("legacy:{base_url}"), Utc::now().to_rfc3339(), id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn bind_transfer_registry_session(
+        &self,
+        id: Uuid,
+        base_url: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE transfers SET registry_url=?1, registry_session_id=?2, updated_at=?3 WHERE id=?4",
+            params![base_url, session_id, Utc::now().to_rfc3339(), id.to_string()],
         )?;
         Ok(())
     }
@@ -429,12 +447,43 @@ impl TransferStore {
             .map_err(Into::into)
     }
 
+    pub fn transfer_registry_session(&self, id: Uuid) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT registry_session_id FROM transfers WHERE id=?1 AND registry_session_id IS NOT NULL",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn set_active_registry(&self, base_url: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO app_settings (key,value,updated_at) VALUES ('active_registry_url',?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
             params![base_url, Utc::now().to_rfc3339()],
         )?;
         Ok(())
+    }
+
+    pub fn set_active_registry_session(&self, session_id: &str, base_url: &str) -> Result<()> {
+        self.set_active_registry(base_url)?;
+        self.conn.execute(
+            "INSERT INTO app_settings (key,value,updated_at) VALUES ('active_registry_session_id',?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+            params![session_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn active_registry_session_id(&self) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='active_registry_session_id'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn active_registry(&self) -> Result<Option<String>> {
@@ -484,8 +533,9 @@ impl TransferStore {
 
     pub fn save_registry_session(&self, session: &RegistrySessionRecord) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO registry_sessions (base_url,expires_at,refresh_expires_at,projects_json,created_at) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(base_url) DO UPDATE SET expires_at=excluded.expires_at,refresh_expires_at=excluded.refresh_expires_at,projects_json=excluded.projects_json,created_at=excluded.created_at",
+            "INSERT INTO registry_sessions (session_id,base_url,expires_at,refresh_expires_at,projects_json,created_at) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(session_id) DO UPDATE SET base_url=excluded.base_url,expires_at=excluded.expires_at,refresh_expires_at=excluded.refresh_expires_at,projects_json=excluded.projects_json,created_at=excluded.created_at",
             params![
+                session.session_id,
                 session.base_url,
                 session.expires_at.to_rfc3339(),
                 session.refresh_expires_at.to_rfc3339(),
@@ -496,24 +546,14 @@ impl TransferStore {
         Ok(())
     }
 
-    pub fn registry_session(&self, base_url: &str) -> Result<Option<RegistrySessionRecord>> {
+    pub fn registry_session(&self, session_id: &str) -> Result<Option<RegistrySessionRecord>> {
         self.conn
             .query_row(
-                "SELECT base_url,expires_at,refresh_expires_at,projects_json FROM registry_sessions WHERE base_url=?1",
-                [base_url],
+                "SELECT session_id,base_url,expires_at,refresh_expires_at,projects_json FROM registry_sessions WHERE session_id=?1",
+                [session_id],
                 |row| {
-                    let expires: String = row.get(1)?;
+                    let expires: String = row.get(2)?;
                     let expires_at = DateTime::parse_from_rfc3339(&expires)
-                        .map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                1,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?
-                        .with_timezone(&Utc);
-                    let refresh_expires: String = row.get(2)?;
-                    let refresh_expires_at = DateTime::parse_from_rfc3339(&refresh_expires)
                         .map_err(|error| {
                             rusqlite::Error::FromSqlConversionFailure(
                                 2,
@@ -522,11 +562,22 @@ impl TransferStore {
                             )
                         })?
                         .with_timezone(&Utc);
+                    let refresh_expires: String = row.get(3)?;
+                    let refresh_expires_at = DateTime::parse_from_rfc3339(&refresh_expires)
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                    })?
+                        .with_timezone(&Utc);
                     Ok(RegistrySessionRecord {
-                        base_url: row.get(0)?,
+                        session_id: row.get(0)?,
+                        base_url: row.get(1)?,
                         expires_at,
                         refresh_expires_at,
-                        projects_json: row.get(3)?,
+                        projects_json: row.get(4)?,
                     })
                 },
             )
@@ -659,6 +710,7 @@ fn row_to_transfer(row: &rusqlite::Row<'_>) -> rusqlite::Result<Transfer> {
         file_count: row.get(7)?,
         original_bytes: row.get(8)?,
         manifest_version: row.get(9)?,
+        registry_session_id: row.get(10)?,
     })
 }
 
@@ -970,6 +1022,10 @@ mod tests {
             Some("https://registry.example.test")
         );
         assert_eq!(
+            store.active_registry_session_id().unwrap().as_deref(),
+            Some("legacy:https://registry.example.test")
+        );
+        assert_eq!(
             store.transfer_registry(transfer_id).unwrap().as_deref(),
             Some("https://registry.example.test")
         );
@@ -998,12 +1054,22 @@ mod tests {
             .bind_registry_file(file.id, server_file_id, "incoming/opaque/payload")
             .unwrap();
         let session = RegistrySessionRecord {
+            session_id: "session-1".into(),
             base_url: "http://registry.test".into(),
             expires_at: Utc::now(),
             refresh_expires_at: Utc::now(),
             projects_json: "[]".into(),
         };
         store.save_registry_session(&session).unwrap();
+        store
+            .save_registry_session(&RegistrySessionRecord {
+                session_id: "session-2".into(),
+                base_url: "http://registry.test".into(),
+                expires_at: Utc::now(),
+                refresh_expires_at: Utc::now(),
+                projects_json: "[]".into(),
+            })
+            .unwrap();
 
         assert_eq!(
             store
@@ -1026,12 +1092,8 @@ mod tests {
             store.active_registry().unwrap().as_deref(),
             Some("https://registry.example.test")
         );
-        assert!(
-            store
-                .registry_session("http://registry.test")
-                .unwrap()
-                .is_some()
-        );
+        assert!(store.registry_session("session-1").unwrap().is_some());
+        assert!(store.registry_session("session-2").unwrap().is_some());
         let columns = store
             .conn
             .prepare("PRAGMA table_info(registry_sessions)")

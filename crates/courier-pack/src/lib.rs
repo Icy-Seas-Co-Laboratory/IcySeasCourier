@@ -83,22 +83,14 @@ pub fn plan_packs<'a>(
         if !current.is_empty() && current_size.saturating_add(file.size) > options.target_pack_size
         {
             let completed = std::mem::take(&mut current);
-            if completed.len() == 1 {
-                standalone.extend(completed);
-            } else {
-                packs.push(completed);
-            }
+            packs.push(completed);
             current_size = 0;
         }
         current_size = current_size.saturating_add(file.size);
         current.push(file);
     }
     if !current.is_empty() {
-        if current.len() == 1 {
-            standalone.extend(current);
-        } else {
-            packs.push(current);
-        }
+        packs.push(current);
     }
     standalone.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     Ok(PackPlan { packs, standalone })
@@ -238,11 +230,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(plan.packs.len(), 1);
+        assert_eq!(plan.packs.len(), 2);
         assert_eq!(plan.packs[0][0].relative_path, PathBuf::from("a"));
         assert_eq!(plan.packs[0][1].relative_path, PathBuf::from("b"));
-        assert_eq!(plan.standalone[0].relative_path, PathBuf::from("c"));
-        assert_eq!(plan.standalone[1].relative_path, PathBuf::from("large"));
+        assert_eq!(plan.packs[1][0].relative_path, PathBuf::from("c"));
+        assert_eq!(plan.standalone[0].relative_path, PathBuf::from("large"));
     }
 
     #[test]
