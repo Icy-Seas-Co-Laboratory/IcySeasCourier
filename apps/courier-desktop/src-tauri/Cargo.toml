@@ -28,7 +28,13 @@ uuid.workspace = true
 url.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
 keyring = { workspace = true, features = ["apple-native"] }
+objc2 = "0.6.4"
+objc2-foundation = "0.3.2"
+objc2-local-authentication = { version = "0.3.2", default-features = false, features = ["LAContext", "LAPublicDefines", "block2", "std"] }
+security-framework = { version = "3.7.0", features = ["OSX_10_15"] }
+security-framework-sys = "2.17.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { workspace = true, features = ["windows-native"] }

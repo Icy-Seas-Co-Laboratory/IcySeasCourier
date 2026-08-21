@@ -32,6 +32,7 @@ struct RuntimeState {
     controls: Mutex<HashMap<Uuid, Arc<AtomicBool>>>,
     credentials: Arc<Mutex<HashMap<String, RegistryCredentials>>>,
     session_gate: Arc<tokio::sync::Mutex<()>>,
+    device_unlocked: Arc<AtomicBool>,
 }
 
 impl Default for RuntimeState {
@@ -40,6 +41,7 @@ impl Default for RuntimeState {
             controls: Mutex::new(HashMap::new()),
             credentials: Arc::new(Mutex::new(HashMap::new())),
             session_gate: Arc::new(tokio::sync::Mutex::new(())),
+            device_unlocked: Arc::new(AtomicBool::new(!cfg!(target_os = "macos"))),
         }
     }
 }
@@ -106,6 +108,15 @@ struct DownloadResult {
     transport_bytes: u64,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceAccessStatus {
+    has_stored_authorization: bool,
+    biometric_available: bool,
+    biometric_label: &'static str,
+    authentication_required: bool,
+}
+
 #[derive(Deserialize)]
 struct DownloadManifest {
     files: Vec<DownloadManifestFile>,
@@ -144,16 +155,154 @@ fn credential_entry(base_url: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(CREDENTIAL_SERVICE, base_url).map_err(display)
 }
 
-fn save_credentials(base_url: &str, credentials: &RegistryCredentials) -> Result<(), String> {
+#[cfg(target_os = "macos")]
+fn protected_keychain_options(base_url: &str) -> security_framework::passwords::PasswordOptions {
+    let mut options = security_framework::passwords::PasswordOptions::new_generic_password(
+        CREDENTIAL_SERVICE,
+        base_url,
+    );
+    options.use_protected_keychain();
+    options
+}
+
+#[cfg(target_os = "macos")]
+fn local_development_credentials(
+    database: &Path,
+) -> Result<HashMap<String, RegistryCredentials>, String> {
+    let path = database.with_file_name("registry-credentials.development.json");
+    match fs::read(path) {
+        Ok(encoded) => serde_json::from_slice(&encoded).map_err(display),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(error) => Err(display(error)),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn save_local_development_credentials(
+    database: &Path,
+    base_url: &str,
+    credentials: &RegistryCredentials,
+) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let path = database.with_file_name("registry-credentials.development.json");
+    let temporary = database.with_file_name(format!(
+        ".registry-credentials.development.{}.tmp",
+        Uuid::new_v4()
+    ));
+    let mut credentials_by_registry = local_development_credentials(database)?;
+    credentials_by_registry.insert(base_url.to_owned(), credentials.clone());
+    let encoded = serde_json::to_vec(&credentials_by_registry).map_err(display)?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(display)?;
+    let result = (|| -> Result<(), String> {
+        output.write_all(&encoded).map_err(display)?;
+        output.sync_all().map_err(display)?;
+        drop(output);
+        fs::rename(&temporary, &path).map_err(display)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(display)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn save_credentials(
+    base_url: &str,
+    credentials: &RegistryCredentials,
+    database: &Path,
+) -> Result<(), String> {
+    let encoded = serde_json::to_vec(credentials).map_err(display)?;
+    let result = security_framework::passwords::set_generic_password_options(
+        &encoded,
+        protected_keychain_options(base_url),
+    );
+    match result {
+        Ok(()) => Ok(()),
+        Err(_) => save_local_development_credentials(database, base_url, credentials),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn save_credentials(
+    base_url: &str,
+    credentials: &RegistryCredentials,
+    _database: &Path,
+) -> Result<(), String> {
     let encoded = serde_json::to_string(credentials).map_err(display)?;
     credential_entry(base_url)?
         .set_password(&encoded)
         .map_err(display)
 }
 
+#[cfg(target_os = "macos")]
+fn load_persisted_credentials(
+    base_url: &str,
+    database: &Path,
+) -> Result<Option<RegistryCredentials>, String> {
+    use security_framework_sys::base::errSecItemNotFound;
+
+    match security_framework::passwords::generic_password(protected_keychain_options(base_url)) {
+        Ok(encoded) => serde_json::from_slice(&encoded).map(Some).map_err(display),
+        Err(error) if error.code() == errSecItemNotFound || cfg!(debug_assertions) => {
+            if let Some(credentials) = local_development_credentials(database)?.remove(base_url) {
+                return Ok(Some(credentials));
+            }
+            // Courier previously used the legacy file-based macOS keychain. Read it once,
+            // then migrate to the app-scoped data-protection keychain. The old entry is
+            // deliberately left in place so migration cannot destroy the only credential.
+            match credential_entry(base_url)?.get_password() {
+                Ok(encoded) => {
+                    let credentials: RegistryCredentials =
+                        serde_json::from_str(&encoded).map_err(display)?;
+                    save_credentials(base_url, &credentials, database)?;
+                    Ok(Some(credentials))
+                }
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(error) => Err(display(error)),
+            }
+        }
+        Err(_) => {
+            if let Some(credentials) = local_development_credentials(database)?.remove(base_url) {
+                return Ok(Some(credentials));
+            }
+            match credential_entry(base_url)?.get_password() {
+                Ok(encoded) => {
+                    let credentials: RegistryCredentials =
+                        serde_json::from_str(&encoded).map_err(display)?;
+                    save_credentials(base_url, &credentials, database)?;
+                    Ok(Some(credentials))
+                }
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(error) => Err(display(error)),
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn load_persisted_credentials(
+    base_url: &str,
+    _database: &Path,
+) -> Result<Option<RegistryCredentials>, String> {
+    match credential_entry(base_url)?.get_password() {
+        Ok(encoded) => serde_json::from_str(&encoded).map(Some).map_err(display),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(display(error)),
+    }
+}
+
 fn load_credentials(
     base_url: &str,
     cache: &Mutex<HashMap<String, RegistryCredentials>>,
+    database: &Path,
 ) -> Result<Option<RegistryCredentials>, String> {
     if let Some(credentials) = cache
         .lock()
@@ -163,18 +312,15 @@ fn load_credentials(
     {
         return Ok(Some(credentials));
     }
-    match credential_entry(base_url)?.get_password() {
-        Ok(encoded) => {
-            let credentials: RegistryCredentials =
-                serde_json::from_str(&encoded).map_err(display)?;
+    match load_persisted_credentials(base_url, database)? {
+        Some(credentials) => {
             cache
                 .lock()
                 .map_err(|_| "Registry credential cache is unavailable".to_string())?
                 .insert(base_url.to_owned(), credentials.clone());
             Ok(Some(credentials))
         }
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(error) => Err(display(error)),
+        None => Ok(None),
     }
 }
 
@@ -195,12 +341,13 @@ fn persist_registry_session(
     base_url: &str,
     session: &courier_registry::RegistrySession,
     cache: &Mutex<HashMap<String, RegistryCredentials>>,
+    database: &Path,
 ) -> Result<(), String> {
     let credentials = RegistryCredentials {
         access_token: session.access_token.clone(),
         refresh_token: session.refresh_token.clone(),
     };
-    save_credentials(base_url, &credentials)?;
+    save_credentials(base_url, &credentials, database)?;
     cache
         .lock()
         .map_err(|_| "Registry credential cache is unavailable".to_string())?
@@ -216,6 +363,7 @@ async fn active_registry_session(
     database: &std::path::Path,
     credential_cache: &Arc<Mutex<HashMap<String, RegistryCredentials>>>,
     session_gate: &Arc<tokio::sync::Mutex<()>>,
+    device_unlocked: &Arc<AtomicBool>,
 ) -> Result<(RegistryClient, RegistrySessionRecord), String> {
     // Credential refresh tokens rotate. Keep lookup and refresh serialized so concurrent
     // status polls cannot prompt repeatedly or attempt to reuse the same refresh token.
@@ -224,7 +372,10 @@ async fn active_registry_session(
         .registry_session(base_url)
         .map_err(display)?
         .ok_or_else(|| "Enter a Registry invitation to authorize this device".to_string())?;
-    let credentials = load_credentials(base_url, credential_cache)?.ok_or_else(|| {
+    if !device_unlocked.load(Ordering::Acquire) {
+        return Err("Unlock saved Courier project access before continuing".into());
+    }
+    let credentials = load_credentials(base_url, credential_cache, database)?.ok_or_else(|| {
         "Registry credentials are unavailable in the operating system credential vault; enter a new invitation"
             .to_string()
     })?;
@@ -242,7 +393,13 @@ async fn active_registry_session(
                 credentials.refresh_token,
                 Arc::new(move |session| {
                     let store = TransferStore::open(&observer_database).map_err(display)?;
-                    persist_registry_session(&store, &observer_url, session, &observer_cache)
+                    persist_registry_session(
+                        &store,
+                        &observer_url,
+                        session,
+                        &observer_cache,
+                        &observer_database,
+                    )
                 }),
             ),
             metadata,
@@ -252,7 +409,7 @@ async fn active_registry_session(
         .refresh_session(&credentials.refresh_token)
         .await
         .map_err(display)?;
-    persist_registry_session(store, base_url, &refreshed, credential_cache)?;
+    persist_registry_session(store, base_url, &refreshed, credential_cache, database)?;
     let metadata = session_record(base_url.to_owned(), &refreshed)?;
     let observer_database = database.to_path_buf();
     let observer_url = base_url.to_owned();
@@ -264,7 +421,13 @@ async fn active_registry_session(
             refreshed.refresh_token,
             Arc::new(move |session| {
                 let store = TransferStore::open(&observer_database).map_err(display)?;
-                persist_registry_session(&store, &observer_url, session, &observer_cache)
+                persist_registry_session(
+                    &store,
+                    &observer_url,
+                    session,
+                    &observer_cache,
+                    &observer_database,
+                )
             }),
         ),
         metadata,
@@ -309,6 +472,117 @@ fn configured_registry_url(store: &TransferStore) -> Result<String, String> {
         Some(value) => normalize_registry_url(&value),
         None => default_registry_url(),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn biometric_available() -> bool {
+    use objc2_local_authentication::{LAContext, LAPolicy};
+
+    let context = unsafe { LAContext::new() };
+    unsafe {
+        context
+            .canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthenticationWithBiometrics)
+            .is_ok()
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn biometric_available() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn authenticate_device_owner() -> Result<(), String> {
+    use block2::RcBlock;
+    use objc2::runtime::Bool;
+    use objc2_foundation::{NSError, NSString};
+    use objc2_local_authentication::{LAContext, LAPolicy};
+
+    let context = unsafe { LAContext::new() };
+    unsafe {
+        context
+            .canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthentication)
+            .map_err(|_| "Touch ID or device authentication is unavailable".to_string())?;
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let sender = Arc::new(Mutex::new(Some(sender)));
+    let reply_sender = sender.clone();
+    let reply = RcBlock::new(move |success: Bool, _error: *mut NSError| {
+        if let Ok(mut sender) = reply_sender.lock()
+            && let Some(sender) = sender.take()
+        {
+            let _ = sender.send(success.as_bool());
+        }
+    });
+    let reason = NSString::from_str("unlock saved Courier project access");
+    unsafe {
+        context.evaluatePolicy_localizedReason_reply(
+            LAPolicy::DeviceOwnerAuthentication,
+            &reason,
+            &reply,
+        );
+    }
+    match receiver.recv_timeout(Duration::from_secs(120)) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("Device authentication was not completed".into()),
+        Err(_) => Err("Device authentication timed out".into()),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn authenticate_device_owner() -> Result<(), String> {
+    Err("Biometric device authentication is not available on this platform".into())
+}
+
+#[tauri::command]
+async fn device_access_status(app: AppHandle) -> Result<DeviceAccessStatus, String> {
+    let database = database_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = TransferStore::open(database).map_err(display)?;
+        let has_stored_authorization = store
+            .active_registry()
+            .map_err(display)?
+            .and_then(|base_url| store.registry_session(&base_url).ok().flatten())
+            .is_some_and(|session| session.refresh_expires_at > chrono::Utc::now());
+        let biometric_available = biometric_available();
+        Ok(DeviceAccessStatus {
+            has_stored_authorization,
+            biometric_available,
+            biometric_label: if cfg!(target_os = "macos") && biometric_available {
+                "Touch ID"
+            } else if cfg!(target_os = "macos") {
+                "Mac authentication"
+            } else {
+                "Device authentication"
+            },
+            authentication_required: cfg!(target_os = "macos"),
+        })
+    })
+    .await
+    .map_err(|error| format!("Device access check failed: {error}"))?
+}
+
+#[tauri::command]
+async fn authenticate_device(
+    app: AppHandle,
+    runtime: State<'_, RuntimeState>,
+) -> Result<(), String> {
+    let database = database_path(&app)?;
+    let credential_cache = runtime.credentials.clone();
+    let device_unlocked = runtime.device_unlocked.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        authenticate_device_owner()?;
+        let store = TransferStore::open(&database).map_err(display)?;
+        if let Some(base_url) = store.active_registry().map_err(display)? {
+            load_credentials(&base_url, &credential_cache, &database)?.ok_or_else(|| {
+                "Saved Registry credentials are unavailable; enter a new invitation".to_string()
+            })?;
+        }
+        device_unlocked.store(true, Ordering::Release);
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("Device authentication failed: {error}"))?
 }
 
 #[tauri::command]
@@ -356,10 +630,13 @@ async fn exchange_invitation(
     };
     let database = database_path(&app)?;
     let credential_cache = runtime.credentials.clone();
+    let device_unlocked = runtime.device_unlocked.clone();
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         let store = TransferStore::open(&database).map_err(display)?;
-        persist_registry_session(&store, &base_url, &remote, &credential_cache)?;
-        store.set_active_registry(&base_url).map_err(display)
+        persist_registry_session(&store, &base_url, &remote, &credential_cache, &database)?;
+        store.set_active_registry(&base_url).map_err(display)?;
+        device_unlocked.store(true, Ordering::Release);
+        Ok(())
     })
     .await
     .map_err(|error| format!("Session save failed: {error}"))?
@@ -375,6 +652,7 @@ async fn current_authorization(
     let database = database_path(&app)?;
     let credential_cache = runtime.credentials.clone();
     let session_gate = runtime.session_gate.clone();
+    let device_unlocked = runtime.device_unlocked.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let store = TransferStore::open(&database).map_err(display)?;
         let base_url = configured_registry_url(&store)?;
@@ -385,6 +663,7 @@ async fn current_authorization(
                 &database,
                 &credential_cache,
                 &session_gate,
+                &device_unlocked,
             )
             .await
             {
@@ -679,6 +958,7 @@ async fn download_dataset(
     let database = database_path(&app)?;
     let credential_cache = runtime.credentials.clone();
     let session_gate = runtime.session_gate.clone();
+    let device_unlocked = runtime.device_unlocked.clone();
     let (client, _) = tauri::async_runtime::spawn_blocking(move || {
         let store = TransferStore::open(&database).map_err(display)?;
         let base_url = configured_registry_url(&store)?;
@@ -688,6 +968,7 @@ async fn download_dataset(
             &database,
             &credential_cache,
             &session_gate,
+            &device_unlocked,
         ))
     })
     .await
@@ -742,7 +1023,7 @@ struct DesktopObserver {
 
 impl UploadObserver for DesktopObserver {
     fn should_pause(&self) -> bool {
-        self.pause.load(Ordering::Relaxed)
+        self.pause.load(Ordering::Acquire)
     }
 
     fn part_confirmed(&self, event: PartUploadEvent) {
@@ -1132,6 +1413,7 @@ async fn refresh_transfer_status(
     let database = database_path(&app)?;
     let credential_cache = runtime.credentials.clone();
     let session_gate = runtime.session_gate.clone();
+    let device_unlocked = runtime.device_unlocked.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let store = TransferStore::open(&database).map_err(display)?;
         let transfer = store
@@ -1152,6 +1434,7 @@ async fn refresh_transfer_status(
                 &database,
                 &credential_cache,
                 &session_gate,
+                &device_unlocked,
             )
             .await?;
             let remote = client
@@ -1197,6 +1480,7 @@ async fn start_upload(
         .insert(transfer_id, pause.clone());
     let credential_cache = runtime.credentials.clone();
     let session_gate = runtime.session_gate.clone();
+    let device_unlocked = runtime.device_unlocked.clone();
 
     let worker_app = app.clone();
     let worker = tauri::async_runtime::spawn_blocking(move || {
@@ -1207,6 +1491,7 @@ async fn start_upload(
             pause,
             credential_cache,
             session_gate,
+            device_unlocked,
         )
     })
     .await;
@@ -1226,6 +1511,7 @@ fn run_upload(
     pause: Arc<AtomicBool>,
     credential_cache: Arc<Mutex<HashMap<String, RegistryCredentials>>>,
     session_gate: Arc<tokio::sync::Mutex<()>>,
+    device_unlocked: Arc<AtomicBool>,
 ) -> Result<Transfer, String> {
     let store = TransferStore::open(&database).map_err(display)?;
     let transfer = store
@@ -1326,6 +1612,7 @@ fn run_upload(
             &database,
             &credential_cache,
             &session_gate,
+            &device_unlocked,
         )
         .await?;
         emit_upload_activity(
@@ -1403,6 +1690,9 @@ fn run_upload(
             })
             .collect::<Result<Vec<_>, String>>()?;
         let remote = RegistryMultipartStore::new(client.clone(), &server_transfer_id, bindings);
+        remote
+            .set_pause_flag(Some(pause.clone()))
+            .map_err(display)?;
         for object in &transport_objects {
             let object_members = transport_members
                 .iter()
@@ -1572,7 +1862,7 @@ fn pause_upload(runtime: State<'_, RuntimeState>, transfer_id: Uuid) -> Result<(
     let pause = controls
         .get(&transfer_id)
         .ok_or_else(|| "Transfer is not currently uploading".to_string())?;
-    pause.store(true, Ordering::Relaxed);
+    pause.store(true, Ordering::Release);
     Ok(())
 }
 
@@ -1632,6 +1922,8 @@ pub fn run() {
         .manage(RuntimeState::default())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            device_access_status,
+            authenticate_device,
             registry_endpoint,
             exchange_invitation,
             current_authorization,
@@ -1670,6 +1962,40 @@ mod tests {
         assert!(normalize_registry_url("http://100.64.1.2:8010").is_err());
         assert!(normalize_registry_url("https://user@registry.example.test").is_err());
         assert!(normalize_registry_url("https://registry.example.test/prefix").is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn development_credentials_are_private_and_registry_scoped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("courier.db");
+        let first = RegistryCredentials {
+            access_token: "first-access".into(),
+            refresh_token: "first-refresh".into(),
+        };
+        let second = RegistryCredentials {
+            access_token: "second-access".into(),
+            refresh_token: "second-refresh".into(),
+        };
+        save_local_development_credentials(&database, "https://one.example.test", &first).unwrap();
+        save_local_development_credentials(&database, "https://two.example.test", &second).unwrap();
+
+        let saved = local_development_credentials(&database).unwrap();
+        assert_eq!(saved.len(), 2);
+        assert_eq!(
+            saved["https://one.example.test"].refresh_token,
+            "first-refresh"
+        );
+        assert_eq!(
+            fs::metadata(database.with_file_name("registry-credentials.development.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Courier Desktop releases
 
-Courier Desktop release artifacts are built on native GitHub-hosted runners and attached to a draft GitHub Release. The release remains a prerelease until the closed-beta acceptance checks are complete.
+Courier Desktop release artifacts are built on native GitHub-hosted runners when a GitHub Release is published, then attached to that existing release. Mac artifacts are signed and notarized during the build.
 
 The workflow produces:
 
@@ -86,11 +86,11 @@ git tag courier-v0.1.0
 git push origin courier-v0.1.0
 ```
 
-The workflow rejects a tag that does not exactly match `courier-v<application-version>`. On success, inspect the draft release and download every artifact before publishing it.
+The workflow rejects a release tag that does not exactly match `courier-v<application-version>`. Create a GitHub Release for that existing tag and publish it (mark it as a prerelease while the beta is ongoing). Publication starts the workflow; the four artifacts are uploaded to that release after they build, and the macOS artifacts are notarized automatically. If a job fails, use **Re-run failed jobs** from the workflow run after correcting the issue.
 
 ## Release verification
 
-Before publishing a beta release:
+After the publication-triggered workflow completes:
 
 1. Confirm all four workflow jobs succeeded from the tagged commit.
 2. On both Mac architectures, inspect the signature and notarization ticket:

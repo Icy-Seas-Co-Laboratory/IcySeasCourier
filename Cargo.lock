@@ -1287,7 +1287,7 @@ dependencies = [
 
 [[package]]
 name = "courier-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1300,7 +1300,7 @@ dependencies = [
 
 [[package]]
 name = "courier-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "chrono",
@@ -1320,8 +1320,9 @@ dependencies = [
 
 [[package]]
 name = "courier-desktop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
+ "block2",
  "chrono",
  "courier-core",
  "courier-pack",
@@ -1329,6 +1330,11 @@ dependencies = [
  "courier-transfer",
  "filetime",
  "keyring",
+ "objc2",
+ "objc2-foundation",
+ "objc2-local-authentication",
+ "security-framework 3.7.0",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "tauri",
@@ -1342,7 +1348,7 @@ dependencies = [
 
 [[package]]
 name = "courier-pack"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "courier-core",
  "serde",
@@ -1355,7 +1361,7 @@ dependencies = [
 
 [[package]]
 name = "courier-registry"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1375,7 +1381,7 @@ dependencies = [
 
 [[package]]
 name = "courier-transfer"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -3684,6 +3690,17 @@ dependencies = [
  "bitflags 2.13.1",
  "objc2",
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-local-authentication"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e48e0b8b339e0d9d2ed4416b7f93f9d4daadff7d4dd797f89867cde11aeac607"
+dependencies = [
+ "block2",
+ "objc2",
+ "objc2-foundation",
 ]
 
 [[package]]

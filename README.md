@@ -58,7 +58,7 @@ npm run check
 npm run tauri dev
 ```
 
-The desktop exchanges project-scoped Registry invitations. Upload invitations present only authorized projects, group files up to 8 MiB into deterministic 64 MiB target zstd transport packs, register immutable v3 manifests, and upload through short-lived part-specific URLs. Read-only download invitations list the project's completed, verified datasets and restore a selected dataset through short-lived S3 URLs. Courier rejects unsafe paths, reconstructs packs, verifies every logical file against the immutable manifest, and atomically publishes the chosen destination. Credentials remain in the operating-system vault, and Courier never describes an object-store upload or unverified restoration as a verified dataset.
+The desktop exchanges project-scoped Registry invitations. Upload invitations present only authorized projects, group files up to 8 MiB into deterministic 64 MiB target zstd transport packs, register immutable v3 manifests, and upload through short-lived part-specific URLs. Read-only download invitations list the project's completed, verified datasets and restore a selected dataset through short-lived S3 URLs. Courier rejects unsafe paths, reconstructs packs, verifies every logical file against the immutable manifest, and atomically publishes the chosen destination. Credentials remain in OS/app-local protected storage, and Courier never describes an object-store upload or unverified restoration as a verified dataset.
 
 ## Status language
 

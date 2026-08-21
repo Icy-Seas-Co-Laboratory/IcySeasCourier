@@ -6,7 +6,13 @@
   import { formatBytes, formatTimestamp, sourceName, statusLabel } from "./lib/format";
   import type { DownloadDataset, RegistryAuthorization, RegistryProject, Transfer } from "./lib/types";
 
-  type Step = "invite" | "source" | "review" | "progress" | "transfers" | "downloads" | "download-progress" | "download-complete";
+  type Step = "home" | "invite" | "source" | "review" | "progress" | "transfers" | "downloads" | "download-progress" | "download-complete";
+  interface DeviceAccessStatus {
+    hasStoredAuthorization: boolean;
+    biometricAvailable: boolean;
+    biometricLabel: string;
+    authenticationRequired: boolean;
+  }
   interface ProgressEvent {
     transferId: string;
     confirmedBytes: number;
@@ -52,7 +58,7 @@
     outcome: "working" | "success" | "warning";
   }
 
-  let step: Step = "invite";
+  let step: Step = "home";
   let registryUrl = "http://127.0.0.1:8020";
   let invitation = "";
   let projectId = "";
@@ -84,12 +90,16 @@
   let autoStartUpload = false;
   let clock = Date.now();
   let activity: ActivityState | null = null;
+  let deviceAccess: DeviceAccessStatus | null = null;
+  let authorizationLocked = false;
+  let unlocking = false;
+  let pauseRequested = false;
 
   onMount(() => {
     autoStartUpload = window.localStorage.getItem("courier.autoStartUpload") === "true";
     void loadTransfers();
     void loadRegistryEndpoint();
-    void restoreAuthorization();
+    void initializeDeviceAccess();
     let unlistenProgress: UnlistenFn | undefined;
     let unlistenInventory: UnlistenFn | undefined;
     let unlistenDownload: UnlistenFn | undefined;
@@ -200,6 +210,44 @@
     window.localStorage.setItem("courier.autoStartUpload", String(autoStartUpload));
   }
 
+  function goHome() {
+    step = "home";
+    error = "";
+    activity = null;
+  }
+
+  async function initializeDeviceAccess() {
+    try {
+      deviceAccess = await invoke<DeviceAccessStatus>("device_access_status");
+      authorizationLocked = deviceAccess.hasStoredAuthorization && deviceAccess.authenticationRequired;
+      if (deviceAccess.hasStoredAuthorization && !authorizationLocked) await restoreAuthorization();
+    } catch (reason) {
+      error = message(reason);
+    }
+  }
+
+  async function unlockSavedAccess() {
+    if (unlocking) return;
+    unlocking = true;
+    error = "";
+    beginActivity(`Waiting for ${deviceAccess?.biometricLabel ?? "device authentication"}`, "Confirm your identity using the system prompt");
+    try {
+      await invoke("authenticate_device");
+      authorizationLocked = false;
+      await restoreAuthorization();
+      finishActivity("Saved access unlocked", "Courier can resume authorized project work");
+    } catch (reason) {
+      error = message(reason);
+      finishActivity("Saved access remains locked", error, "warning");
+    } finally {
+      unlocking = false;
+    }
+  }
+
+  function continueAuthorizedWork() {
+    step = authorization?.purpose === "download" ? "downloads" : "source";
+  }
+
   async function loadRegistryEndpoint() {
     try {
       registryUrl = await invoke<string>("registry_endpoint");
@@ -235,7 +283,6 @@
       const authorization = await invoke<RegistryAuthorization | null>("current_authorization");
       if (authorization) {
         applyAuthorization(authorization);
-        step = authorization.purpose === "download" ? "downloads" : "source";
       }
     } catch (reason) {
       error = message(reason);
@@ -462,10 +509,16 @@
 
   async function startUpload() {
     if (!current || uploadCommandRunning) return;
+    if (authorizationLocked) {
+      error = `Unlock saved access with ${deviceAccess?.biometricLabel ?? "device authentication"} before resuming this transfer.`;
+      step = "home";
+      return;
+    }
     step = "progress";
     current = { ...current, status: "uploading" };
     error = "";
     uploadCommandRunning = true;
+    pauseRequested = false;
     sentBytes = confirmedBytes;
     uploadRate = 0;
     lastUploadSample = null;
@@ -485,16 +538,24 @@
       await loadTransfers();
     } finally {
       uploadCommandRunning = false;
+      pauseRequested = false;
     }
   }
 
   async function pauseUpload() {
-    if (!current) return;
+    if (!current || pauseRequested) return;
+    const previousStatus = current.status;
     error = "";
+    pauseRequested = true;
+    current = { ...current, status: "paused" };
+    sentBytes = confirmedBytes;
+    finishActivity("Pausing upload", "Stopping the active request; confirmed parts remain resumable", "warning");
     try {
       await invoke("pause_upload", { transferId: current.id });
     } catch (reason) {
       error = message(reason);
+      pauseRequested = false;
+      current = { ...current, status: previousStatus };
     }
   }
 
@@ -518,7 +579,7 @@
 
 <div class="shell">
   <header class="masthead">
-    <button class="brand" aria-label="Courier home" onclick={() => (step = "invite")}>
+    <button class="brand" aria-label="Courier home" onclick={goHome}>
       <span class="mark" aria-hidden="true"><span></span></span>
       <span><strong>Icy Seas</strong><small>Courier</small></span>
     </button>
@@ -528,7 +589,7 @@
   </header>
 
   <main>
-    {#if step !== "transfers" && step !== "invite"}
+    {#if step !== "home" && step !== "transfers" && step !== "invite"}
       <nav class="steps" aria-label="Transfer setup progress">
         <span class="done">1 <em>Invitation</em></span>
         <i></i>
@@ -550,7 +611,66 @@
       </aside>
     {/if}
 
-    {#if step === "invite"}
+    {#if step === "home"}
+      <section class="home">
+        <div class="home-hero">
+          <div>
+            <p class="eyebrow">Secure project delivery</p>
+            <h1>Your Courier workspace</h1>
+            <p class="lede">Send, resume, and retrieve project datasets with visible progress and verified transfer history.</p>
+          </div>
+          {#if authorizationLocked}
+            <div class="access-card locked">
+              <span class="access-icon" aria-hidden="true">◎</span>
+              <div><strong>Saved project access is locked</strong><small>Use {deviceAccess?.biometricLabel ?? "device authentication"} instead of entering your Mac password.</small></div>
+              <button class="primary" disabled={unlocking} onclick={unlockSavedAccess}>{unlocking ? "Waiting…" : `Unlock with ${deviceAccess?.biometricLabel ?? "Touch ID"}`}</button>
+            </div>
+          {:else if authorization}
+            <div class="access-card">
+              <span class="access-dot" aria-hidden="true"></span>
+              <div><strong>{authorization.purpose === "download" ? "Project retrieval ready" : "Project upload ready"}</strong><small>{projects.map((project) => `${project.project_code} · ${project.name}`).join("; ")}</small></div>
+              <button class="primary" onclick={continueAuthorizedWork}>{authorization.purpose === "download" ? "Browse datasets" : "Add dataset"}</button>
+            </div>
+          {:else}
+            <div class="access-card new-user">
+              <span class="access-icon" aria-hidden="true">→</span>
+              <div><strong>Connect this device</strong><small>Use an invitation from Icy Seas to access the correct project and delivery direction.</small></div>
+              <button class="primary" onclick={() => (step = "invite")}>Enter invitation</button>
+            </div>
+          {/if}
+        </div>
+
+        <div class="home-grid">
+          <article class="home-card">
+            <p class="eyebrow">Continue work</p>
+            <div class="card-heading"><h2>Recent transfers</h2><button class="text-button" onclick={() => { step = "transfers"; loadTransfers(); }}>View all <span class="count">{transfers.length}</span></button></div>
+            {#if transfers.length === 0}
+              <div class="home-empty"><strong>No transfer history yet</strong><span>Your analyzed, paused, and completed datasets will appear here.</span></div>
+            {:else}
+              <div class="transfer-list compact-list">
+                {#each transfers.slice(0, 4) as transfer}
+                  <button class="transfer-row" onclick={() => openTransfer(transfer)}>
+                    <div><strong>{sourceName(transfer.source_root)}</strong><small>{transfer.project_id ?? "Project pending"} · {formatBytes(transfer.original_bytes)} · {formatTimestamp(transfer.updated_at)}</small></div>
+                    <span class:verified={transfer.status === "complete"} class="status">{statusLabel(transfer.status)}</span>
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          </article>
+
+          <aside class="home-card quick-start">
+            <p class="eyebrow">How Courier works</p>
+            <h2>Three clear stages</h2>
+            <ol>
+              <li><span>1</span><div><strong>Connect</strong><small>An invitation limits access to the intended project.</small></div></li>
+              <li><span>2</span><div><strong>Choose</strong><small>Add a source dataset or select a verified dataset to retrieve.</small></div></li>
+              <li><span>3</span><div><strong>Transfer</strong><small>Follow live progress; pause and resume without restarting.</small></div></li>
+            </ol>
+            {#if authorization}<button class="secondary" onclick={() => (step = "invite")}>Use another invitation</button>{/if}
+          </aside>
+        </div>
+      </section>
+    {:else if step === "invite"}
       <section class="panel compact">
         <p class="eyebrow">Secure data delivery</p>
         <h1>Transfer data with Icy Seas</h1>
@@ -580,7 +700,7 @@
             {/each}
           </div>
         {/if}
-        <div class="actions"><button class="secondary" onclick={() => (step = "invite")}>Use another invitation</button></div>
+        <div class="actions"><button class="secondary" onclick={goHome}>Back home</button><button class="secondary" onclick={() => (step = "invite")}>Use another invitation</button></div>
       </section>
     {:else if step === "download-progress"}
       <section class="panel">
@@ -643,7 +763,7 @@
           </div>
         {/if}
         <label class="preference-toggle"><input type="checkbox" bind:checked={autoStartUpload} onchange={saveAutoStartPreference} disabled={busy}><span><strong>Start upload automatically after analysis</strong><small>Skip the review pause when inventory, hashing, and packaging finish successfully.</small></span></label>
-        <div class="actions"><button class="secondary" onclick={() => (step = "invite")}>Back</button><button class="primary" disabled={busy} onclick={inventory}>{busy ? (inventoryProgress?.phase === "packaging" ? "Packaging…" : "Analyzing…") : autoStartUpload ? "Analyze and upload" : "Review dataset"}</button></div>
+        <div class="actions"><button class="secondary" onclick={goHome}>Back home</button><button class="primary" disabled={busy} onclick={inventory}>{busy ? (inventoryProgress?.phase === "packaging" ? "Packaging…" : "Analyzing…") : autoStartUpload ? "Analyze and upload" : "Review dataset"}</button></div>
       </section>
     {:else if step === "review" && current}
       <section class="panel">
@@ -685,15 +805,15 @@
           <div class="actions"><button class="primary" onclick={() => { step = "transfers"; loadTransfers(); }}>View transfers</button></div>
         {:else if current.status === "paused" || current.status === "interrupted" || (current.status === "uploading" && !uploadCommandRunning)}
           <div class="notice info">Confirmed parts are safely recorded. Resume will reconcile remote state before sending anything else.</div>
-          <div class="actions"><button class="primary" disabled={uploadCommandRunning} onclick={startUpload}>{uploadCommandRunning ? "Resuming…" : "Resume"}</button></div>
+          <div class="actions"><button class="primary" disabled={uploadCommandRunning} onclick={startUpload}>{pauseRequested ? "Pausing…" : uploadCommandRunning ? "Finishing pause…" : "Resume"}</button></div>
         {:else}
           <div class="connection"><i></i><span>Connection active</span><small>Completed parts are saved continuously</small></div>
-          <div class="actions"><button class="secondary" disabled={!uploadCommandRunning} onclick={pauseUpload}>Pause</button></div>
+          <div class="actions"><button class="secondary" disabled={!uploadCommandRunning || pauseRequested} onclick={pauseUpload}>{pauseRequested ? "Pausing…" : "Pause now"}</button></div>
         {/if}
       </section>
     {:else if step === "transfers"}
       <section class="panel wide">
-        <div class="section-heading"><div><p class="eyebrow">Local state</p><h1>Transfers</h1></div><div class="heading-actions"><button class="secondary small" disabled={refreshingTransfers} onclick={refreshActiveTransfers}>{refreshingTransfers ? "Refreshing…" : "Refresh status"}</button><button class="primary small" onclick={() => (step = authorization ? "source" : "invite")}>New transfer</button></div></div>
+        <div class="section-heading"><div><p class="eyebrow">Local state</p><h1>Transfers</h1></div><div class="heading-actions"><button class="secondary small" onclick={goHome}>Home</button><button class="secondary small" disabled={refreshingTransfers} onclick={refreshActiveTransfers}>{refreshingTransfers ? "Refreshing…" : "Refresh status"}</button><button class="primary small" onclick={() => (step = authorization ? (authorization.purpose === "download" ? "downloads" : "source") : "invite")}>{authorization?.purpose === "download" ? "Browse datasets" : "New transfer"}</button></div></div>
         {#if transferCount("inventorying") > 0 || transferCount("complete") > 0}
           <div class="cleanup-bar">
             <span>Remove local records</span>

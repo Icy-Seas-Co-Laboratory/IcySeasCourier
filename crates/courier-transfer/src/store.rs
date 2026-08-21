@@ -23,6 +23,8 @@ pub enum StoreError {
     UploadNotFound,
     #[error("permanent object-store failure: {0}")]
     Permanent(String),
+    #[error("upload paused")]
+    Paused,
 }
 
 impl StoreError {

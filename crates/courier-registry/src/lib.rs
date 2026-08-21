@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     path::{Component, Path},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -624,10 +627,12 @@ pub struct RegistryMultipartStore {
     server_transfer_id: String,
     files: Arc<HashMap<String, Uuid>>,
     part_progress: SharedPartProgressObserver,
+    pause_flag: SharedPauseFlag,
 }
 
 type PartProgressObserver = Arc<dyn Fn(u64) + Send + Sync>;
 type SharedPartProgressObserver = Arc<Mutex<Option<PartProgressObserver>>>;
+type SharedPauseFlag = Arc<Mutex<Option<Arc<AtomicBool>>>>;
 
 #[derive(Deserialize)]
 struct MultipartResponse {
@@ -684,6 +689,7 @@ impl RegistryMultipartStore {
                     .collect(),
             ),
             part_progress: Arc::new(Mutex::new(None)),
+            pause_flag: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -694,6 +700,15 @@ impl RegistryMultipartStore {
         *self.part_progress.lock().map_err(|_| {
             StoreError::Permanent("upload progress monitor is unavailable".into())
         })? = observer;
+        Ok(())
+    }
+
+    pub fn set_pause_flag(&self, pause: Option<Arc<AtomicBool>>) -> Result<(), StoreError> {
+        *self
+            .pause_flag
+            .lock()
+            .map_err(|_| StoreError::Permanent("upload pause control is unavailable".into()))? =
+            pause;
         Ok(())
     }
 
@@ -783,11 +798,36 @@ impl MultipartStore for RegistryMultipartStore {
             .lock()
             .map_err(|_| StoreError::Permanent("upload progress monitor is unavailable".into()))?
             .clone();
+        let pause = self
+            .pause_flag
+            .lock()
+            .map_err(|_| StoreError::Permanent("upload pause control is unavailable".into()))?
+            .clone();
+        if pause
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return Err(StoreError::Paused);
+        }
+        let stream_pause = pause.clone();
         let stream = futures_util::stream::unfold((content, 0_usize), move |(content, offset)| {
             let progress = progress.clone();
+            let pause = stream_pause.clone();
             async move {
                 if offset >= content.len() {
                     return None;
+                }
+                if pause
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Acquire))
+                {
+                    return Some((
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "upload paused",
+                        )),
+                        (content, offset),
+                    ));
                 }
                 const CHUNK_SIZE: usize = 256 * 1024;
                 let end = offset.saturating_add(CHUNK_SIZE).min(content.len());
@@ -798,15 +838,35 @@ impl MultipartStore for RegistryMultipartStore {
                 Some((Ok::<_, std::io::Error>(chunk), (content, end)))
             }
         });
-        let response = self
+        let request = self
             .client
             .http
             .put(authorization.url)
             .header(reqwest::header::CONTENT_LENGTH, size)
             .body(reqwest::Body::wrap_stream(stream))
-            .send()
-            .await
-            .map_err(map_transport)?;
+            .send();
+        tokio::pin!(request);
+        let response = loop {
+            tokio::select! {
+                result = &mut request => {
+                    if pause
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(Ordering::Acquire))
+                    {
+                        return Err(StoreError::Paused);
+                    }
+                    break result.map_err(map_transport)?;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(25)), if pause.is_some() => {
+                    if pause
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(Ordering::Acquire))
+                    {
+                        return Err(StoreError::Paused);
+                    }
+                }
+            }
+        };
         if !response.status().is_success() {
             return Err(map_status(
                 response.status(),
@@ -916,6 +976,7 @@ mod tests {
         net::TcpListener,
         path::PathBuf,
         sync::atomic::{AtomicBool, AtomicU64, Ordering},
+        time::{Duration, Instant},
     };
 
     use courier_core::FileStatus;
@@ -1094,6 +1155,75 @@ mod tests {
             .unwrap();
         assert_eq!(result.size, expected.len() as u64);
         assert_eq!(observed.load(Ordering::SeqCst), expected.len() as u64);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn registry_upload_pause_cancels_an_in_flight_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut authorization, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let count = authorization.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|value| value == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = format!(r#"{{"url":"http://{address}/object"}}"#);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            authorization.write_all(response.as_bytes()).unwrap();
+
+            let (mut upload, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            loop {
+                let count = upload.read(&mut buffer).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|value| value == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        });
+
+        let object_id = Uuid::new_v4();
+        let store = RegistryMultipartStore::new(
+            RegistryClient::authenticated(format!("http://{address}"), "test-token"),
+            "ISC-TR-PAUSE",
+            [RegistryObjectBinding {
+                server_object_id: object_id,
+                object_key: "opaque/object".into(),
+            }],
+        );
+        let pause = Arc::new(AtomicBool::new(false));
+        store.set_pause_flag(Some(pause.clone())).unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            pause.store(true, Ordering::Release);
+        });
+
+        let started = Instant::now();
+        let result = store
+            .upload_part(
+                &UploadSession {
+                    object_key: "opaque/object".into(),
+                    upload_id: "upload-id".into(),
+                },
+                1,
+                vec![0x5a_u8; 8 * 1024 * 1024],
+            )
+            .await;
+        assert!(matches!(result, Err(StoreError::Paused)));
+        assert!(started.elapsed() < Duration::from_millis(500));
         server.join().unwrap();
     }
 }
