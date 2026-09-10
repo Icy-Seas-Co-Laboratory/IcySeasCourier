@@ -266,7 +266,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $installer = @(Get-ChildItem `
-            -Path "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis" `
+            -Path "$env:GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/release/bundle/nsis" `
             -Filter "*-setup.exe" -File -Recurse)
           if ($installer.Count -ne 1) {
             throw "Expected exactly one NSIS installer; found $($installer.Count)."
@@ -294,7 +294,7 @@ jobs:
         working-directory: apps/courier-desktop
         run: |
           & "$env:GITHUB_WORKSPACE/.github/scripts/test-windows-installer.ps1" `
-            -BundleDirectory "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis" `
+            -BundleDirectory "$env:GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/release/bundle/nsis" `
             -InstallDirectory "$env:RUNNER_TEMP/Courier release installer smoke test" `
             -RequireSignature
 
@@ -304,7 +304,7 @@ jobs:
         working-directory: apps/courier-desktop
         run: |
           & "$env:GITHUB_WORKSPACE/.github/scripts/test-windows-installer.ps1" `
-            -BundleDirectory "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis" `
+            -BundleDirectory "$env:GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/release/bundle/nsis" `
             -InstallDirectory "$env:RUNNER_TEMP/Courier release installer smoke test"
 
       - name: Attach verified Windows release artifact
@@ -315,7 +315,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $installer = @(Get-ChildItem `
-            -Path "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis" `
+            -Path "$env:GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/release/bundle/nsis" `
             -Filter "*-setup.exe" -File -Recurse)
           if ($installer.Count -ne 1) {
             throw "Expected exactly one NSIS installer to attach; found $($installer.Count)."
