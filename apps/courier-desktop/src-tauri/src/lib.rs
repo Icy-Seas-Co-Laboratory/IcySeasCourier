@@ -390,7 +390,7 @@ fn persist_registry_session(
         access_token: session.access_token.clone(),
         refresh_token: session.refresh_token.clone(),
     };
-    save_credentials(&session_id, &credentials, database)?;
+    save_credentials(session_id, &credentials, database)?;
     cache
         .lock()
         .map_err(|_| "Registry credential cache is unavailable".to_string())?
@@ -1579,7 +1579,7 @@ async fn clear_transfer(app: AppHandle, transfer_id: Uuid) -> Result<bool, Strin
         }
         remove_pack_cache(&store, transfer.id);
         remove_transfer_pack_directory(&database, transfer.id)?;
-        Ok(store.delete_transfer(transfer.id).map_err(display)?)
+        store.delete_transfer(transfer.id).map_err(display)
     })
     .await
     .map_err(|error| format!("Transfer cleanup failed: {error}"))?

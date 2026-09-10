@@ -71,9 +71,7 @@ class ObjectStorage:
         return str(result.get("ETag", ""))
 
     def abort_multipart(self, object_key: str, upload_id: str) -> None:
-        self.internal.abort_multipart_upload(
-            Bucket=self.bucket, Key=object_key, UploadId=upload_id
-        )
+        self.internal.abort_multipart_upload(Bucket=self.bucket, Key=object_key, UploadId=upload_id)
 
     def delete_object(self, object_key: str) -> None:
         self.internal.delete_object(Bucket=self.bucket, Key=object_key)
