@@ -61,7 +61,7 @@ jobs:
         run: |
           & "$env:GITHUB_WORKSPACE/.github/scripts/test-windows-installer.ps1" `
             -BundleDirectory "$env:GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/release/bundle/nsis" `
-            -InstallDirectory "$env:RUNNER_TEMP/Courier installer smoke test"
+            -InstallDirectory "$env:RUNNER_TEMP/CourierInstallerSmoke"
 
   registry:
     runs-on: ubuntu-latest

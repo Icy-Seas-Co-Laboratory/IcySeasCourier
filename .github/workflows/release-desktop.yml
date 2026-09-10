@@ -295,7 +295,7 @@ jobs:
         run: |
           & "$env:GITHUB_WORKSPACE/.github/scripts/test-windows-installer.ps1" `
             -BundleDirectory "$env:GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/release/bundle/nsis" `
-            -InstallDirectory "$env:RUNNER_TEMP/Courier release installer smoke test" `
+            -InstallDirectory "$env:RUNNER_TEMP/CourierReleaseInstallerSmoke" `
             -RequireSignature
 
       - name: Install and launch the unsigned Windows NSIS bundle
@@ -305,7 +305,7 @@ jobs:
         run: |
           & "$env:GITHUB_WORKSPACE/.github/scripts/test-windows-installer.ps1" `
             -BundleDirectory "$env:GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/release/bundle/nsis" `
-            -InstallDirectory "$env:RUNNER_TEMP/Courier release installer smoke test"
+            -InstallDirectory "$env:RUNNER_TEMP/CourierReleaseInstallerSmoke"
 
       - name: Attach verified Windows release artifact
         if: runner.os == 'Windows'

@@ -17,9 +17,14 @@ if ($installers.Count -ne 1) {
 }
 
 $installer = $installers[0]
+$InstallDirectory = [System.IO.Path]::GetFullPath($InstallDirectory)
+New-Item -ItemType Directory -Path $InstallDirectory -Force | Out-Null
+
 Write-Host "Installing $($installer.Name) into $InstallDirectory"
+# NSIS requires /D= to be the final command-line argument. Supplying one
+# argument string avoids Start-Process changing that ordering.
 $installerProcess = Start-Process -FilePath $installer.FullName `
-  -ArgumentList @("/S", "/D=$InstallDirectory") `
+  -ArgumentList "/S /D=$InstallDirectory" `
   -Wait -PassThru
 if ($installerProcess.ExitCode -ne 0) {
   throw "The installer exited with code $($installerProcess.ExitCode)."
@@ -41,9 +46,14 @@ if ($RequireSignature) {
 
 Write-Host "Launching $($application.FullName)"
 $applicationProcess = Start-Process -FilePath $application.FullName -PassThru
-Start-Sleep -Seconds 5
-if ($applicationProcess.HasExited) {
-  throw "The installed application exited during its startup smoke test (exit code $($applicationProcess.ExitCode))."
+try {
+  Start-Sleep -Seconds 5
+  if ($applicationProcess.HasExited) {
+    throw "The installed application exited during its startup smoke test (exit code $($applicationProcess.ExitCode))."
+  }
 }
-
-Stop-Process -Id $applicationProcess.Id -Force
+finally {
+  if (-not $applicationProcess.HasExited) {
+    Stop-Process -Id $applicationProcess.Id -Force
+  }
+}
