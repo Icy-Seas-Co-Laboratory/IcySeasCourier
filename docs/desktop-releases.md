@@ -6,10 +6,14 @@ The workflow produces:
 
 - a signed and notarized DMG for Apple Silicon Macs;
 - a signed and notarized DMG for Intel Macs;
-- an unsigned Windows x64 NSIS installer;
+- a Windows x64 NSIS installer, Authenticode-signed when SSL.com eSigner is configured;
 - a Linux x64 AppImage.
 
-Windows signing is intentionally not configured yet. Do not present an unsigned Windows build as production-ready; Windows may display a SmartScreen warning.
+When SSL.com eSigner has an active, enrolled code-signing certificate, Windows
+builds use eSigner CKA to sign the desktop executable and NSIS installer and
+verify the installer signature. Before certificate validation is complete, the
+same workflow publishes an unsigned installer after its install-and-launch smoke
+test so releases remain available.
 
 ## Apple account prerequisites
 
@@ -46,6 +50,30 @@ An `Apple Development` signature is for local testing only. It does not replace
 the `Developer ID Application` identity and App Store Connect API key required by
 the release workflow for external distribution and notarization.
 
+### Local notarized DMG
+
+The dedicated local release command requires a `Developer ID Application`
+identity in the login keychain. It will not fall back to an Apple Development
+identity. Store the App Store Connect `.p8` file as the ignored
+`.signing/apple/AuthKey_<key-id>.p8` and store the issuer ID in the ignored
+`.signing/apple/notarization.env` file. The command derives the key ID from the
+filename when it is the only such key in that directory:
+
+```bash
+cd apps/courier-desktop
+npm run tauri:build:mac-notarized
+```
+
+Set `APPLE_API_ISSUER` in the shell to override the saved value. Set
+`APPLE_API_KEY_PATH` instead when the `.p8` file is stored elsewhere. The key ID
+must also be supplied as `APPLE_API_KEY` when more than one local `.p8` file is
+present.
+
+The command submits the application to Apple through Tauri, waits for the result,
+and then validates the strict signature, Gatekeeper assessment, and stapled
+notarization ticket before succeeding. The DMG is written under
+`apps/courier-desktop/src-tauri/target/release/bundle/dmg/`.
+
 ## Configure GitHub secrets
 
 Create a GitHub Actions environment named `desktop-release`, add a required reviewer, and store these as environment secrets:
@@ -57,6 +85,9 @@ Create a GitHub Actions environment named `desktop-release`, add a required revi
 | `APPLE_API_ISSUER` | App Store Connect API issuer ID |
 | `APPLE_API_KEY` | App Store Connect API key ID |
 | `APPLE_API_PRIVATE_KEY` | Base64-encoded App Store Connect `.p8` private key |
+| `ESIGNER_USERNAME` | SSL.com eSigner account username |
+| `ESIGNER_PASSWORD` | SSL.com eSigner account password |
+| `ESIGNER_TOTP_SECRET` | SSL.com eSigner automation TOTP secret |
 
 Encode the files without line wrapping:
 
@@ -70,6 +101,14 @@ Copy each encoded file's contents into its corresponding GitHub secret. Never co
 Restrict creation of tags matching `courier-v*` with a repository ruleset. The protected `desktop-release` environment ensures a release reviewer must approve the jobs before the signing credentials become available.
 
 The workflow creates a temporary keychain on each macOS runner, imports the Developer ID identity, signs the application, submits it to Apple for notarization, staples the notarization ticket, and deletes the temporary keychain after the build.
+
+For Windows, set the `ESIGNER_MODE` environment variable to `PROD` in the same
+environment after the SSL.com certificate has completed validation and eSigner
+enrollment. Copy the automation TOTP secret displayed with the certificate's
+eSigner QR code into `ESIGNER_TOTP_SECRET`; do not use a one-time code. Until
+that secret is available, the Windows installer remains unsigned. The workflow
+installs eSigner CKA only on the temporary Windows runner and does not retain
+its generated local key material.
 
 ## Create a release
 

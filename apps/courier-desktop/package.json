@@ -1,14 +1,15 @@
 {
   "name": "@icy-seas/courier-desktop",
   "private": true,
-  "version": "0.1.2",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "tauri": "tauri",
-    "tauri:build:mac-local": "../../scripts/build-desktop-macos.sh"
+    "tauri:build:mac-local": "../../scripts/build-desktop-macos.sh",
+    "tauri:build:mac-notarized": "COURIER_NOTARIZE=1 ../../scripts/build-desktop-macos.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",

@@ -150,6 +150,68 @@ jobs:
           echo "APPLE_API_KEY_PATH=$api_key_path" >> "$GITHUB_ENV"
           echo "COURIER_SIGNING_KEYCHAIN=$keychain_path" >> "$GITHUB_ENV"
 
+      - name: Configure SSL.com eSigner certificate
+        if: runner.os == 'Windows'
+        id: esigner
+        shell: pwsh
+        env:
+          ESIGNER_USERNAME: ${{ secrets.ESIGNER_USERNAME }}
+          ESIGNER_PASSWORD: ${{ secrets.ESIGNER_PASSWORD }}
+          ESIGNER_TOTP_SECRET: ${{ secrets.ESIGNER_TOTP_SECRET }}
+          ESIGNER_MODE: ${{ vars.ESIGNER_MODE }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($name in "ESIGNER_USERNAME", "ESIGNER_PASSWORD", "ESIGNER_TOTP_SECRET") {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              Write-Warning "Windows signing is disabled because $name is not configured."
+              "enabled=false" >> $env:GITHUB_OUTPUT
+              exit 0
+            }
+          }
+
+          $mode = switch ($env:ESIGNER_MODE) {
+            "PROD" { "product" }
+            "TEST" { "sandbox" }
+            "product" { "product" }
+            "sandbox" { "sandbox" }
+            default { throw "ESIGNER_MODE must be PROD, TEST, product, or sandbox." }
+          }
+          $workDirectory = Join-Path $env:RUNNER_TEMP "courier-esigner"
+          $installDirectory = Join-Path $workDirectory "cka"
+          $archivePath = Join-Path $workDirectory "eSignerCKA.zip"
+          New-Item -ItemType Directory -Force -Path $workDirectory | Out-Null
+          Invoke-WebRequest `
+            -Uri "https://github.com/SSLcom/eSignerCKA/releases/download/v1.0.6/SSL.COM-eSigner-CKA_1.0.6.zip" `
+            -OutFile $archivePath
+          Expand-Archive -LiteralPath $archivePath -DestinationPath $workDirectory -Force
+          $installer = @(Get-ChildItem -Path $workDirectory -Filter "*.exe" -File -Recurse)
+          if ($installer.Count -ne 1) {
+            throw "Expected exactly one eSigner CKA installer; found $($installer.Count)."
+          }
+          $install = Start-Process -FilePath $installer[0].FullName `
+            -ArgumentList @("/CURRENTUSER", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/DIR=$installDirectory") `
+            -Wait -PassThru
+          if ($install.ExitCode -ne 0) {
+            throw "eSigner CKA installation failed with exit code $($install.ExitCode)."
+          }
+
+          $ckaTool = Join-Path $installDirectory "eSignerCKATool.exe"
+          if (!(Test-Path -LiteralPath $ckaTool)) {
+            throw "eSigner CKA did not install eSignerCKATool.exe."
+          }
+          $masterKey = Join-Path $installDirectory "master.key"
+          & $ckaTool config -mode $mode -user $env:ESIGNER_USERNAME `
+            -pass $env:ESIGNER_PASSWORD -totp $env:ESIGNER_TOTP_SECRET `
+            -key $masterKey -r
+          & $ckaTool unload
+          & $ckaTool load
+          $certificates = @(Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert)
+          if ($certificates.Count -ne 1) {
+            throw "Expected one eSigner code-signing certificate; found $($certificates.Count)."
+          }
+          "COURIER_WINDOWS_CERTIFICATE_THUMBPRINT=$($certificates[0].Thumbprint)" >> $env:GITHUB_ENV
+          "enabled=true" >> $env:GITHUB_OUTPUT
+
       - name: Build, sign, notarize, and attach macOS release artifact
         if: runner.os == 'macOS'
         uses: tauri-apps/tauri-action@v1.0.0
@@ -164,8 +226,8 @@ jobs:
           prerelease: ${{ github.event.release.prerelease }}
           args: ${{ matrix.tauri_args }}
 
-      - name: Build and attach release artifact
-        if: runner.os != 'macOS'
+      - name: Build and attach Linux release artifact
+        if: runner.os == 'Linux'
         uses: tauri-apps/tauri-action@v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -175,6 +237,90 @@ jobs:
           releaseDraft: false
           prerelease: ${{ github.event.release.prerelease }}
           args: ${{ matrix.tauri_args }}
+
+      - name: Configure Tauri Windows signing
+        if: runner.os == 'Windows' && steps.esigner.outputs.enabled == 'true'
+        shell: pwsh
+        working-directory: apps/courier-desktop
+        run: |
+          $ErrorActionPreference = "Stop"
+          $configPath = "src-tauri/tauri.conf.json"
+          $config = Get-Content -Raw $configPath | ConvertFrom-Json -AsHashtable
+          $config.bundle.windows = @{
+            certificateThumbprint = $env:COURIER_WINDOWS_CERTIFICATE_THUMBPRINT
+            digestAlgorithm = "sha256"
+            timestampUrl = "http://ts.ssl.com"
+            tsp = $true
+          }
+          $config | ConvertTo-Json -Depth 100 | Set-Content -NoNewline $configPath
+
+      - name: Build Windows release bundle
+        if: runner.os == 'Windows'
+        working-directory: apps/courier-desktop
+        run: npm run tauri -- build --target x86_64-pc-windows-msvc --bundles nsis
+
+      - name: Sign and verify the Windows NSIS installer
+        if: runner.os == 'Windows' && steps.esigner.outputs.enabled == 'true'
+        shell: pwsh
+        working-directory: apps/courier-desktop
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = @(Get-ChildItem `
+            -Path "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis" `
+            -Filter "*-setup.exe" -File -Recurse)
+          if ($installer.Count -ne 1) {
+            throw "Expected exactly one NSIS installer; found $($installer.Count)."
+          }
+          $signTool = @(Get-ChildItem `
+            -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" `
+            -Filter "signtool.exe" -File -Recurse | Where-Object { $_.Directory.Name -eq "x64" } |
+            Sort-Object FullName -Descending | Select-Object -First 1)
+          if ($signTool.Count -ne 1) {
+            throw "signtool.exe was not found on the Windows runner."
+          }
+          & $signTool[0].FullName sign /fd SHA256 /tr http://ts.ssl.com /td SHA256 `
+            /sha1 $env:COURIER_WINDOWS_CERTIFICATE_THUMBPRINT $installer[0].FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "Signing the NSIS installer failed with exit code $LASTEXITCODE."
+          }
+          & $signTool[0].FullName verify /pa /all $installer[0].FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "Authenticode verification of the NSIS installer failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Install and launch the signed Windows NSIS bundle
+        if: runner.os == 'Windows' && steps.esigner.outputs.enabled == 'true'
+        shell: pwsh
+        working-directory: apps/courier-desktop
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/scripts/test-windows-installer.ps1" `
+            -BundleDirectory "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis" `
+            -InstallDirectory "$env:RUNNER_TEMP/Courier release installer smoke test" `
+            -RequireSignature
+
+      - name: Install and launch the unsigned Windows NSIS bundle
+        if: runner.os == 'Windows' && steps.esigner.outputs.enabled != 'true'
+        shell: pwsh
+        working-directory: apps/courier-desktop
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/scripts/test-windows-installer.ps1" `
+            -BundleDirectory "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis" `
+            -InstallDirectory "$env:RUNNER_TEMP/Courier release installer smoke test"
+
+      - name: Attach verified Windows release artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: apps/courier-desktop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $installer = @(Get-ChildItem `
+            -Path "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis" `
+            -Filter "*-setup.exe" -File -Recurse)
+          if ($installer.Count -ne 1) {
+            throw "Expected exactly one NSIS installer to attach; found $($installer.Count)."
+          }
+          gh release upload "${{ github.event.release.tag_name }}" $installer[0].FullName --clobber
 
       - name: Remove the temporary signing keychain
         if: always() && runner.os == 'macOS'

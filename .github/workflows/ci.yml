@@ -33,6 +33,36 @@ jobs:
       - run: npm run check
       - run: npm run build
 
+  windows-installer:
+    name: Windows installer smoke test
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: apps/courier-desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/courier-desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: windows-installer
+      - run: npm ci
+      - run: npm run check
+      - run: npm run tauri -- build --target x86_64-pc-windows-msvc --bundles nsis
+      - name: Install and launch the NSIS bundle
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/scripts/test-windows-installer.ps1" `
+            -BundleDirectory "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis" `
+            -InstallDirectory "$env:RUNNER_TEMP/Courier installer smoke test"
+
   registry:
     runs-on: ubuntu-latest
     defaults:
