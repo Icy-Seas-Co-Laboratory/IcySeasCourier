@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -14,7 +15,7 @@ use courier_core::{
     Transfer, TransferStatus, TransferStore, TransportMemberRecord, TransportObjectKind,
     TransportObjectRecord, digest_file, inventory_transfer_observed,
 };
-use courier_pack::{PackOptions, decode_pack, encode_pack, plan_packs};
+use courier_pack::{PackError, PackOptions, decode_pack, encode_pack, plan_packs};
 use courier_registry::{
     ManifestTransportPlan, RegistryClient, RegistryDownloadDataset, RegistryDownloadPlan,
     RegistryInvitationPurpose, RegistryMultipartStore, RegistryObjectBinding, RegistryProject,
@@ -150,6 +151,17 @@ struct RegistryCredentials {
 }
 
 const CREDENTIAL_SERVICE: &str = "co.icyseas.courier.registry";
+
+// Packs are reproducible from the immutable inventory, so retaining every pack
+// is unnecessary. Keep at most ten target-sized packs per transfer; an absent
+// cache entry is rebuilt immediately before its upload.
+const PACK_CACHE_PACKS_PER_TRANSFER: u64 = 10;
+
+fn pack_cache_budget(options: PackOptions) -> u64 {
+    options
+        .target_pack_size
+        .saturating_mul(PACK_CACHE_PACKS_PER_TRANSFER)
+}
 
 fn credential_entry(base_url: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(CREDENTIAL_SERVICE, base_url).map_err(display)
@@ -1231,10 +1243,189 @@ fn remove_transfer_pack_directory(database: &Path, transfer_id: Uuid) -> Result<
     }
 }
 
+fn remove_cached_packs_except(objects: &[TransportObjectRecord], keep: Uuid) {
+    for object in objects {
+        if object.id == keep || object.kind != TransportObjectKind::Pack {
+            continue;
+        }
+        if let Some(path) = &object.cache_path
+            && let Err(error) = fs::remove_file(path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!("Could not evict Courier pack {}: {error}", path.display());
+        }
+    }
+}
+
+fn pack_upload_source(
+    object: &TransportObjectRecord,
+    object_members: &[&TransportMemberRecord],
+    files_by_id: &HashMap<Uuid, &FileRecord>,
+    options: PackOptions,
+    cache_budget: u64,
+) -> Result<FileRecord, String> {
+    let path = object
+        .cache_path
+        .as_ref()
+        .ok_or_else(|| format!("Transport pack {} has no local cache path", object.id))?;
+    if !path.exists() {
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("Transport pack {} has no cache directory", object.id))?;
+        fs::create_dir_all(parent).map_err(display)?;
+        let temporary = parent.join(format!("{}.tmp", object.id));
+        let members = object_members
+            .iter()
+            .map(|member| {
+                files_by_id.get(&member.file_id).copied().ok_or_else(|| {
+                    format!("Transport object {} references a missing file", object.id)
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (transport_bytes, cached) =
+            stage_or_measure_pack(&members, &temporary, path, options, cache_budget)?;
+        if !cached || object.transport_bytes != Some(transport_bytes) {
+            let _ = fs::remove_file(path);
+            return Err(format!(
+                "Transport pack {} could not be reproduced; create a new transfer",
+                object.id
+            ));
+        }
+    }
+    let size = path
+        .metadata()
+        .map_err(|error| {
+            format!(
+                "Could not open cached transport pack {}: {error}",
+                path.display()
+            )
+        })?
+        .len();
+    if object.transport_bytes != Some(size) {
+        return Err(format!(
+            "Cached transport pack {} changed; create a new transfer",
+            path.display()
+        ));
+    }
+    Ok(FileRecord {
+        id: object.id,
+        transfer_id: object.transfer_id,
+        relative_path: PathBuf::from(format!("Courier pack {}", object.id)),
+        absolute_path: path.clone(),
+        size,
+        mtime_ns: modified_ns(path)?,
+        hash_algorithm: HashAlgorithm::Sha256,
+        sha256: String::new(),
+        status: FileStatus::Ready,
+        bytes_completed: 0,
+    })
+}
+
 struct PreparedTransportPlan {
     objects: Vec<TransportObjectRecord>,
     members: Vec<TransportMemberRecord>,
     upload_sources: Vec<FileRecord>,
+}
+
+struct CappedWriter<W> {
+    inner: W,
+    written: u64,
+    limit: u64,
+}
+
+impl<W: Write> Write for CappedWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let length = u64::try_from(buffer.len()).unwrap_or(u64::MAX);
+        if self.written.saturating_add(length) > self.limit {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "Courier pack cache budget exceeded",
+            ));
+        }
+        let written = self.inner.write(buffer)?;
+        self.written = self.written.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+struct CountingWriter<W> {
+    inner: W,
+    written: Arc<AtomicU64>,
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        self.written.fetch_add(written as u64, Ordering::Relaxed);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn cache_budget_exceeded(error: &PackError) -> bool {
+    matches!(error, PackError::Io(error) if error.kind() == io::ErrorKind::StorageFull)
+}
+
+fn measure_pack_transport_bytes(
+    members: &[&FileRecord],
+    options: PackOptions,
+) -> Result<u64, String> {
+    let written = Arc::new(AtomicU64::new(0));
+    let output = CountingWriter {
+        inner: io::sink(),
+        written: written.clone(),
+    };
+    encode_pack(members, output, options.zstd_level).map_err(display)?;
+    Ok(written.load(Ordering::Relaxed))
+}
+
+/// Attempts to persist a pack without exceeding `cache_limit`. If there is not
+/// enough budget, calculate its deterministic transport size without staging it.
+fn stage_or_measure_pack(
+    members: &[&FileRecord],
+    temporary: &Path,
+    destination: &Path,
+    options: PackOptions,
+    cache_limit: u64,
+) -> Result<(u64, bool), String> {
+    if cache_limit == 0 {
+        return Ok((measure_pack_transport_bytes(members, options)?, false));
+    }
+    let output = File::create(temporary).map_err(display)?;
+    let result = encode_pack(
+        members,
+        CappedWriter {
+            inner: output,
+            written: 0,
+            limit: cache_limit,
+        },
+        options.zstd_level,
+    );
+    match result {
+        Ok(_) => {
+            File::open(temporary)
+                .and_then(|file| file.sync_all())
+                .map_err(display)?;
+            let transport_bytes = temporary.metadata().map_err(display)?.len();
+            fs::rename(temporary, destination).map_err(display)?;
+            Ok((transport_bytes, true))
+        }
+        Err(error) if cache_budget_exceeded(&error) => {
+            let _ = fs::remove_file(temporary);
+            Ok((measure_pack_transport_bytes(members, options)?, false))
+        }
+        Err(error) => {
+            let _ = fs::remove_file(temporary);
+            Err(display(error))
+        }
+    }
 }
 
 fn prepare_transport_plan(
@@ -1242,7 +1433,22 @@ fn prepare_transport_plan(
     files: &[FileRecord],
     cache_root: &Path,
 ) -> Result<PreparedTransportPlan, String> {
-    let options = PackOptions::default();
+    prepare_transport_plan_with_options(
+        transfer_id,
+        files,
+        cache_root,
+        PackOptions::default(),
+        pack_cache_budget(PackOptions::default()),
+    )
+}
+
+fn prepare_transport_plan_with_options(
+    transfer_id: Uuid,
+    files: &[FileRecord],
+    cache_root: &Path,
+    options: PackOptions,
+    cache_budget: u64,
+) -> Result<PreparedTransportPlan, String> {
     let plan = plan_packs(files, options).map_err(display)?;
     let pack_directory = cache_root.join("packs").join(transfer_id.to_string());
     if !plan.packs.is_empty() || !plan.standalone.is_empty() {
@@ -1251,22 +1457,22 @@ fn prepare_transport_plan(
     let mut objects = Vec::new();
     let mut members = Vec::new();
     let mut upload_sources = Vec::new();
+    let mut cached_bytes = 0_u64;
 
     for pack in plan.packs {
         let object_id = Uuid::new_v4();
         let destination = pack_directory.join(format!("{object_id}.iscpack.zst"));
         let temporary = pack_directory.join(format!("{object_id}.tmp"));
-        let result = (|| -> Result<(), String> {
-            let mut output = File::create(&temporary).map_err(display)?;
-            encode_pack(&pack, &mut output, options.zstd_level).map_err(display)?;
-            output.sync_all().map_err(display)?;
-            fs::rename(&temporary, &destination).map_err(display)
-        })();
-        if let Err(error) = result {
-            let _ = fs::remove_file(&temporary);
-            return Err(error);
+        let (transport_bytes, cached) = stage_or_measure_pack(
+            &pack,
+            &temporary,
+            &destination,
+            options,
+            cache_budget.saturating_sub(cached_bytes),
+        )?;
+        if cached {
+            cached_bytes = cached_bytes.saturating_add(transport_bytes);
         }
-        let transport_bytes = destination.metadata().map_err(display)?.len();
         let original_bytes = pack
             .iter()
             .fold(0_u64, |total, file| total.saturating_add(file.size));
@@ -1293,7 +1499,11 @@ fn prepare_transport_plan(
             relative_path: PathBuf::from(format!("Courier pack {object_id}")),
             absolute_path: destination.clone(),
             size: transport_bytes,
-            mtime_ns: modified_ns(&destination)?,
+            mtime_ns: if cached {
+                modified_ns(&destination)?
+            } else {
+                0
+            },
             hash_algorithm: HashAlgorithm::Sha256,
             sha256: String::new(),
             status: FileStatus::Ready,
@@ -1302,23 +1512,24 @@ fn prepare_transport_plan(
     }
 
     for file in plan.standalone {
-        // Large files are first encoded as a one-member zstd pack. Keep the
-        // compressed representation only when it actually saves bytes; this
-        // avoids paying CPU/storage costs for already-compressed formats while
-        // still making compressible large files cheaper to transfer.
+        // Large files are encoded as one-member packs only when the compressed
+        // object is both smaller and can fit within the bounded cache. Otherwise
+        // they upload directly from their original source.
         let object_id = Uuid::new_v4();
         let destination = pack_directory.join(format!("{object_id}.iscpack.zst"));
         let temporary = pack_directory.join(format!("{object_id}.tmp"));
-        let compressed_size = (|| -> Result<u64, String> {
-            let mut output = File::create(&temporary).map_err(display)?;
-            encode_pack(&[file], &mut output, options.zstd_level).map_err(display)?;
-            output.sync_all().map_err(display)?;
-            Ok(temporary.metadata().map_err(display)?.len())
-        })()?;
-        let use_compressed = compressed_size < file.size;
+        let (compressed_size, cached) = stage_or_measure_pack(
+            &[file],
+            &temporary,
+            &destination,
+            options,
+            cache_budget.saturating_sub(cached_bytes),
+        )?;
+        let use_compressed = compressed_size < file.size && compressed_size <= cache_budget;
         if use_compressed {
-            let transport_bytes = compressed_size;
-            fs::rename(&temporary, &destination).map_err(display)?;
+            if cached {
+                cached_bytes = cached_bytes.saturating_add(compressed_size);
+            }
             objects.push(TransportObjectRecord {
                 id: object_id,
                 transfer_id,
@@ -1326,7 +1537,7 @@ fn prepare_transport_plan(
                 compression: "zstd".into(),
                 encoding_version: 2,
                 original_bytes: file.size,
-                transport_bytes: Some(transport_bytes),
+                transport_bytes: Some(compressed_size),
                 cache_path: Some(destination.clone()),
             });
             members.push(TransportMemberRecord {
@@ -1339,15 +1550,22 @@ fn prepare_transport_plan(
                 transfer_id,
                 relative_path: PathBuf::from(format!("Courier pack {object_id}")),
                 absolute_path: destination.clone(),
-                size: transport_bytes,
-                mtime_ns: modified_ns(&destination)?,
+                size: compressed_size,
+                mtime_ns: if cached {
+                    modified_ns(&destination)?
+                } else {
+                    0
+                },
                 hash_algorithm: HashAlgorithm::Sha256,
                 sha256: String::new(),
                 status: FileStatus::Ready,
                 bytes_completed: 0,
             });
         } else {
-            let _ = fs::remove_file(&temporary);
+            if cached {
+                let _ = fs::remove_file(&destination);
+                cached_bytes = cached_bytes.saturating_sub(compressed_size);
+            }
             objects.push(TransportObjectRecord {
                 id: file.id,
                 transfer_id,
@@ -1735,57 +1953,6 @@ fn run_upload(
         .iter()
         .map(|file| (file.id, file))
         .collect::<HashMap<_, _>>();
-    let mut upload_sources = HashMap::new();
-    for object in &transport_objects {
-        let object_members = transport_members
-            .iter()
-            .filter(|member| member.object_id == object.id)
-            .collect::<Vec<_>>();
-        let source = match object.kind {
-            TransportObjectKind::File => {
-                let member = object_members
-                    .first()
-                    .ok_or_else(|| format!("Transport object {} has no member", object.id))?;
-                (*files_by_id.get(&member.file_id).ok_or_else(|| {
-                    format!("Transport object {} references a missing file", object.id)
-                })?)
-                .clone()
-            }
-            TransportObjectKind::Pack => {
-                let path = object.cache_path.clone().ok_or_else(|| {
-                    format!("Transport pack {} has no local cache path", object.id)
-                })?;
-                let size = path
-                    .metadata()
-                    .map_err(|error| {
-                        format!(
-                            "Could not open cached transport pack {}: {error}",
-                            path.display()
-                        )
-                    })?
-                    .len();
-                if object.transport_bytes != Some(size) {
-                    return Err(format!(
-                        "Cached transport pack {} changed; create a new transfer",
-                        path.display()
-                    ));
-                }
-                FileRecord {
-                    id: object.id,
-                    transfer_id,
-                    relative_path: PathBuf::from(format!("Courier pack {}", object.id)),
-                    absolute_path: path.clone(),
-                    size,
-                    mtime_ns: modified_ns(&path)?,
-                    hash_algorithm: HashAlgorithm::Sha256,
-                    sha256: String::new(),
-                    status: FileStatus::Ready,
-                    bytes_completed: 0,
-                }
-            }
-        };
-        upload_sources.insert(object.id, source);
-    }
     let confirmed = Arc::new(AtomicU64::new(0));
     let result: Result<(), String> = tauri::async_runtime::block_on(async {
         let base_url = match store.transfer_registry(transfer_id).map_err(display)? {
@@ -1897,9 +2064,29 @@ fn run_upload(
                 confirmed.fetch_add(object.original_bytes, Ordering::Relaxed);
                 continue;
             }
-            let source = upload_sources
-                .get(&object.id)
-                .ok_or_else(|| format!("Upload source missing for {}", object.id))?;
+            let source = match object.kind {
+                TransportObjectKind::File => {
+                    let member = object_members
+                        .first()
+                        .ok_or_else(|| format!("Transport object {} has no member", object.id))?;
+                    (*files_by_id.get(&member.file_id).ok_or_else(|| {
+                        format!("Transport object {} references a missing file", object.id)
+                    })?)
+                    .clone()
+                }
+                TransportObjectKind::Pack => {
+                    // Retain only the object being uploaded. This makes room for a
+                    // regenerated cache while preserving at most one bounded pack.
+                    remove_cached_packs_except(&transport_objects, object.id);
+                    pack_upload_source(
+                        object,
+                        &object_members,
+                        &files_by_id,
+                        PackOptions::default(),
+                        pack_cache_budget(PackOptions::default()),
+                    )?
+                }
+            };
             let base_confirmed = confirmed.load(Ordering::Relaxed);
             let object_confirmed_transport_bytes = Arc::new(AtomicU64::new(0));
             let observer = DesktopObserver {
@@ -1967,18 +2154,28 @@ fn run_upload(
                 transfer.original_bytes,
                 &observer.current_file,
             );
-            upload_missing_parts_observed(&store, &remote, source, &retry, &observer)
+            upload_missing_parts_observed(&store, &remote, &source, &retry, &observer)
                 .await
                 .map_err(display)?;
             remote.set_part_progress_observer(None).map_err(display)?;
             if observer.should_pause() {
                 return Err(UploadError::Paused.to_string());
             }
-            complete_uploaded_file(&store, &remote, source, &retry)
+            complete_uploaded_file(&store, &remote, &source, &retry)
                 .await
                 .map_err(display)?;
             for member in object_members {
                 store.mark_file_uploaded(member.file_id).map_err(display)?;
+            }
+            if object.kind == TransportObjectKind::Pack {
+                if let Some(path) = &object.cache_path {
+                    fs::remove_file(path).map_err(|error| {
+                        format!(
+                            "Could not remove uploaded Courier pack {}: {error}",
+                            path.display()
+                        )
+                    })?;
+                }
             }
             confirmed.store(
                 base_confirmed.saturating_add(object.original_bytes),
@@ -2261,6 +2458,70 @@ mod tests {
         )
         .unwrap();
         assert_eq!(paths, ["a.csv", "b.csv"]);
+    }
+
+    #[test]
+    fn transport_cache_is_bounded_and_missing_packs_are_planned_for_regeneration() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::create_dir(&source).unwrap();
+        for name in ["a.bin", "b.bin", "c.bin"] {
+            fs::write(source.join(name), name.as_bytes()).unwrap();
+        }
+        let transfer_id = Uuid::new_v4();
+        let files = inventory_transfer(transfer_id, &source, &InventoryOptions::default()).unwrap();
+        let options = PackOptions {
+            maximum_member_size: 8,
+            target_pack_size: 8,
+            zstd_level: 3,
+        };
+        // One independently encoded pack is larger than this limit, so none can
+        // be retained. Their measured byte lengths still form a valid plan.
+        let plan =
+            prepare_transport_plan_with_options(transfer_id, &files, directory.path(), options, 8)
+                .unwrap();
+
+        assert_eq!(plan.objects.len(), 3);
+        assert!(
+            plan.objects
+                .iter()
+                .all(|object| object.transport_bytes.is_some())
+        );
+        assert!(plan.objects.iter().all(|object| {
+            object
+                .cache_path
+                .as_ref()
+                .is_some_and(|path| !path.exists())
+        }));
+        let cache = directory.path().join("packs").join(transfer_id.to_string());
+        let cached_bytes = fs::read_dir(cache)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.metadata().ok())
+            .map(|metadata| metadata.len())
+            .sum::<u64>();
+        assert!(cached_bytes <= 8);
+
+        let object = &plan.objects[0];
+        let object_members = plan
+            .members
+            .iter()
+            .filter(|member| member.object_id == object.id)
+            .collect::<Vec<_>>();
+        let files_by_id = files
+            .iter()
+            .map(|file| (file.id, file))
+            .collect::<HashMap<_, _>>();
+        let rebuilt = pack_upload_source(
+            object,
+            &object_members,
+            &files_by_id,
+            options,
+            object.transport_bytes.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rebuilt.size, object.transport_bytes.unwrap());
+        assert!(rebuilt.absolute_path.exists());
     }
 
     #[test]
