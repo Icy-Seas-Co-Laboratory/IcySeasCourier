@@ -7,7 +7,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, Instant, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use courier_core::{
@@ -156,6 +156,7 @@ const CREDENTIAL_SERVICE: &str = "co.icyseas.courier.registry";
 // is unnecessary. Keep at most ten target-sized packs per transfer; an absent
 // cache entry is rebuilt immediately before its upload.
 const PACK_CACHE_PACKS_PER_TRANSFER: u64 = 10;
+const STAGED_PACK_STALE_AFTER: Duration = Duration::from_secs(60 * 60);
 
 fn pack_cache_budget(options: PackOptions) -> u64 {
     options
@@ -164,7 +165,8 @@ fn pack_cache_budget(options: PackOptions) -> u64 {
 }
 
 fn credential_entry(base_url: &str) -> Result<keyring::Entry, String> {
-    keyring::Entry::new(CREDENTIAL_SERVICE, base_url).map_err(display)
+    keyring::Entry::new(CREDENTIAL_SERVICE, base_url)
+        .map_err(|error| credential_store_error("prepare", error))
 }
 
 fn invitation_scope(invitation_code: &str) -> String {
@@ -172,6 +174,76 @@ fn invitation_scope(invitation_code: &str) -> String {
         "invite:{}",
         blake3::hash(invitation_code.trim().as_bytes()).to_hex()
     )
+}
+
+#[cfg(target_os = "windows")]
+fn credential_store_error(operation: &str, error: impl std::fmt::Display) -> String {
+    format!(
+        "Windows Credential Manager denied Courier access while trying to {operation} Registry credentials: {error}. This is a local Windows access or policy issue, not a Registry authorization failure. Ensure Credential Manager is available and run Courier as the same Windows user who accepted the invitation."
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+fn credential_store_error(operation: &str, error: impl std::fmt::Display) -> String {
+    format!(
+        "Courier could not {operation} Registry credentials in the operating system secure credential store: {error}"
+    )
+}
+
+fn open_transfer_store(database: &Path) -> Result<TransferStore, String> {
+    TransferStore::open(database).map_err(|error| {
+        format!(
+            "Courier cannot access local transfer state at {}: {error}. Check that the disk has free space and that the current user account can read and write Courier's local-data folder.",
+            database.display()
+        )
+    })
+}
+
+fn cleanup_stale_staged_packs(cache_root: &Path, now: SystemTime) -> Result<u64, String> {
+    let packs = cache_root.join("packs");
+    let transfer_directories = match fs::read_dir(&packs) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect Courier's pack cache {}: {error}",
+                packs.display()
+            ));
+        }
+    };
+    let mut removed = 0;
+    for transfer_directory in transfer_directories {
+        let transfer_directory = transfer_directory.map_err(display)?;
+        if !transfer_directory.file_type().map_err(display)?.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(transfer_directory.path()).map_err(display)? {
+            let entry = entry.map_err(display)?;
+            if !entry.file_type().map_err(display)?.is_file()
+                || entry.path().extension().and_then(|value| value.to_str()) != Some("tmp")
+            {
+                continue;
+            }
+            let modified = entry
+                .metadata()
+                .map_err(display)?
+                .modified()
+                .map_err(display)?;
+            let is_stale = now
+                .duration_since(modified)
+                .is_ok_and(|age| age >= STAGED_PACK_STALE_AFTER);
+            if is_stale {
+                fs::remove_file(entry.path()).map_err(|error| {
+                    format!(
+                        "Could not remove stale staged transport pack {}: {error}",
+                        entry.path().display()
+                    )
+                })?;
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
 }
 
 #[cfg(target_os = "macos")]
@@ -258,7 +330,7 @@ fn save_credentials(
     let encoded = serde_json::to_string(credentials).map_err(display)?;
     credential_entry(session_id)?
         .set_password(&encoded)
-        .map_err(display)
+        .map_err(|error| credential_store_error("save", error))
 }
 
 #[cfg(target_os = "macos")]
@@ -292,11 +364,11 @@ fn load_persisted_credentials(
                     match credential_entry(base_url)?.get_password() {
                         Ok(encoded) => serde_json::from_str(&encoded).map(Some).map_err(display),
                         Err(keyring::Error::NoEntry) => Ok(None),
-                        Err(error) => Err(display(error)),
+                        Err(error) => Err(credential_store_error("read", error)),
                     }
                 }
                 Err(keyring::Error::NoEntry) => Ok(None),
-                Err(error) => Err(display(error)),
+                Err(error) => Err(credential_store_error("read", error)),
             }
         }
         Err(_) => {
@@ -317,11 +389,11 @@ fn load_persisted_credentials(
                     match credential_entry(base_url)?.get_password() {
                         Ok(encoded) => serde_json::from_str(&encoded).map(Some).map_err(display),
                         Err(keyring::Error::NoEntry) => Ok(None),
-                        Err(error) => Err(display(error)),
+                        Err(error) => Err(credential_store_error("read", error)),
                     }
                 }
                 Err(keyring::Error::NoEntry) => Ok(None),
-                Err(error) => Err(display(error)),
+                Err(error) => Err(credential_store_error("read", error)),
             }
         }
     }
@@ -342,11 +414,11 @@ fn load_persisted_credentials(
             match credential_entry(base_url)?.get_password() {
                 Ok(encoded) => serde_json::from_str(&encoded).map(Some).map_err(display),
                 Err(keyring::Error::NoEntry) => Ok(None),
-                Err(error) => Err(display(error)),
+                Err(error) => Err(credential_store_error("read", error)),
             }
         }
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(error) => Err(display(error)),
+        Err(error) => Err(credential_store_error("read", error)),
     }
 }
 
@@ -1388,6 +1460,23 @@ fn measure_pack_transport_bytes(
 
 /// Attempts to persist a pack without exceeding `cache_limit`. If there is not
 /// enough budget, calculate its deterministic transport size without staging it.
+fn sync_staged_pack(path: &Path) -> Result<(), String> {
+    // `sync_all` on a read-only handle returns ERROR_ACCESS_DENIED on Windows.
+    // Open the completed temporary pack with write access before flushing it,
+    // then drop that handle before the atomic rename below.
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| {
+            format!(
+                "Could not finalize staged transport pack {}: {error}",
+                path.display()
+            )
+        })
+}
+
 fn stage_or_measure_pack(
     members: &[&FileRecord],
     temporary: &Path,
@@ -1410,12 +1499,24 @@ fn stage_or_measure_pack(
     );
     match result {
         Ok(_) => {
-            File::open(temporary)
-                .and_then(|file| file.sync_all())
-                .map_err(display)?;
-            let transport_bytes = temporary.metadata().map_err(display)?.len();
-            fs::rename(temporary, destination).map_err(display)?;
-            Ok((transport_bytes, true))
+            let finalized = (|| -> Result<u64, String> {
+                sync_staged_pack(temporary)?;
+                let transport_bytes = temporary.metadata().map_err(display)?.len();
+                fs::rename(temporary, destination).map_err(|error| {
+                    format!(
+                        "Could not publish staged transport pack {}: {error}",
+                        temporary.display()
+                    )
+                })?;
+                Ok(transport_bytes)
+            })();
+            match finalized {
+                Ok(transport_bytes) => Ok((transport_bytes, true)),
+                Err(error) => {
+                    let _ = fs::remove_file(temporary);
+                    Err(error)
+                }
+            }
         }
         Err(error) if cache_budget_exceeded(&error) => {
             let _ = fs::remove_file(temporary);
@@ -1604,7 +1705,7 @@ async fn create_inventory(
         let source = PathBuf::from(&source_path)
             .canonicalize()
             .map_err(|error| format!("Could not open source: {error}"))?;
-        let mut store = TransferStore::open(&database).map_err(display)?;
+        let mut store = open_transfer_store(&database)?;
         let base_url = configured_registry_url(&store)?;
         let session_id = store
             .active_registry_session_id()
@@ -1917,7 +2018,7 @@ fn run_upload(
     session_gate: Arc<tokio::sync::Mutex<()>>,
     device_unlocked: Arc<AtomicBool>,
 ) -> Result<Transfer, String> {
-    let store = TransferStore::open(&database).map_err(display)?;
+    let store = open_transfer_store(&database)?;
     let transfer = store
         .get_transfer(transfer_id)
         .map_err(display)?
@@ -2296,7 +2397,15 @@ fn emit_status(
 
 fn database_path(app: &AppHandle) -> Result<PathBuf, String> {
     let directory = app.path().app_local_data_dir().map_err(display)?;
-    fs::create_dir_all(&directory).map_err(display)?;
+    fs::create_dir_all(&directory).map_err(|error| {
+        format!(
+            "Courier cannot create or access its local-data folder {}: {error}. Check that the disk has free space and that the current user account can write to the folder.",
+            directory.display()
+        )
+    })?;
+    if let Err(error) = cleanup_stale_staged_packs(&directory, SystemTime::now()) {
+        eprintln!("{error}");
+    }
     Ok(directory.join("courier.db"))
 }
 
@@ -2336,8 +2445,56 @@ mod tests {
 
     use courier_core::{InventoryOptions, inventory_transfer};
     use courier_pack::decode_pack;
+    use filetime::{FileTime, set_file_mtime};
 
     use super::*;
+
+    #[test]
+    fn credential_store_errors_explain_the_local_remediation_boundary() {
+        let message = credential_store_error("read", "Access is denied (os error 5)");
+        assert!(message.contains("secure credential"));
+        #[cfg(target_os = "windows")]
+        {
+            assert!(message.contains("Windows Credential Manager"));
+            assert!(message.contains("not a Registry authorization failure"));
+        }
+    }
+
+    #[test]
+    fn staged_pack_sync_uses_a_writable_handle() {
+        let directory = tempfile::tempdir().unwrap();
+        let staged = directory.path().join("transport.tmp");
+        fs::write(&staged, b"pack bytes").unwrap();
+
+        sync_staged_pack(&staged).unwrap();
+    }
+
+    #[test]
+    fn startup_cleanup_removes_only_stale_unpublished_packs() {
+        let directory = tempfile::tempdir().unwrap();
+        let pack_directory = directory.path().join("packs").join("transfer-1");
+        fs::create_dir_all(&pack_directory).unwrap();
+        let stale = pack_directory.join("stale.tmp");
+        let recent = pack_directory.join("recent.tmp");
+        let published = pack_directory.join("published.iscpack.zst");
+        fs::write(&stale, b"stale").unwrap();
+        fs::write(&recent, b"recent").unwrap();
+        fs::write(&published, b"published").unwrap();
+        let now = SystemTime::now();
+        set_file_mtime(
+            &stale,
+            FileTime::from_system_time(now - STAGED_PACK_STALE_AFTER - Duration::from_secs(1)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            cleanup_stale_staged_packs(directory.path(), now).unwrap(),
+            1
+        );
+        assert!(!stale.exists());
+        assert!(recent.exists());
+        assert!(published.exists());
+    }
 
     #[test]
     fn registry_urls_require_https_except_on_loopback() {
