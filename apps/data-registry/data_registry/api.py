@@ -1213,6 +1213,7 @@ def get_transfer_status(
     return TransferStatusResponse(
         transfer_id=transfer.public_id,
         status=transfer.status,
+        courier_version=transfer.courier_version,
         manifest_sha256=transfer.manifest_sha256,
         completed_at=transfer.completed_at,
         verification_started_at=transfer.verification_started_at,

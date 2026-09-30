@@ -6,7 +6,8 @@ use courier_core::{
     TransportObjectKind, TransportObjectRecord, inventory_transfer,
 };
 use courier_registry::{
-    ManifestTransportPlan, RegistryClient, RegistryMultipartStore, RegistryObjectBinding,
+    ManifestSnapshotContext, ManifestTransportPlan, RegistryClient, RegistryMultipartStore,
+    RegistryObjectBinding,
 };
 use courier_transfer::{MultipartLimits, complete_uploaded_file, plan_parts, upload_missing_parts};
 
@@ -84,18 +85,30 @@ async fn rust_client_completes_registry_authorized_upload() {
         .register_transfer(&transfer, project, "rust-e2e", hash_algorithm)
         .await
         .unwrap();
-    let receipt = client
-        .submit_manifest(
+    let courier_version = client
+        .transfer_status(&registered.public_id)
+        .await
+        .unwrap()
+        .courier_version
+        .unwrap();
+    let manifest_snapshot = client
+        .build_manifest_snapshot(
             &transfer,
-            &registered.public_id,
-            project,
-            "rust-e2e",
             &files,
             ManifestTransportPlan {
                 objects: &objects,
                 members: &members,
             },
+            ManifestSnapshotContext {
+                server_transfer_id: &registered.public_id,
+                project_code: project,
+                source_name: "rust-e2e",
+                courier_version: &courier_version,
+            },
         )
+        .unwrap();
+    let receipt = client
+        .submit_manifest(&registered.public_id, &manifest_snapshot)
         .await
         .unwrap();
     let bindings = receipt

@@ -455,6 +455,7 @@ class VerificationFileResponse(ORMModel):
 class TransferStatusResponse(BaseModel):
     transfer_id: str
     status: str
+    courier_version: str
     manifest_sha256: str | None
     completed_at: datetime | None
     verification_started_at: datetime | None

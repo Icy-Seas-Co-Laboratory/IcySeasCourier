@@ -1170,6 +1170,6 @@
     {/if}
   </main>
 
-  <footer><span><i></i> Local state available</span><span>Uploads are verified independently by Icy Seas</span></footer>
+  <footer><span><i></i> Local state available</span><span>Uploads are verified independently by Icy Seas</span><span class="app-version">Courier v{__COURIER_VERSION__}</span></footer>
 </div>
 {/if}

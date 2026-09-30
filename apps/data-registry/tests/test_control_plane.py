@@ -467,6 +467,9 @@ def test_manifest_is_immutable_and_drives_scoped_multipart_lifecycle(
         },
     )
     transfer_id = transfer_response.json()["public_id"]
+    transfer_status = client.get(f"/api/v1/transfers/{transfer_id}", headers=headers)
+    assert transfer_status.status_code == 200
+    assert transfer_status.json()["courier_version"] == "0.1.0"
     object_id = "4d5d7d7f-944f-4eef-a4d8-80d42c608dac"
     manifest = {
         "schema": "icy-seas-transfer-manifest",
@@ -518,6 +521,18 @@ def test_manifest_is_immutable_and_drives_scoped_multipart_lifecycle(
     assert (
         client.put(
             f"/api/v1/transfers/{transfer_id}/manifest", headers=headers, json=changed
+        ).status_code
+        == 409
+    )
+    changed_courier_version = {
+        **manifest,
+        "courier": {**manifest["courier"], "version": "0.3.1"},
+    }
+    assert (
+        client.put(
+            f"/api/v1/transfers/{transfer_id}/manifest",
+            headers=headers,
+            json=changed_courier_version,
         ).status_code
         == 409
     )

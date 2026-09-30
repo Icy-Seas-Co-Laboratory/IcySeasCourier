@@ -87,6 +87,11 @@ impl TransferStore {
                 "../migrations/010_scoped_registry_sessions.sql"
             ))?;
         }
+        if version < 11 {
+            self.conn.execute_batch(include_str!(
+                "../migrations/011_immutable_manifest_snapshot.sql"
+            ))?;
+        }
         Ok(())
     }
 
@@ -180,6 +185,29 @@ impl TransferStore {
 
     pub fn get_transfer(&self, id: Uuid) -> Result<Option<Transfer>> {
         self.conn.query_row("SELECT id,server_transfer_id,project_id,source_root,created_at,updated_at,status,file_count,original_bytes,manifest_version,registry_session_id FROM transfers WHERE id=?1", [id.to_string()], row_to_transfer).optional().map_err(Into::into)
+    }
+
+    pub fn manifest_snapshot(&self, id: Uuid) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT manifest_json FROM transfers WHERE id=?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(Into::into)
+    }
+
+    /// Persists the first manifest generated for this transfer and always
+    /// returns that original snapshot on subsequent attempts.
+    pub fn ensure_manifest_snapshot(&self, id: Uuid, candidate: &str) -> Result<String> {
+        self.conn.execute(
+            "UPDATE transfers SET manifest_json=?1 WHERE id=?2 AND manifest_json IS NULL",
+            params![candidate, id.to_string()],
+        )?;
+        self.manifest_snapshot(id)?
+            .ok_or_else(|| CourierError::TransferNotFound(id.to_string()))
     }
 
     pub fn list_transfers(&self) -> Result<Vec<Transfer>> {
@@ -991,6 +1019,26 @@ mod tests {
         let path = dir.path().join("courier.db");
         drop(TransferStore::open(&path).unwrap());
         drop(TransferStore::open(&path).unwrap());
+    }
+
+    #[test]
+    fn manifest_snapshot_is_written_once_and_reused() {
+        let store = TransferStore::open_in_memory().unwrap();
+        let transfer = Transfer::draft("/source".into(), Some("P12345".into()));
+        store.create_transfer(&transfer).unwrap();
+
+        assert_eq!(
+            store
+                .ensure_manifest_snapshot(transfer.id, r#"{"courier":"0.3.0"}"#)
+                .unwrap(),
+            r#"{"courier":"0.3.0"}"#
+        );
+        assert_eq!(
+            store
+                .ensure_manifest_snapshot(transfer.id, r#"{"courier":"0.3.1"}"#)
+                .unwrap(),
+            r#"{"courier":"0.3.0"}"#
+        );
     }
 
     #[test]

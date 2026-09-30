@@ -29,6 +29,8 @@ pub enum RegistryError {
     Rejected { status: StatusCode, detail: String },
     #[error("Registry response did not match local transfer state: {0}")]
     State(String),
+    #[error("manifest serialization failed: {0}")]
+    Serialization(#[from] serde_json::Error),
     #[error("download paused")]
     Paused,
 }
@@ -132,6 +134,8 @@ pub struct RegistryTransfer {
 pub struct RegistryTransferStatus {
     pub transfer_id: String,
     pub status: String,
+    #[serde(default)]
+    pub courier_version: Option<String>,
     pub manifest_sha256: Option<String>,
     pub verification_attempt_count: u32,
     pub verification_error: Option<String>,
@@ -226,6 +230,14 @@ pub struct ManifestReceipt {
 pub struct ManifestTransportPlan<'a> {
     pub objects: &'a [TransportObjectRecord],
     pub members: &'a [TransportMemberRecord],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ManifestSnapshotContext<'a> {
+    pub server_transfer_id: &'a str,
+    pub project_code: &'a str,
+    pub source_name: &'a str,
+    pub courier_version: &'a str,
 }
 
 #[derive(Clone)]
@@ -548,15 +560,13 @@ impl RegistryClient {
         .await
     }
 
-    pub async fn submit_manifest(
+    pub fn build_manifest_snapshot(
         &self,
         transfer: &Transfer,
-        server_transfer_id: &str,
-        project_code: &str,
-        source_name: &str,
         files: &[FileRecord],
         transport: ManifestTransportPlan<'_>,
-    ) -> Result<ManifestReceipt, RegistryError> {
+        context: ManifestSnapshotContext<'_>,
+    ) -> Result<String, RegistryError> {
         let member_by_file = transport
             .members
             .iter()
@@ -592,15 +602,17 @@ impl RegistryClient {
         let payload = Manifest {
             schema: "icy-seas-transfer-manifest",
             version: 3,
-            transfer_id: server_transfer_id,
-            project: project_code,
+            transfer_id: context.server_transfer_id,
+            project: context.project_code,
             created_at: transfer.created_at,
             courier: ManifestCourier {
-                version: env!("CARGO_PKG_VERSION"),
+                version: context.courier_version,
                 platform: std::env::consts::OS,
                 transport_encoding_version: 2,
             },
-            source: ManifestSource { name: source_name },
+            source: ManifestSource {
+                name: context.source_name,
+            },
             summary: ManifestSummary {
                 file_count: transfer.file_count,
                 original_bytes: transfer.original_bytes,
@@ -618,12 +630,21 @@ impl RegistryClient {
                 .collect(),
             files: manifest_files,
         };
+        Ok(serde_json::to_string(&payload)?)
+    }
+
+    pub async fn submit_manifest(
+        &self,
+        server_transfer_id: &str,
+        manifest_snapshot: &str,
+    ) -> Result<ManifestReceipt, RegistryError> {
         self.send_json(
             self.authorized(self.http.put(format!(
                 "{}/api/v1/transfers/{server_transfer_id}/manifest",
                 self.base_url
             )))?
-            .json(&payload),
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(manifest_snapshot.to_owned()),
         )
         .await
     }
@@ -1046,6 +1067,7 @@ fn map_registry_error(error: RegistryError) -> StoreError {
     match error {
         RegistryError::Transport(error) => map_transport(error),
         RegistryError::Io(error) => StoreError::Permanent(error.to_string()),
+        RegistryError::Serialization(error) => StoreError::Permanent(error.to_string()),
         RegistryError::Rejected { status, detail } => map_status(status, detail),
         RegistryError::State(detail) => StoreError::Permanent(detail),
         RegistryError::Paused => StoreError::Permanent("download paused".into()),
@@ -1222,7 +1244,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use courier_core::FileStatus;
+    use courier_core::{FileStatus, TransportObjectKind};
 
     use super::*;
 
@@ -1241,6 +1263,60 @@ mod tests {
             bytes_completed: 0,
         };
         assert_eq!(portable_relative_path(&file).unwrap(), "casts/cast-001.csv");
+    }
+
+    #[test]
+    fn manifest_snapshot_uses_the_registry_registered_version() {
+        let client = RegistryClient::unauthenticated("https://registry.example.test");
+        let transfer = Transfer::draft(PathBuf::from("/source"), Some("P12345".into()));
+        let file_id = Uuid::new_v4();
+        let object_id = Uuid::new_v4();
+        let file = FileRecord {
+            id: file_id,
+            transfer_id: transfer.id,
+            relative_path: PathBuf::from("cast.csv"),
+            absolute_path: PathBuf::from("/source/cast.csv"),
+            size: 3,
+            mtime_ns: 0,
+            hash_algorithm: HashAlgorithm::Sha256,
+            sha256: "0".repeat(64),
+            status: FileStatus::Ready,
+            bytes_completed: 0,
+        };
+        let object = TransportObjectRecord {
+            id: object_id,
+            transfer_id: transfer.id,
+            kind: TransportObjectKind::File,
+            compression: "none".into(),
+            encoding_version: 2,
+            original_bytes: file.size,
+            transport_bytes: Some(file.size),
+            cache_path: None,
+        };
+        let member = TransportMemberRecord {
+            object_id,
+            file_id,
+            member_index: 0,
+        };
+
+        let snapshot = client
+            .build_manifest_snapshot(
+                &transfer,
+                &[file],
+                ManifestTransportPlan {
+                    objects: &[object],
+                    members: &[member],
+                },
+                ManifestSnapshotContext {
+                    server_transfer_id: "ISC-TR-TEST",
+                    project_code: "P12345",
+                    source_name: "source",
+                    courier_version: "0.3.0",
+                },
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(parsed["courier"]["version"], "0.3.0");
     }
 
     #[test]
@@ -1393,7 +1469,7 @@ mod tests {
                     ),
                     _ => (
                         "200 OK",
-                        r#"{"transfer_id":"ISC-TR-TEST","status":"complete","manifest_sha256":null,"verification_attempt_count":1,"verification_error":null}"#,
+                        r#"{"transfer_id":"ISC-TR-TEST","status":"complete","courier_version":"0.3.0","manifest_sha256":null,"verification_attempt_count":1,"verification_error":null}"#,
                     ),
                 };
                 let response = format!(
@@ -1418,6 +1494,7 @@ mod tests {
 
         let status = client.transfer_status("ISC-TR-TEST").await.unwrap();
         assert_eq!(status.status, "complete");
+        assert_eq!(status.courier_version.as_deref(), Some("0.3.0"));
         assert!(observed.load(Ordering::SeqCst));
         server.join().unwrap();
     }

@@ -17,8 +17,9 @@ use courier_core::{
 };
 use courier_pack::{PackError, PackOptions, decode_pack, encode_pack, plan_packs};
 use courier_registry::{
-    ManifestTransportPlan, RegistryClient, RegistryDownloadDataset, RegistryDownloadPlan,
-    RegistryInvitationPurpose, RegistryMultipartStore, RegistryObjectBinding, RegistryProject,
+    ManifestSnapshotContext, ManifestTransportPlan, RegistryClient, RegistryDownloadDataset,
+    RegistryDownloadPlan, RegistryInvitationPurpose, RegistryMultipartStore, RegistryObjectBinding,
+    RegistryProject,
 };
 use courier_transfer::{
     MultipartLimits, PartUploadEvent, UploadError, UploadObserver, complete_uploaded_file,
@@ -2621,18 +2622,50 @@ fn run_upload(
                 registered.public_id
             }
         };
+        let manifest_snapshot = match store.manifest_snapshot(transfer_id).map_err(display)? {
+            Some(snapshot) => snapshot,
+            None => {
+                // Older local transfers did not persist their manifest. Fetch
+                // the version recorded when the Registry transfer was created
+                // so upgrading Courier does not change its immutable digest.
+                let remote_status = client
+                    .transfer_status(&server_transfer_id)
+                    .await
+                    .map_err(display)?;
+                let registered_version = match remote_status.courier_version {
+                    Some(version) => version,
+                    None if remote_status.manifest_sha256.is_none() => {
+                        env!("CARGO_PKG_VERSION").to_string()
+                    }
+                    None => {
+                        return Err(
+                            "This Registry does not report the transfer's original Courier version. Update the Registry before resuming this older transfer.".into(),
+                        );
+                    }
+                };
+                let candidate = client
+                    .build_manifest_snapshot(
+                        &transfer,
+                        &files,
+                        ManifestTransportPlan {
+                            objects: &transport_objects,
+                            members: &transport_members,
+                        },
+                        ManifestSnapshotContext {
+                            server_transfer_id: &server_transfer_id,
+                            project_code,
+                            source_name,
+                            courier_version: &registered_version,
+                        },
+                    )
+                    .map_err(display)?;
+                store
+                    .ensure_manifest_snapshot(transfer_id, &candidate)
+                    .map_err(display)?
+            }
+        };
         let receipt = client
-            .submit_manifest(
-                &transfer,
-                &server_transfer_id,
-                project_code,
-                source_name,
-                &files,
-                ManifestTransportPlan {
-                    objects: &transport_objects,
-                    members: &transport_members,
-                },
-            )
+            .submit_manifest(&server_transfer_id, &manifest_snapshot)
             .await
             .map_err(display)?;
         for local in &transport_objects {
