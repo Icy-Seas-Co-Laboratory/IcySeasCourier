@@ -1,8 +1,9 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-  import { confirm, open } from "@tauri-apps/plugin-dialog";
-  import { onMount } from "svelte";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { confirm, open, save } from "@tauri-apps/plugin-dialog";
+  import { onMount, tick } from "svelte";
   import { formatBytes, formatTimestamp, sourceName, statusLabel } from "./lib/format";
   import type { DownloadDataset, RegistryAuthorization, RegistryProject, Transfer } from "./lib/types";
 
@@ -28,7 +29,7 @@
     bytesAnalyzed: number;
     totalBytes: number;
     currentPath: string;
-    phase: "analyzing" | "packaging";
+    phase: "discovering" | "analyzing" | "packaging" | "complete" | "failed";
   }
   interface TransferSizes {
     originalBytes: number;
@@ -57,7 +58,13 @@
     active: boolean;
     outcome: "working" | "success" | "warning";
   }
+  interface DiagnosticEvent {
+    timestamp: string;
+    level: "info" | "warning" | "error" | string;
+    message: string;
+  }
 
+  const diagnosticsWindow = getCurrentWindow().label === "diagnostics";
   let step: Step = "home";
   let registryUrl = "https://courier.icyseascolab.io";
   let invitation = "";
@@ -81,22 +88,49 @@
   let clearingIncomplete = false;
   let refreshingCurrent = false;
   let inventoryProgress: InventoryProgressEvent | null = null;
+  let activeInventoryId: string | null = null;
+  let inventoryCommandRunning = false;
   let downloads: DownloadDataset[] = [];
   let selectedDownloadId = "";
   let downloadProgress: DownloadProgressEvent | null = null;
   let downloadResult: DownloadResult | null = null;
+  let downloadDestination = "";
+  let downloadCommandRunning = false;
+  let downloadPauseRequested = false;
+  let downloadPaused = false;
+  let downloadFailed = false;
+  let transferSearch = "";
   let downloadRate = 0;
   let lastDownloadSample: { bytes: number; at: number } | null = null;
   let verificationChecks = 0;
   let autoStartUpload = false;
   let clock = Date.now();
   let activity: ActivityState | null = null;
+  let activityDestination: Step = "home";
   let deviceAccess: DeviceAccessStatus | null = null;
   let authorizationLocked = false;
   let unlocking = false;
   let pauseRequested = false;
+  let diagnostics: DiagnosticEvent[] = [];
+  let diagnosticConsole: HTMLDivElement | undefined;
+  let diagnosticsBusy = false;
+  let diagnosticsFeedback = "";
 
   onMount(() => {
+    if (diagnosticsWindow) {
+      document.body.classList.add("diagnostics-mode");
+      let unlistenDiagnostics: UnlistenFn | undefined;
+      void listen<DiagnosticEvent>("courier://diagnostic", ({ payload }) => {
+        void appendDiagnosticEvent(payload);
+      }).then((dispose) => {
+        unlistenDiagnostics = dispose;
+        void loadDiagnostics();
+      });
+      return () => {
+        document.body.classList.remove("diagnostics-mode");
+        unlistenDiagnostics?.();
+      };
+    }
     autoStartUpload = window.localStorage.getItem("courier.autoStartUpload") === "true";
     void loadTransfers();
     void loadRegistryEndpoint();
@@ -104,6 +138,7 @@
     let unlistenProgress: UnlistenFn | undefined;
     let unlistenInventory: UnlistenFn | undefined;
     let unlistenDownload: UnlistenFn | undefined;
+    let unlistenDiagnostics: UnlistenFn | undefined;
     const heartbeatTimer = window.setInterval(() => (clock = Date.now()), 1000);
     const statusTimer = window.setInterval(() => {
       if (step === "transfers") void refreshActiveTransfers();
@@ -135,13 +170,7 @@
       }
     }).then((dispose) => (unlistenProgress = dispose));
     void listen<InventoryProgressEvent>("courier://inventory-progress", ({ payload }) => {
-      if (busy && step === "source") {
-        inventoryProgress = payload;
-        touchActivity(
-          payload.phase === "packaging" ? "Packaging dataset" : "Analyzing dataset",
-          payload.currentPath || (payload.phase === "packaging" ? "Creating compressed transport packages" : "Discovering files and computing integrity digests"),
-        );
-      }
+      receiveInventoryProgress(payload);
     }).then((dispose) => (unlistenInventory = dispose));
     void listen<DownloadProgressEvent>("courier://download-progress", ({ payload }) => {
       if (payload.transferId === selectedDownloadId) {
@@ -158,21 +187,30 @@
         touchActivity("Retrieving and verifying dataset", payload.currentFile || "Downloading verified transport");
       }
     }).then((dispose) => (unlistenDownload = dispose));
+    void listen<DiagnosticEvent>("courier://diagnostic", ({ payload }) => {
+      void appendDiagnosticEvent(payload);
+    }).then((dispose) => {
+      unlistenDiagnostics = dispose;
+      void loadDiagnostics();
+    });
     return () => {
       window.clearInterval(statusTimer);
       window.clearInterval(heartbeatTimer);
       unlistenProgress?.();
       unlistenInventory?.();
       unlistenDownload?.();
+      unlistenDiagnostics?.();
     };
   });
 
   function beginActivity(title: string, detail: string) {
+    activityDestination = step;
     const timestamp = Date.now();
     activity = { title, detail, startedAt: timestamp, updatedAt: timestamp, active: true, outcome: "working" };
   }
 
   function touchActivity(title: string, detail: string) {
+    if (!activity?.active) activityDestination = step;
     const timestamp = Date.now();
     activity = {
       title,
@@ -214,7 +252,130 @@
   function goHome() {
     step = "home";
     error = "";
-    activity = null;
+    if (!busy) activity = null;
+  }
+
+  async function loadDiagnostics() {
+    try {
+      const snapshot = await invoke<DiagnosticEvent[]>("diagnostic_events");
+      const knownEvents = new Set(snapshot.map((event) => `${event.timestamp}\n${event.level}\n${event.message}`));
+      diagnostics = [
+        ...snapshot,
+        ...diagnostics.filter((event) => !knownEvents.has(`${event.timestamp}\n${event.level}\n${event.message}`)),
+      ].slice(-5000);
+      const recovery = snapshot.find((event) => event.message.startsWith("Local database corruption detected."));
+      if (recovery && !activity) {
+        const recoveredAt = Date.parse(recovery.timestamp) || Date.now();
+        activityDestination = "home";
+        activity = {
+          title: "Local state recovered",
+          detail: "The damaged database was preserved; local history and resumable state were not restored. See Diagnostics for details.",
+          startedAt: recoveredAt,
+          updatedAt: recoveredAt,
+          active: false,
+          outcome: "warning",
+        };
+      }
+    } catch (reason) {
+      diagnosticsFeedback = message(reason);
+    }
+  }
+
+  async function appendDiagnosticEvent(event: DiagnosticEvent) {
+    const followLatest = !diagnosticConsole ||
+      diagnosticConsole.scrollHeight - diagnosticConsole.scrollTop - diagnosticConsole.clientHeight < 48;
+    diagnostics = [...diagnostics.slice(-4999), event];
+    if (followLatest) {
+      await tick();
+      diagnosticConsole?.scrollTo({ top: diagnosticConsole.scrollHeight, behavior: "smooth" });
+    }
+  }
+
+  async function openDiagnostics() {
+    try {
+      await invoke("open_diagnostics_window");
+    } catch (reason) {
+      error = `Could not open diagnostics: ${message(reason)}`;
+    }
+  }
+
+  function openActivity() {
+    step = activityDestination;
+    error = "";
+  }
+
+  function receiveInventoryProgress(progress: InventoryProgressEvent) {
+    const isNewInventory = activeInventoryId !== progress.transferId;
+    activeInventoryId = progress.transferId;
+    inventoryProgress = progress;
+    if (isNewInventory) void loadTransfers();
+
+    if (progress.phase === "complete") {
+      inventoryCommandRunning = false;
+      finishActivity(
+        "Analysis complete",
+        `${progress.totalFiles.toLocaleString()} files indexed · ${formatBytes(progress.totalBytes)} ready for review`,
+      );
+      activityDestination = "review";
+      void loadTransfers();
+      return;
+    }
+    if (progress.phase === "failed") {
+      inventoryCommandRunning = false;
+      finishActivity("Analysis stopped", progress.currentPath || "Courier could not finish preparing this dataset", "warning");
+      activityDestination = "source";
+      void loadTransfers();
+      return;
+    }
+
+    const title = progress.phase === "packaging" ? "Packaging dataset" : "Analyzing dataset";
+    const fileNumber = Math.min(progress.totalFiles, progress.filesAnalyzed + (progress.currentPath ? 1 : 0));
+    const progressDetail = progress.phase === "discovering"
+      ? progress.currentPath || "Finding files in the selected source"
+      : progress.phase === "packaging"
+        ? `Creating resumable packages · ${progress.filesAnalyzed.toLocaleString()} of ${progress.totalFiles.toLocaleString()} files`
+        : `${fileNumber.toLocaleString()} of ${progress.totalFiles.toLocaleString()} files · ${formatBytes(progress.bytesAnalyzed)} of ${formatBytes(progress.totalBytes)}${progress.currentPath ? ` · ${progress.currentPath}` : ""}`;
+    touchActivity(title, progressDetail);
+    inventoryCommandRunning = true;
+  }
+
+  function openInvitationEntry() {
+    error = "";
+    step = "invite";
+  }
+
+  async function copyDiagnostics() {
+    diagnosticsBusy = true;
+    diagnosticsFeedback = "";
+    try {
+      const report = await invoke<string>("diagnostic_report_text");
+      await navigator.clipboard.writeText(report);
+      diagnosticsFeedback = "Copied diagnostic report to the clipboard.";
+    } catch (reason) {
+      diagnosticsFeedback = `Could not copy diagnostics: ${message(reason)}`;
+    } finally {
+      diagnosticsBusy = false;
+    }
+  }
+
+  async function saveDiagnostics() {
+    diagnosticsFeedback = "";
+    diagnosticsBusy = true;
+    try {
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const path = await save({
+        title: "Save Courier diagnostics",
+        defaultPath: `courier-diagnostics-${stamp}.txt`,
+        filters: [{ name: "Text report", extensions: ["txt"] }],
+      });
+      if (!path) return;
+      await invoke("save_diagnostic_report", { path });
+      diagnosticsFeedback = "Saved diagnostic report.";
+    } catch (reason) {
+      diagnosticsFeedback = `Could not save diagnostics: ${message(reason)}`;
+    } finally {
+      diagnosticsBusy = false;
+    }
   }
 
   async function initializeDeviceAccess() {
@@ -318,6 +479,7 @@
       applyAuthorization(authorization);
       invitation = "";
       step = authorization.purpose === "download" ? "downloads" : "source";
+      activityDestination = step;
       finishActivity("Courier authorized", `${projects.length} project ${projects.length === 1 ? "scope" : "scopes"} available`);
     } catch (reason) {
       error = message(reason);
@@ -344,28 +506,68 @@
     const selected = await open({ directory: true, multiple: false, title: "Choose where to save this dataset" });
     if (typeof selected !== "string") return;
     selectedDownloadId = dataset.transfer_id;
+    downloadDestination = selected;
     downloadProgress = null;
     downloadResult = null;
     downloadRate = 0;
     lastDownloadSample = null;
+    downloadPaused = false;
+    downloadFailed = false;
+    await runDownload();
+  }
+
+  async function runDownload() {
+    if (!selectedDownloadId || !downloadDestination || downloadCommandRunning) return;
     error = "";
     busy = true;
+    downloadCommandRunning = true;
+    downloadPauseRequested = false;
+    downloadPaused = false;
+    downloadFailed = false;
     step = "download-progress";
-    beginActivity("Preparing dataset retrieval", "Requesting the verified manifest and destination plan");
+    beginActivity(downloadProgress ? "Resuming dataset retrieval" : "Preparing dataset retrieval", "Requesting the verified manifest and destination plan");
     try {
       downloadResult = await invoke<DownloadResult>("download_dataset", {
-        transferId: dataset.transfer_id,
-        destinationDirectory: selected,
+        transferId: selectedDownloadId,
+        destinationDirectory: downloadDestination,
       });
       step = "download-complete";
+      activityDestination = step;
       finishActivity("Dataset retrieved and verified", `${downloadResult.restoredFiles.toLocaleString()} files restored successfully`);
     } catch (reason) {
-      error = message(reason);
-      step = "downloads";
-      finishActivity("Dataset retrieval stopped", error, "warning");
+      downloadPaused = true;
+      downloadFailed = !downloadPauseRequested;
+      if (!downloadPauseRequested) error = message(reason);
+      finishActivity(downloadPauseRequested ? "Dataset retrieval paused" : "Dataset retrieval stopped", downloadPauseRequested ? "The destination and partial files are retained for resume" : message(reason), "warning");
     } finally {
+      downloadCommandRunning = false;
+      downloadPauseRequested = false;
       busy = false;
     }
+  }
+
+  async function pauseDownload() {
+    if (!downloadCommandRunning || downloadPauseRequested || !selectedDownloadId) return;
+    downloadPauseRequested = true;
+    error = "";
+    touchActivity("Pausing dataset retrieval", "Keeping the selected destination and partial files available for resume");
+    try {
+      await invoke("pause_download", { transferId: selectedDownloadId });
+    } catch (reason) {
+      error = message(reason);
+      downloadPauseRequested = false;
+    }
+  }
+
+  function filteredTransfers(): Transfer[] {
+    const query = transferSearch.trim().toLocaleLowerCase();
+    if (!query) return transfers;
+    return transfers.filter((transfer) => [
+      sourceName(transfer.source_root),
+      transfer.project_id ?? "",
+      transfer.status,
+      transfer.server_transfer_id ?? "",
+    ].some((value) => value.toLocaleLowerCase().includes(query)));
   }
 
   async function refreshDownloads() {
@@ -470,6 +672,10 @@
     try {
       await invoke<boolean>("clear_transfer", { transferId: transfer.id });
       current = null;
+      activeInventoryId = null;
+      inventoryProgress = null;
+      inventoryCommandRunning = false;
+      activity = null;
       sourcePath = transfer.source_root;
       projectId = transfer.project_id ?? projectId;
       step = authorization?.purpose === "upload" ? "source" : "invite";
@@ -507,6 +713,7 @@
       return;
     }
     busy = true;
+    inventoryCommandRunning = true;
     error = "";
     inventoryProgress = null;
     beginActivity("Analyzing dataset", "Discovering files and computing integrity digests");
@@ -523,13 +730,15 @@
         await startUpload();
       } else {
         finishActivity("Analysis complete", `${current.file_count.toLocaleString()} files are ready for review`);
-        step = "review";
+        activityDestination = "review";
+        if (step === "source") step = "review";
       }
     } catch (reason) {
       error = message(reason);
       finishActivity("Analysis stopped", error, "warning");
     } finally {
       busy = false;
+      inventoryCommandRunning = false;
     }
   }
 
@@ -552,7 +761,16 @@
     currentFile = "";
     packagedBytes = null;
     error = "";
-    step = transfer.status === "ready" ? "review" : "progress";
+    if (transfer.status === "inventorying") {
+      sourcePath = transfer.source_root;
+      step = "source";
+      if (activeInventoryId !== transfer.id || !inventoryCommandRunning) {
+        finishActivity("Inventory is not active", "This saved record has no live analysis worker. Restart analysis to try again.", "warning");
+        activityDestination = "source";
+      }
+    } else {
+      step = transfer.status === "ready" ? "review" : "progress";
+    }
     void loadTransferSizes(transfer.id);
   }
 
@@ -638,17 +856,44 @@
   }
 </script>
 
-<svelte:head><title>Icy Seas Courier</title></svelte:head>
+<svelte:head><title>{diagnosticsWindow ? "Courier Diagnostics" : "Icy Seas Courier"}</title></svelte:head>
 
+{#if diagnosticsWindow}
+  <main class="diagnostics-window">
+    <header class="diagnostics-window-header">
+      <div><p class="eyebrow">Live support feed</p><h1>Courier diagnostics</h1></div>
+      <div class="diagnostics-window-actions">
+        <span class="live-pill"><i></i>Live</span>
+        <button class="secondary small" onclick={loadDiagnostics}>Refresh</button>
+        <button class="secondary small" disabled={diagnosticsBusy} onclick={copyDiagnostics}>Copy report</button>
+        <button class="primary small" disabled={diagnosticsBusy} onclick={saveDiagnostics}>Save report</button>
+      </div>
+    </header>
+    <p class="diagnostics-window-note">Streaming this session; entries may include local file paths or recovery locations. Reports omit invitation codes, tokens, and signed URL query strings.</p>
+    {#if diagnosticsFeedback}<div class="diagnostics-feedback" role="status">{diagnosticsFeedback}</div>{/if}
+    <div class="diagnostic-console" bind:this={diagnosticConsole} aria-live="polite" aria-label="Live Courier diagnostic events">
+      {#if diagnostics.length === 0}
+        <div class="diagnostic-empty">Waiting for diagnostic events…</div>
+      {:else}
+        {#each diagnostics as event}
+          <div class:diagnostic-error={event.level === "error"} class:diagnostic-warning={event.level === "warning"} class="diagnostic-line"><time>{formatTimestamp(event.timestamp)}</time><strong>{event.level.toUpperCase()}</strong><code>{event.message}</code></div>
+        {/each}
+      {/if}
+    </div>
+  </main>
+{:else}
 <div class="shell">
   <header class="masthead">
     <button class="brand" aria-label="Courier home" onclick={goHome}>
       <span class="mark" aria-hidden="true"><span></span></span>
       <span><strong>Icy Seas</strong><small>Courier</small></span>
     </button>
-    {#if authorization?.purpose !== "download"}<button class="text-button" onclick={() => { step = "transfers"; loadTransfers(); }}>
-      Transfers <span class="count">{transfers.length}</span>
-    </button>{/if}
+    <div class="masthead-actions">
+      <button class="text-button" onclick={openDiagnostics}>Diagnostics</button>
+      {#if authorization?.purpose !== "download"}<button class="text-button" onclick={() => { step = "transfers"; loadTransfers(); }}>
+        Transfers <span class="count">{transfers.length}</span>
+      </button>{/if}
+    </div>
   </header>
 
   <main>
@@ -665,13 +910,14 @@
     {#if error}<div class="notice error dismissible" role="alert"><span>{error}</span><button aria-label="Dismiss error" onclick={() => (error = "")}>×</button></div>{/if}
 
     {#if activity}
-      <aside class:working={activity.active} class:success={activity.outcome === "success"} class:warning={activity.outcome === "warning"} class="activity-monitor" aria-live="polite">
+      <button type="button" class:working={activity.active} class:success={activity.outcome === "success"} class:warning={activity.outcome === "warning"} class="activity-monitor" aria-live="polite" aria-label={`Open ${activity.title}`} title="Open the related activity" onclick={openActivity}>
         <span class="activity-indicator" aria-hidden="true">{activity.active ? "" : activity.outcome === "success" ? "✓" : "!"}</span>
         <div class="activity-copy"><strong>{activity.title}</strong><span>{activity.detail}</span></div>
         <div class="activity-time">
           {#if activity.active}<strong>{activityAge() === "0s" ? "Working now" : `Still working · update ${activityAge()} ago`}</strong><span>Active for {activityElapsed()}</span>{:else}<strong>{activity.outcome === "success" ? "Complete" : "Attention needed"}</strong><span>{formatTimestamp(new Date(activity.updatedAt).toISOString())}</span>{/if}
         </div>
-      </aside>
+        <span class="activity-open" aria-hidden="true">Open ›</span>
+      </button>
     {/if}
 
     {#if step === "home"}
@@ -693,12 +939,13 @@
               <span class="access-dot" aria-hidden="true"></span>
               <div><strong>{authorization.purpose === "download" ? "Project retrieval ready" : "Project upload ready"}</strong><small>{projects.map((project) => `${project.project_code} · ${project.name}`).join("; ")}</small></div>
               <button class="primary" onclick={continueAuthorizedWork}>{authorization.purpose === "download" ? "Browse datasets" : "Add dataset"}</button>
+              <button class="secondary" onclick={openInvitationEntry}>Enter another invitation</button>
             </div>
           {:else}
             <div class="access-card new-user">
               <span class="access-icon" aria-hidden="true">→</span>
               <div><strong>Connect this device</strong><small>Use an invitation from Icy Seas to access the correct project and delivery direction.</small></div>
-              <button class="primary" onclick={() => (step = "invite")}>Enter invitation</button>
+              <button class="primary" onclick={openInvitationEntry}>Enter invitation code</button>
             </div>
           {/if}
         </div>
@@ -729,15 +976,15 @@
               <li><span>2</span><div><strong>Choose</strong><small>Add a source dataset or select a verified dataset to retrieve.</small></div></li>
               <li><span>3</span><div><strong>Transfer</strong><small>Follow live progress; pause and resume without restarting.</small></div></li>
             </ol>
-            {#if authorization}<button class="secondary" onclick={() => (step = "invite")}>Use another invitation</button>{/if}
+            {#if authorization}<button class="secondary" onclick={openInvitationEntry}>Use another invitation</button>{/if}
           </aside>
         </div>
       </section>
     {:else if step === "invite"}
       <section class="panel compact">
         <p class="eyebrow">Secure data delivery</p>
-        <h1>Transfer data with Icy Seas</h1>
-        <p class="lede">An invitation can authorize a secure project upload or retrieval of verified project datasets.</p>
+        <h1>{authorization ? "Enter a new invitation code" : "Connect with an invitation"}</h1>
+        <p class="lede">{authorization ? "Use a different invitation to switch the project or change between upload and retrieval access." : "Your invitation determines the project and whether this device may upload or retrieve datasets."}</p>
         <label for="registry-url">Registry address</label>
         <input id="registry-url" type="url" bind:value={registryUrl} placeholder="https://courier.example.org" autocomplete="url" autocapitalize="none" spellcheck="false" />
         <p class="hint">Use the HTTPS address supplied with your beta invitation. Local development may use localhost.</p>
@@ -758,7 +1005,11 @@
               <article class="download-card">
                 <div><span class="eyebrow">{dataset.project_code}</span><h2>{dataset.source_name}</h2><p>{dataset.file_count.toLocaleString()} files · verified {formatTimestamp(dataset.verified_at)} · {dataset.hash_algorithm.toUpperCase()}</p></div>
                 <div class="download-size"><strong>{formatBytes(dataset.original_bytes)}</strong><small>{dataset.transport_bytes === null ? "Packaged size unavailable" : `${formatBytes(dataset.transport_bytes)} to transfer`}</small></div>
-                <button class="primary" disabled={busy} onclick={() => startDownload(dataset)}>Choose destination</button>
+                {#if dataset.transfer_id === selectedDownloadId && downloadDestination && downloadPaused}
+                  <button class="primary" disabled={busy} onclick={() => { step = "download-progress"; void runDownload(); }}>{downloadFailed ? "Retry download" : "Resume download"}</button>
+                {:else}
+                  <button class="primary" disabled={busy} onclick={() => startDownload(dataset)}>Choose destination</button>
+                {/if}
               </article>
             {/each}
           </div>
@@ -767,13 +1018,19 @@
       </section>
     {:else if step === "download-progress"}
       <section class="panel">
-        <p class="eyebrow centered">Secure project retrieval</p>
+        <p class="eyebrow centered">{downloadPaused ? (downloadFailed ? "Retrieval interrupted" : "Retrieval paused") : "Secure project retrieval"}</p>
         <h1 class="centered">{downloads.find((item) => item.transfer_id === selectedDownloadId)?.source_name ?? selectedDownloadId}</h1>
         <div class="progress-number">{downloadPercent().toFixed(0)}%</div>
         <div class="progress-track" role="progressbar" aria-label="Download progress" aria-valuenow={downloadPercent()} aria-valuemin="0" aria-valuemax="100"><span style={`width: ${downloadPercent()}%`}></span></div>
         <div class="progress-details"><strong>{downloadProgress ? `${formatBytes(downloadProgress.receivedBytes)}${downloadProgress.totalBytes ? ` / ${formatBytes(downloadProgress.totalBytes)}` : ""}` : "Preparing secure download…"}</strong><span>{downloadRate > 0 ? `${formatBytes(downloadRate)}/s · ` : ""}{downloadProgress ? `${downloadProgress.restoredFiles.toLocaleString()} / ${downloadProgress.totalFiles.toLocaleString()} files restored` : "Requesting short-lived access"}</span></div>
         {#if downloadProgress?.currentFile}<div class="current-file"><span>Current activity</span><code>{downloadProgress.currentFile}</code></div>{/if}
+        {#if downloadDestination}<div class="provenance download-destination"><span>Destination retained for resume</span><code>{downloadDestination}</code></div>{/if}
         <div class="notice info">Courier downloads the verified transport, safely reconstructs the original paths, and checks every file against the immutable manifest before making the destination visible.</div>
+        {#if downloadPaused}
+          <div class="actions split"><button class="secondary" disabled={downloadCommandRunning} onclick={() => (step = "downloads")}>Back to datasets</button><button class="primary" disabled={downloadCommandRunning} onclick={runDownload}>{downloadFailed ? "Retry download" : "Resume download"}</button></div>
+        {:else}
+          <div class="actions split"><button class="secondary" disabled={downloadCommandRunning} onclick={() => (step = "downloads")}>Back to datasets</button><button class="secondary danger" disabled={!downloadCommandRunning || downloadPauseRequested} onclick={pauseDownload}>{downloadPauseRequested ? "Pausing…" : "Pause download"}</button></div>
+        {/if}
       </section>
     {:else if step === "download-complete" && downloadResult}
       <section class="panel">
@@ -815,6 +1072,12 @@
             </div>
           </div>
         </div>
+        {#if current?.status === "inventorying" && !inventoryCommandRunning}
+          <div class="notice info stale-inventory-notice">
+            <span>This record says “Inventorying,” but Courier has no live analysis worker for it. Analysis cannot resume mid-scan.</span>
+            <button class="secondary small" disabled={busy} onclick={() => restartTransfer(current!)}>Restart analysis</button>
+          </div>
+        {/if}
         {#if busy}
           <div class="analysis-progress" role="status" aria-live="polite">
             <div class="analysis-heading">
@@ -868,7 +1131,7 @@
           <div class="actions"><button class="primary" onclick={() => { step = "transfers"; loadTransfers(); }}>View transfers</button></div>
         {:else if current.status === "paused" || current.status === "interrupted" || (current.status === "uploading" && !uploadCommandRunning)}
           <div class="notice info">Confirmed parts are safely recorded. Resume will reconcile remote state before sending anything else.</div>
-          <div class="actions"><button class="primary" disabled={uploadCommandRunning} onclick={startUpload}>{pauseRequested ? "Pausing…" : uploadCommandRunning ? "Finishing pause…" : "Resume"}</button></div>
+          <div class="actions"><button class="primary" disabled={uploadCommandRunning} onclick={startUpload}>{pauseRequested ? "Pausing…" : uploadCommandRunning ? "Finishing pause…" : current.status === "interrupted" ? "Retry upload" : "Resume upload"}</button></div>
         {:else}
           <div class="connection"><i></i><span>Connection active</span><small>Completed parts are saved continuously</small></div>
           <div class="actions"><button class="secondary" disabled={!uploadCommandRunning || pauseRequested} onclick={pauseUpload}>{pauseRequested ? "Pausing…" : "Pause now"}</button></div>
@@ -876,7 +1139,7 @@
       </section>
     {:else if step === "transfers"}
       <section class="panel wide">
-        <div class="section-heading"><div><p class="eyebrow">Local state</p><h1>Transfers</h1></div><div class="heading-actions"><button class="secondary small" onclick={goHome}>Home</button><button class="secondary small" disabled={refreshingTransfers} onclick={refreshActiveTransfers}>{refreshingTransfers ? "Refreshing…" : "Refresh status"}</button><button class="primary small" onclick={() => (step = authorization ? (authorization.purpose === "download" ? "downloads" : "source") : "invite")}>{authorization?.purpose === "download" ? "Browse datasets" : "New transfer"}</button></div></div>
+        <div class="section-heading"><div><p class="eyebrow">Local state</p><h1>Transfers</h1></div><div class="heading-actions"><button class="secondary small" onclick={goHome}>Home</button>{#if authorization}<button class="secondary small" onclick={openInvitationEntry}>Enter a new invitation code</button>{/if}<button class="secondary small" disabled={refreshingTransfers} onclick={refreshActiveTransfers}>{refreshingTransfers ? "Refreshing…" : "Refresh status"}</button><button class="primary small" onclick={() => (step = authorization ? (authorization.purpose === "download" ? "downloads" : "source") : "invite")}>{authorization?.purpose === "download" ? "Browse datasets" : authorization ? "Add dataset" : "Enter invitation code"}</button></div></div>
         {#if incompleteTransferCount() > 0 || transferCount("inventorying") > 0 || transferCount("complete") > 0}
           <div class="cleanup-bar">
             <span>Manage local records</span>
@@ -888,8 +1151,10 @@
           </div>
         {/if}
         {#if transfers.length === 0}<div class="empty"><div class="state-icon">↑</div><h2>No transfers yet</h2><p>Start with an invitation and choose a dataset file or folder.</p></div>{:else}
+          <label class="transfer-search" for="transfer-search"><span>Find a transfer</span><input id="transfer-search" type="search" bind:value={transferSearch} placeholder="Search dataset, project, status, or Registry ID" /></label>
+          {#if filteredTransfers().length === 0}<div class="empty filtered-empty">No transfers match “{transferSearch}”.</div>{:else}
           <div class="transfer-list">
-            {#each transfers as transfer}
+            {#each filteredTransfers() as transfer}
               <div class="transfer-entry">
                 <button class="transfer-row" onclick={() => openTransfer(transfer)}>
                   <div><strong>{sourceName(transfer.source_root)}</strong><small>{transfer.project_id ?? "Project pending"} · {transfer.file_count.toLocaleString()} files · {formatBytes(transfer.original_bytes)}</small><small>Updated {formatTimestamp(transfer.updated_at)}{transfer.server_transfer_id ? ` · ${transfer.server_transfer_id}` : ""}</small></div>
@@ -899,6 +1164,7 @@
               </div>
             {/each}
           </div>
+          {/if}
         {/if}
       </section>
     {/if}
@@ -906,3 +1172,4 @@
 
   <footer><span><i></i> Local state available</span><span>Uploads are verified independently by Icy Seas</span></footer>
 </div>
+{/if}

@@ -2,6 +2,6 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default Courier desktop capability",
-  "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open", "dialog:allow-message"]
+  "windows": ["main", "diagnostics"],
+  "permissions": ["core:default", "dialog:allow-open", "dialog:allow-message", "dialog:allow-save"]
 }

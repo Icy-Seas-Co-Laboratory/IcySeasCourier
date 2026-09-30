@@ -14,6 +14,15 @@ pub struct TransferStore {
 }
 
 impl TransferStore {
+    /// Runs SQLite's full structural check without applying schema migrations.
+    pub fn integrity_check(path: impl AsRef<Path>) -> Result<Vec<String>> {
+        let conn = Connection::open(path)?;
+        let mut statement = conn.prepare("PRAGMA integrity_check")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<std::result::Result<Vec<String>, _>>()
+            .map_err(Into::into)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;

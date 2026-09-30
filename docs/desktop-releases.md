@@ -7,13 +7,33 @@ The workflow produces:
 - a signed and notarized DMG for Apple Silicon Macs;
 - a signed and notarized DMG for Intel Macs;
 - a Windows x64 NSIS installer, Authenticode-signed when SSL.com eSigner is configured;
+- a Windows x64 portable ZIP containing the standalone executable and a short README, with the executable Authenticode-signed when SSL.com eSigner is configured;
 - a Linux x64 AppImage.
 
 When SSL.com eSigner has an active, enrolled code-signing certificate, Windows
 builds use eSigner CKA to sign the desktop executable and NSIS installer and
-verify the installer signature. Before certificate validation is complete, the
-same workflow publishes an unsigned installer after its install-and-launch smoke
-test so releases remain available.
+verify both signatures. Before certificate validation is complete, the same
+workflow publishes unsigned Windows artifacts after their launch smoke tests
+so releases remain available.
+
+### Portable Windows ZIP
+
+Extract `Icy-Seas-Courier_<version>_windows-x64-portable.zip` and run
+`courier-desktop.exe`. It does not install the app or the Microsoft Edge
+WebView2 Runtime. WebView2 must already be installed on the Windows x64
+computer; if it is missing, install Microsoft's
+[Evergreen WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/).
+The NSIS installer checks for WebView2 and downloads its bootstrapper when
+needed. The ZIP is useful where installation is restricted or an unpacked
+copy is preferred. If Windows reports a missing `VCRUNTIME` or `MSVCP` DLL,
+install the current [Microsoft Visual C++ x64 Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist).
+
+Portable refers to the application files, not its data. Courier keeps its
+SQLite transfer state in the current Windows user's local app-data directory
+and Registry credentials in that user's Windows Credential Manager. The ZIP
+and NSIS installer share those per-user records. Removing the extracted folder
+does not remove saved transfers or credentials; moving the ZIP to another
+computer or Windows account does not carry them along.
 
 ## Apple account prerequisites
 
@@ -106,9 +126,9 @@ For Windows, set the `ESIGNER_MODE` environment variable to `PROD` in the same
 environment after the SSL.com certificate has completed validation and eSigner
 enrollment. Copy the automation TOTP secret displayed with the certificate's
 eSigner QR code into `ESIGNER_TOTP_SECRET`; do not use a one-time code. Until
-that secret is available, the Windows installer remains unsigned. The workflow
-installs eSigner CKA only on the temporary Windows runner and does not retain
-its generated local key material.
+that secret is available, the Windows installer and portable executable remain
+unsigned. The workflow installs eSigner CKA only on the temporary Windows
+runner and does not retain its generated local key material.
 
 ## Create a release
 
@@ -125,7 +145,7 @@ git tag courier-v0.1.2
 git push origin courier-v0.1.2
 ```
 
-The workflow rejects a release tag that does not exactly match `courier-v<application-version>`. Create a GitHub Release for that existing tag and publish it (mark it as a prerelease while the beta is ongoing). Publication starts the workflow; the four artifacts are uploaded to that release after they build, and the macOS artifacts are notarized automatically. If a job fails, use **Re-run failed jobs** from the workflow run after correcting the issue.
+The workflow rejects a release tag that does not exactly match `courier-v<application-version>`. Create a GitHub Release for that existing tag and publish it (mark it as a prerelease while the beta is ongoing). Publication starts the workflow; the five artifacts are uploaded to that release after they build, and the macOS artifacts are notarized automatically. If a job fails, use **Re-run failed jobs** from the workflow run after correcting the issue.
 
 ## Release verification
 
@@ -140,7 +160,7 @@ After the publication-triggered workflow completes:
    xcrun stapler validate "/Applications/Icy Seas Courier.app"
    ```
 
-3. Install the Windows package on a clean Windows x64 account and the AppImage on the oldest supported Linux distribution.
+3. Install the Windows package on a clean Windows x64 account. Separately extract and launch the portable ZIP on a Windows x64 account with WebView2 installed. Run the AppImage on the oldest supported Linux distribution.
 4. Run the complete acceptance sequence in `docs/beta-deployment.md` against the beta Registry.
 5. Record the Courier version, artifact architecture, operating system, transfer ID, and result.
 

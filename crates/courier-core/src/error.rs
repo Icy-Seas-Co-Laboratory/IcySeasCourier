@@ -30,4 +30,17 @@ pub enum CourierError {
     SourceTraversal { path: PathBuf, message: String },
 }
 
+impl CourierError {
+    pub fn is_database_corruption(&self) -> bool {
+        matches!(
+            self,
+            Self::Database(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(
+                    error.code,
+                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                )
+        )
+    }
+}
+
 pub type Result<T> = std::result::Result<T, CourierError>;

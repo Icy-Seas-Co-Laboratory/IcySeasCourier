@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs::{self, File},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -25,26 +25,40 @@ use courier_transfer::{
     plan_parts, upload_missing_parts_observed,
 };
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use url::{Host, Url};
 use uuid::Uuid;
 
 struct RuntimeState {
     controls: Mutex<HashMap<Uuid, Arc<AtomicBool>>>,
+    download_controls: Mutex<HashMap<String, Arc<AtomicBool>>>,
     credentials: Arc<Mutex<HashMap<String, RegistryCredentials>>>,
     session_gate: Arc<tokio::sync::Mutex<()>>,
     device_unlocked: Arc<AtomicBool>,
+    diagnostics: Mutex<VecDeque<DiagnosticEvent>>,
 }
 
 impl Default for RuntimeState {
     fn default() -> Self {
         Self {
             controls: Mutex::new(HashMap::new()),
+            download_controls: Mutex::new(HashMap::new()),
             credentials: Arc::new(Mutex::new(HashMap::new())),
             session_gate: Arc::new(tokio::sync::Mutex::new(())),
             device_unlocked: Arc::new(AtomicBool::new(!cfg!(target_os = "macos"))),
+            diagnostics: Mutex::new(VecDeque::new()),
         }
     }
+}
+
+const MAX_DIAGNOSTIC_EVENTS: usize = 5_000;
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticEvent {
+    timestamp: String,
+    level: String,
+    message: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -244,6 +258,141 @@ fn cleanup_stale_staged_packs(cache_root: &Path, now: SystemTime) -> Result<u64,
         }
     }
     Ok(removed)
+}
+
+fn archive_corrupt_database(database: &Path) -> Result<PathBuf, String> {
+    let parent = database
+        .parent()
+        .ok_or_else(|| "Courier database has no parent directory".to_string())?;
+    let archive = parent.join(format!(
+        "courier-db-recovery-{}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
+        Uuid::new_v4()
+    ));
+    fs::create_dir(&archive).map_err(|error| {
+        format!(
+            "Could not create a recovery archive for {}: {error}",
+            database.display()
+        )
+    })?;
+
+    let mut moved = Vec::new();
+    for suffix in ["", "-wal", "-shm"] {
+        let mut source_name = database.as_os_str().to_os_string();
+        source_name.push(suffix);
+        let source = PathBuf::from(source_name);
+        if !source.exists() {
+            continue;
+        }
+        let Some(name) = source.file_name() else {
+            continue;
+        };
+        let destination = archive.join(name);
+        if let Err(error) = fs::rename(&source, &destination) {
+            for (original, archived) in moved.iter().rev() {
+                let _ = fs::rename(archived, original);
+            }
+            let _ = fs::remove_dir(&archive);
+            return Err(format!(
+                "Could not preserve corrupt database file {} in {}: {error}",
+                source.display(),
+                archive.display()
+            ));
+        }
+        moved.push((source, destination));
+    }
+    if moved.is_empty() {
+        let _ = fs::remove_dir(&archive);
+        return Err(format!(
+            "Corrupt database {} disappeared before recovery could preserve it",
+            database.display()
+        ));
+    }
+    Ok(archive)
+}
+
+fn ensure_database_integrity(database: &Path) -> Result<Option<(PathBuf, String)>, String> {
+    if !database.exists() {
+        let has_orphaned_sidecar = ["-wal", "-shm"].iter().any(|suffix| {
+            let mut sidecar = database.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            Path::new(&sidecar).exists()
+        });
+        if has_orphaned_sidecar {
+            let archive = archive_corrupt_database(database)?;
+            return Ok(Some((
+                archive,
+                "SQLite database is missing but journal sidecars remain".into(),
+            )));
+        }
+        return Ok(None);
+    }
+    match TransferStore::integrity_check(database) {
+        Ok(results) if results.len() == 1 && results[0] == "ok" => Ok(None),
+        Ok(results) => {
+            let details = results.join("; ");
+            let archive = archive_corrupt_database(database)?;
+            Ok(Some((archive, details)))
+        }
+        Err(error) if error.is_database_corruption() => {
+            let details = error.to_string();
+            let archive = archive_corrupt_database(database)?;
+            Ok(Some((archive, details)))
+        }
+        Err(error) => Err(format!(
+            "Could not check local database integrity at {}: {error}",
+            database.display()
+        )),
+    }
+}
+
+fn initialize_local_state(app: &AppHandle) -> Result<(), String> {
+    let database = database_path(app)?;
+    let recovery_archive = ensure_database_integrity(&database)?;
+    if let Some((archive, details)) = &recovery_archive {
+        record_diagnostic(
+            app,
+            "warning",
+            format!(
+                "Local database corruption detected ({details}). The damaged database and SQLite sidecars were preserved at {}. Courier is creating a fresh local database; local history and resumable state are not automatically restored, so needed transfers must be started again.",
+                archive.display(),
+            ),
+        );
+    }
+    drop(open_transfer_store(&database)?);
+    let results = TransferStore::integrity_check(&database).map_err(display)?;
+    if results.len() != 1 || results[0] != "ok" {
+        return Err(format!(
+            "Local database failed its integrity check after startup initialization: {}",
+            results.join("; ")
+        ));
+    }
+    if recovery_archive.is_some() {
+        record_diagnostic(
+            app,
+            "info",
+            "Fresh local transfer database created and verified after corruption recovery",
+        );
+    } else {
+        record_diagnostic(
+            app,
+            "info",
+            "Local transfer database integrity check passed",
+        );
+    }
+    match cleanup_stale_staged_packs(
+        &database.parent().unwrap_or_else(|| Path::new(".")),
+        SystemTime::now(),
+    ) {
+        Ok(removed) if removed > 0 => record_diagnostic(
+            app,
+            "info",
+            format!("Removed {removed} stale temporary transport pack(s)"),
+        ),
+        Ok(_) => {}
+        Err(error) => record_diagnostic(app, "warning", error),
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -945,6 +1094,7 @@ async fn restore_download_plan(
     client: &RegistryClient,
     plan: &RegistryDownloadPlan,
     partial: &Path,
+    pause: Arc<AtomicBool>,
 ) -> Result<(u64, u64), String> {
     let manifest: DownloadManifest =
         serde_json::from_value(plan.manifest.clone()).map_err(display)?;
@@ -968,7 +1118,43 @@ async fn restore_download_plan(
 
     let mut received_total = 0_u64;
     let mut restored = 0_u64;
-    for object in &plan.objects {
+    for (object_index, object) in plan.objects.iter().enumerate() {
+        if pause.load(Ordering::Acquire) {
+            return Err("download paused".into());
+        }
+        let expected_files = by_object
+            .remove(&object.object_id)
+            .ok_or_else(|| format!("Manifest does not reference object {}", object.object_id))?;
+        record_diagnostic(
+            app,
+            "info",
+            format!(
+                "Retrieving object {} of {} for Registry transfer {} ({} files, {} transport bytes)",
+                object_index + 1,
+                plan.objects.len(),
+                plan.dataset.transfer_id,
+                expected_files.len(),
+                object.transport_bytes.unwrap_or(0)
+            ),
+        );
+        if expected_files
+            .iter()
+            .all(|file| restored_file_matches(partial, file))
+        {
+            restored = restored.saturating_add(expected_files.len() as u64);
+            received_total = received_total.saturating_add(object.transport_bytes.unwrap_or(0));
+            emit_download_progress(
+                app,
+                plan,
+                received_total,
+                restored,
+                expected_files
+                    .last()
+                    .map(|file| file.path.clone())
+                    .unwrap_or_default(),
+            );
+            continue;
+        }
         let authorization = client
             .authorize_download_object(&plan.dataset.transfer_id, object.object_id)
             .await
@@ -984,19 +1170,25 @@ async fn restore_download_plan(
         let total_files = plan.dataset.file_count;
         let restored_before = restored;
         let received = client
-            .download_object(&url, &cache_path, move |object_received| {
-                let _ = app_for_progress.emit(
-                    "courier://download-progress",
-                    DownloadProgressEvent {
-                        transfer_id: transfer_for_progress.clone(),
-                        received_bytes: before.saturating_add(object_received),
-                        total_bytes: total_transport,
-                        restored_files: restored_before,
-                        total_files,
-                        current_file: "Downloading verified transport…".into(),
-                    },
-                );
-            })
+            .download_object_resumable(
+                &url,
+                &cache_path,
+                object.transport_bytes,
+                pause.clone(),
+                move |object_received| {
+                    let _ = app_for_progress.emit(
+                        "courier://download-progress",
+                        DownloadProgressEvent {
+                            transfer_id: transfer_for_progress.clone(),
+                            received_bytes: before.saturating_add(object_received),
+                            total_bytes: total_transport,
+                            restored_files: restored_before,
+                            total_files,
+                            current_file: "Downloading verified transport…".into(),
+                        },
+                    );
+                },
+            )
             .await
             .map_err(display)?;
         if let Some(expected) = object.transport_bytes
@@ -1008,10 +1200,6 @@ async fn restore_download_plan(
             ));
         }
         received_total = received_total.saturating_add(received);
-        let expected_files = by_object
-            .remove(&object.object_id)
-            .ok_or_else(|| format!("Manifest does not reference object {}", object.object_id))?;
-
         match object.kind.as_str() {
             "file" => {
                 if expected_files.len() != 1 || expected_files[0].transport.member_index != 0 {
@@ -1021,6 +1209,11 @@ async fn restore_download_plan(
                     ));
                 }
                 let file = expected_files[0];
+                record_diagnostic(
+                    app,
+                    "info",
+                    format!("Restoring and verifying downloaded file: {}", file.path),
+                );
                 let destination = safe_relative_path(partial, &file.path)?;
                 if let Some(parent) = destination.parent() {
                     fs::create_dir_all(parent).map_err(display)?;
@@ -1041,6 +1234,11 @@ async fn restore_download_plan(
                                 "pack has extra members",
                             )
                         })?;
+                        record_diagnostic(
+                            app,
+                            "info",
+                            format!("Restoring and verifying downloaded file: {}", file.path),
+                        );
                         if header.path != file.path
                             || header.size != file.size
                             || header.digest_algorithm != file.digest.algorithm
@@ -1112,6 +1310,13 @@ async fn restore_download_plan(
     Ok((restored, received_total))
 }
 
+fn restored_file_matches(root: &Path, file: &DownloadManifestFile) -> bool {
+    let Ok(path) = safe_relative_path(root, &file.path) else {
+        return false;
+    };
+    path.is_file() && verify_restored_file(&path, file).is_ok()
+}
+
 #[tauri::command]
 async fn download_dataset(
     app: AppHandle,
@@ -1119,10 +1324,66 @@ async fn download_dataset(
     transfer_id: String,
     destination_directory: String,
 ) -> Result<DownloadResult, String> {
+    let pause = Arc::new(AtomicBool::new(false));
+    {
+        let mut controls = runtime
+            .download_controls
+            .lock()
+            .map_err(|_| "Download controls are unavailable".to_string())?;
+        if controls.contains_key(&transfer_id) {
+            return Err("This dataset is already being retrieved".into());
+        }
+        controls.insert(transfer_id.clone(), pause.clone());
+    }
+    let result = download_dataset_inner(
+        app.clone(),
+        runtime.credentials.clone(),
+        runtime.session_gate.clone(),
+        runtime.device_unlocked.clone(),
+        transfer_id.clone(),
+        destination_directory,
+        pause,
+    )
+    .await;
+    if let Ok(mut controls) = runtime.download_controls.lock() {
+        controls.remove(&transfer_id);
+    }
+    if let Err(error) = &result {
+        record_diagnostic(
+            &app,
+            if error.eq_ignore_ascii_case("download paused") {
+                "warning"
+            } else {
+                "error"
+            },
+            format!(
+                "Download {} for Registry transfer {transfer_id}: {error}",
+                if error.eq_ignore_ascii_case("download paused") {
+                    "paused"
+                } else {
+                    "stopped"
+                }
+            ),
+        );
+    }
+    result
+}
+
+async fn download_dataset_inner(
+    app: AppHandle,
+    credential_cache: Arc<Mutex<HashMap<String, RegistryCredentials>>>,
+    session_gate: Arc<tokio::sync::Mutex<()>>,
+    device_unlocked: Arc<AtomicBool>,
+    transfer_id: String,
+    destination_directory: String,
+    pause: Arc<AtomicBool>,
+) -> Result<DownloadResult, String> {
+    record_diagnostic(
+        &app,
+        "info",
+        format!("Download started for Registry transfer {transfer_id}"),
+    );
     let database = database_path(&app)?;
-    let credential_cache = runtime.credentials.clone();
-    let session_gate = runtime.session_gate.clone();
-    let device_unlocked = runtime.device_unlocked.clone();
     let (client, _) = tauri::async_runtime::spawn_blocking(move || {
         let store = TransferStore::open(&database).map_err(display)?;
         let base_url = configured_registry_url(&store)?;
@@ -1154,27 +1415,39 @@ async fn download_dataset(
             "A file or folder named {name} already exists at the destination"
         ));
     }
-    let partial = parent.join(format!(".{name}.courier-partial-{}", Uuid::new_v4()));
-    fs::create_dir(&partial).map_err(display)?;
-    let restored = restore_download_plan(&app, &client, &plan, &partial).await;
+    let partial = parent.join(format!(".{name}.courier-partial"));
+    match fs::symlink_metadata(&partial) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Err("The existing Courier recovery path is not a directory".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(&partial).map_err(display)?;
+        }
+        Err(error) => return Err(display(error)),
+    }
+    let restored = restore_download_plan(&app, &client, &plan, &partial, pause).await;
     let (restored_files, transport_bytes) = match restored {
         Ok(value) => value,
         Err(error) => {
-            let _ = fs::remove_dir_all(&partial);
             return Err(error);
         }
     };
-    fs::rename(&partial, &destination).map_err(|error| {
-        let _ = fs::remove_dir_all(&partial);
-        display(error)
-    })?;
-    Ok(DownloadResult {
+    fs::rename(&partial, &destination).map_err(display)?;
+    let result = DownloadResult {
         transfer_id: plan.dataset.transfer_id,
         destination: destination.to_string_lossy().into_owned(),
         restored_files,
         original_bytes: plan.dataset.original_bytes,
         transport_bytes,
-    })
+    };
+    record_diagnostic(
+        &app,
+        "info",
+        format!(
+            "Download finished for Registry transfer {}",
+            result.transfer_id
+        ),
+    );
+    Ok(result)
 }
 
 struct DesktopObserver {
@@ -1701,7 +1974,7 @@ async fn create_inventory(
 ) -> Result<Transfer, String> {
     let database = database_path(&app)?;
     let worker_app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let source = PathBuf::from(&source_path)
             .canonicalize()
             .map_err(|error| format!("Could not open source: {error}"))?;
@@ -1719,7 +1992,30 @@ async fn create_inventory(
         store
             .transition(transfer.id, TransferStatus::Inventorying)
             .map_err(display)?;
-        match inventory_transfer_observed(
+        record_diagnostic(
+            &worker_app,
+            "info",
+            format!(
+                "Inventory started for local transfer {}: {}",
+                transfer.id,
+                source.display()
+            ),
+        );
+        let _ = worker_app.emit(
+            "courier://inventory-progress",
+            InventoryProgressEvent {
+                transfer_id: transfer.id,
+                files_analyzed: 0,
+                total_files: 0,
+                bytes_analyzed: 0,
+                total_bytes: 0,
+                current_path: "Finding files in the selected source…".into(),
+                phase: "discovering",
+            },
+        );
+        let mut discovery_logged = false;
+        let mut last_inventory_path = PathBuf::new();
+        let indexed = inventory_transfer_observed(
             transfer.id,
             &source,
             &InventoryOptions {
@@ -1727,6 +2023,36 @@ async fn create_inventory(
                 ..InventoryOptions::default()
             },
             |progress| {
+                if !discovery_logged {
+                    record_diagnostic(
+                        &worker_app,
+                        "info",
+                        format!(
+                            "Source discovery found {} files totaling {} bytes for transfer {}",
+                            progress.total_files, progress.total_bytes, transfer.id
+                        ),
+                    );
+                    discovery_logged = true;
+                }
+                if !progress.current_path.as_os_str().is_empty()
+                    && progress.current_path != last_inventory_path
+                {
+                    let file_number = progress
+                        .files_analyzed
+                        .saturating_add(1)
+                        .min(progress.total_files);
+                    record_diagnostic(
+                        &worker_app,
+                        "info",
+                        format!(
+                            "Inventorying file {file_number} of {} for transfer {}: {}",
+                            progress.total_files,
+                            transfer.id,
+                            progress.current_path.display()
+                        ),
+                    );
+                    last_inventory_path = progress.current_path.clone();
+                }
                 let _ = worker_app.emit(
                     "courier://inventory-progress",
                     InventoryProgressEvent {
@@ -1740,11 +2066,22 @@ async fn create_inventory(
                     },
                 );
             },
-        ) {
-            Ok(files) => {
+        );
+        let result = match indexed {
+            Ok(files) => (|| -> Result<Transfer, String> {
                 store
                     .replace_inventory(transfer.id, &files)
                     .map_err(display)?;
+                record_diagnostic(
+                    &worker_app,
+                    "info",
+                    format!(
+                        "Indexed {} source files ({} bytes) for transfer {}",
+                        files.len(),
+                        files.iter().map(|file| file.size).sum::<u64>(),
+                        transfer.id
+                    ),
+                );
                 let _ = worker_app.emit(
                     "courier://inventory-progress",
                     InventoryProgressEvent {
@@ -1756,6 +2093,11 @@ async fn create_inventory(
                         current_path: "Creating compressed, resumable transport packages".into(),
                         phase: "packaging",
                     },
+                );
+                record_diagnostic(
+                    &worker_app,
+                    "info",
+                    format!("Preparing resumable transport packages for transfer {}", transfer.id),
                 );
                 let cache_root = database
                     .parent()
@@ -1774,21 +2116,75 @@ async fn create_inventory(
                 store
                     .transition(transfer.id, TransferStatus::Ready)
                     .map_err(display)?;
-                store
+                let ready = store
                     .get_transfer(transfer.id)
                     .map_err(display)?
-                    .ok_or_else(|| "Inventory disappeared from local state".to_string())
-            }
-            Err(error) => {
+                    .ok_or_else(|| "Inventory disappeared from local state".to_string())?;
+                let transport_bytes = plan
+                    .objects
+                    .iter()
+                    .filter_map(|object| object.transport_bytes)
+                    .sum::<u64>();
+                record_diagnostic(
+                    &worker_app,
+                    "info",
+                    format!(
+                        "Inventory ready for transfer {}: {} files, {} original bytes, {} transport bytes",
+                        transfer.id, ready.file_count, ready.original_bytes, transport_bytes
+                    ),
+                );
+                let _ = worker_app.emit(
+                    "courier://inventory-progress",
+                    InventoryProgressEvent {
+                        transfer_id: transfer.id,
+                        files_analyzed: ready.file_count,
+                        total_files: ready.file_count,
+                        bytes_analyzed: ready.original_bytes,
+                        total_bytes: ready.original_bytes,
+                        current_path: "Inventory and transport preparation complete".into(),
+                        phase: "complete",
+                    },
+                );
+                Ok(ready)
+            })(),
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = &result {
+            if store
+                .get_transfer(transfer.id)
+                .map_err(display)?
+                .is_some_and(|current| current.status == TransferStatus::Inventorying)
+            {
                 store
                     .transition(transfer.id, TransferStatus::Failed)
                     .map_err(display)?;
-                Err(error.to_string())
             }
+            record_diagnostic(
+                &worker_app,
+                "error",
+                format!("Inventory failed for local transfer {}: {error}", transfer.id),
+            );
+            let _ = worker_app.emit(
+                "courier://inventory-progress",
+                InventoryProgressEvent {
+                    transfer_id: transfer.id,
+                    files_analyzed: 0,
+                    total_files: 0,
+                    bytes_analyzed: 0,
+                    total_bytes: 0,
+                    current_path: error.clone(),
+                    phase: "failed",
+                },
+            );
         }
+        result
     })
     .await
-    .map_err(|error| format!("Inventory task failed: {error}"))?
+    .map_err(|error| format!("Inventory task failed: {error}"))?;
+    if let Err(error) = &result {
+        record_diagnostic(&app, "error", format!("Inventory command failed: {error}"));
+    }
+    result
 }
 
 #[tauri::command]
@@ -2018,6 +2414,11 @@ fn run_upload(
     session_gate: Arc<tokio::sync::Mutex<()>>,
     device_unlocked: Arc<AtomicBool>,
 ) -> Result<Transfer, String> {
+    record_diagnostic(
+        &app,
+        "info",
+        format!("Upload started for local transfer {transfer_id}"),
+    );
     let store = open_transfer_store(&database)?;
     let transfer = store
         .get_transfer(transfer_id)
@@ -2152,7 +2553,7 @@ fn run_upload(
         remote
             .set_pause_flag(Some(pause.clone()))
             .map_err(display)?;
-        for object in &transport_objects {
+        for (object_index, object) in transport_objects.iter().enumerate() {
             let object_members = transport_members
                 .iter()
                 .filter(|member| member.object_id == object.id)
@@ -2162,6 +2563,17 @@ fn run_upload(
                     .get(&member.file_id)
                     .is_some_and(|file| file.status == FileStatus::Uploaded)
             }) {
+                record_diagnostic(
+                    &app,
+                    "info",
+                    format!(
+                        "Skipping already completed upload object {} of {} ({}) for transfer {}",
+                        object_index + 1,
+                        transport_objects.len(),
+                        object.id,
+                        transfer_id
+                    ),
+                );
                 confirmed.fetch_add(object.original_bytes, Ordering::Relaxed);
                 continue;
             }
@@ -2209,6 +2621,20 @@ fn run_upload(
                 object_transport_bytes: source.size,
                 object_confirmed_transport_bytes: object_confirmed_transport_bytes.clone(),
             };
+            record_diagnostic(
+                &app,
+                "info",
+                format!(
+                    "Uploading object {} of {} for transfer {}: {} ({} files, {} original bytes, {} transport bytes)",
+                    object_index + 1,
+                    transport_objects.len(),
+                    transfer_id,
+                    observer.current_file,
+                    object_members.len(),
+                    object.original_bytes,
+                    source.size
+                ),
+            );
             let progress_app = app.clone();
             let progress_file = observer.current_file.clone();
             let progress_object_original = object.original_bytes;
@@ -2282,6 +2708,17 @@ fn run_upload(
                 base_confirmed.saturating_add(object.original_bytes),
                 Ordering::Relaxed,
             );
+            record_diagnostic(
+                &app,
+                "info",
+                format!(
+                    "Upload object {} of {} confirmed for transfer {} ({} original bytes)",
+                    object_index + 1,
+                    transport_objects.len(),
+                    transfer_id,
+                    object.original_bytes
+                ),
+            );
         }
         emit_upload_activity(
             &app,
@@ -2309,6 +2746,13 @@ fn run_upload(
                 transfer.original_bytes,
                 "finalizing",
             );
+            record_diagnostic(
+                &app,
+                "info",
+                format!(
+                    "Upload finished for local transfer {transfer_id}; Registry verification is pending"
+                ),
+            );
         }
         Err(error) if error == UploadError::Paused.to_string() => {
             store
@@ -2321,6 +2765,11 @@ fn run_upload(
                 transfer.original_bytes,
                 "paused",
             );
+            record_diagnostic(
+                &app,
+                "info",
+                format!("Upload paused for local transfer {transfer_id}"),
+            );
         }
         Err(error) => {
             store
@@ -2332,6 +2781,11 @@ fn run_upload(
                 confirmed.load(Ordering::Relaxed),
                 transfer.original_bytes,
                 "interrupted",
+            );
+            record_diagnostic(
+                &app,
+                "error",
+                format!("Upload interrupted for local transfer {transfer_id}: {error}"),
             );
             return Err(error);
         }
@@ -2351,6 +2805,19 @@ fn pause_upload(runtime: State<'_, RuntimeState>, transfer_id: Uuid) -> Result<(
     let pause = controls
         .get(&transfer_id)
         .ok_or_else(|| "Transfer is not currently uploading".to_string())?;
+    pause.store(true, Ordering::Release);
+    Ok(())
+}
+
+#[tauri::command]
+fn pause_download(runtime: State<'_, RuntimeState>, transfer_id: String) -> Result<(), String> {
+    let controls = runtime
+        .download_controls
+        .lock()
+        .map_err(|_| "Download controls are unavailable".to_string())?;
+    let pause = controls
+        .get(&transfer_id)
+        .ok_or_else(|| "Dataset is not currently being retrieved".to_string())?;
     pause.store(true, Ordering::Release);
     Ok(())
 }
@@ -2403,9 +2870,6 @@ fn database_path(app: &AppHandle) -> Result<PathBuf, String> {
             directory.display()
         )
     })?;
-    if let Err(error) = cleanup_stale_staged_packs(&directory, SystemTime::now()) {
-        eprintln!("{error}");
-    }
     Ok(directory.join("courier.db"))
 }
 
@@ -2413,11 +2877,128 @@ fn display(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
+fn record_diagnostic(app: &AppHandle, level: &str, message: impl Into<String>) {
+    let event = DiagnosticEvent {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        level: level.to_owned(),
+        message: message.into(),
+    };
+    if let Ok(mut diagnostics) = app.state::<RuntimeState>().diagnostics.lock() {
+        if diagnostics.len() == MAX_DIAGNOSTIC_EVENTS {
+            diagnostics.pop_front();
+        }
+        diagnostics.push_back(event.clone());
+    }
+    let _ = app.emit("courier://diagnostic", event);
+}
+
+fn diagnostic_report(events: &[DiagnosticEvent]) -> String {
+    let mut report = format!(
+        "Icy Seas Courier diagnostics\nGenerated: {}\nCourier version: {}\nPlatform: {} {}\n\n",
+        chrono::Utc::now().to_rfc3339(),
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    );
+    report.push_str("Events (newest last)\n");
+    if events.is_empty() {
+        report.push_str("No diagnostic events have been recorded in this Courier session.\n");
+    } else {
+        for event in events {
+            report.push_str(&format!(
+                "{} [{}] {}\n",
+                event.timestamp,
+                event.level.to_uppercase(),
+                event.message
+            ));
+        }
+    }
+    report.push_str(
+        "\nPrivacy note: Courier diagnostics do not include invitation codes, Registry session tokens, or presigned URL query strings. Diagnostics may include local source/file paths and the path to a preserved recovery database. The in-memory session log retains the most recent 5,000 events.\n",
+    );
+    report
+}
+
+#[tauri::command]
+fn diagnostic_events(runtime: State<'_, RuntimeState>) -> Result<Vec<DiagnosticEvent>, String> {
+    runtime
+        .diagnostics
+        .lock()
+        .map(|events| events.iter().cloned().collect())
+        .map_err(|_| "Courier diagnostics are unavailable".to_string())
+}
+
+#[tauri::command]
+fn open_diagnostics_window(app: AppHandle) -> Result<(), String> {
+    let window = if let Some(window) = app.get_webview_window("diagnostics") {
+        window
+    } else {
+        WebviewWindowBuilder::new(
+            &app,
+            "diagnostics",
+            WebviewUrl::App("index.html?window=diagnostics".into()),
+        )
+        .title("Courier Diagnostics")
+        .inner_size(760.0, 520.0)
+        .min_inner_size(560.0, 340.0)
+        .resizable(true)
+        .build()
+        .map_err(display)?
+    };
+    window.show().map_err(display)?;
+    window.set_focus().map_err(display)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn diagnostic_report_text(runtime: State<'_, RuntimeState>) -> Result<String, String> {
+    let events = runtime
+        .diagnostics
+        .lock()
+        .map_err(|_| "Courier diagnostics are unavailable".to_string())?
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(diagnostic_report(&events))
+}
+
+#[tauri::command]
+fn save_diagnostic_report(
+    app: AppHandle,
+    runtime: State<'_, RuntimeState>,
+    path: PathBuf,
+) -> Result<(), String> {
+    let report = diagnostic_report_text(runtime)?;
+    fs::write(&path, report)
+        .map_err(|error| format!("Could not save diagnostics to {}: {error}", path.display()))?;
+    record_diagnostic(
+        &app,
+        "info",
+        format!("Saved diagnostic report to {}", path.display()),
+    );
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(RuntimeState::default())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            record_diagnostic(
+                app.handle(),
+                "info",
+                "Courier started; diagnostics are ready for this session",
+            );
+            if let Err(error) = initialize_local_state(app.handle()) {
+                record_diagnostic(
+                    app.handle(),
+                    "error",
+                    format!("Local state startup check failed: {error}"),
+                );
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             device_access_status,
             authenticate_device,
@@ -2433,7 +3014,12 @@ pub fn run() {
             clear_transfer,
             refresh_transfer_status,
             start_upload,
-            pause_upload
+            pause_upload,
+            pause_download,
+            diagnostic_events,
+            diagnostic_report_text,
+            save_diagnostic_report,
+            open_diagnostics_window
         ])
         .run(tauri::generate_context!())
         .expect("error while running Icy Seas Courier");
@@ -2494,6 +3080,47 @@ mod tests {
         assert!(!stale.exists());
         assert!(recent.exists());
         assert!(published.exists());
+    }
+
+    #[test]
+    fn corrupt_database_is_archived_before_a_fresh_store_is_created() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("courier.db");
+        let damaged_bytes = b"not a SQLite database";
+        fs::write(&database, damaged_bytes).unwrap();
+
+        let (archive, _) = ensure_database_integrity(&database).unwrap().unwrap();
+
+        assert!(!database.exists());
+        assert_eq!(fs::read(archive.join("courier.db")).unwrap(), damaged_bytes);
+        drop(open_transfer_store(&database).unwrap());
+        assert_eq!(TransferStore::integrity_check(&database).unwrap(), ["ok"]);
+    }
+
+    #[test]
+    fn database_recovery_archive_preserves_sqlite_sidecars() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("courier.db");
+        let wal = directory.path().join("courier.db-wal");
+        let shm = directory.path().join("courier.db-shm");
+        fs::write(&database, b"damaged database").unwrap();
+        fs::write(&wal, b"write-ahead log").unwrap();
+        fs::write(&shm, b"shared memory index").unwrap();
+
+        let archive = archive_corrupt_database(&database).unwrap();
+
+        assert_eq!(
+            fs::read(archive.join("courier.db")).unwrap(),
+            b"damaged database"
+        );
+        assert_eq!(
+            fs::read(archive.join("courier.db-wal")).unwrap(),
+            b"write-ahead log"
+        );
+        assert_eq!(
+            fs::read(archive.join("courier.db-shm")).unwrap(),
+            b"shared memory index"
+        );
     }
 
     #[test]

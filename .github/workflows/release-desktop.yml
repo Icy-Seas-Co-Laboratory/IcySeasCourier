@@ -288,6 +288,69 @@ jobs:
             throw "Authenticode verification of the NSIS installer failed with exit code $LASTEXITCODE."
           }
 
+      - name: Package portable Windows x64 build
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: apps/courier-desktop
+        run: |
+          $ErrorActionPreference = "Stop"
+          $executable = Join-Path $env:GITHUB_WORKSPACE "target/x86_64-pc-windows-msvc/release/courier-desktop.exe"
+          if (!(Test-Path -LiteralPath $executable -PathType Leaf)) {
+            throw "The Windows release executable was not found at $executable."
+          }
+          $version = (Get-Content -Raw package.json | ConvertFrom-Json).version
+          $portableDirectory = Join-Path $env:RUNNER_TEMP "courier-windows-portable"
+          New-Item -ItemType Directory -Path $portableDirectory -Force | Out-Null
+          Copy-Item -LiteralPath $executable -Destination $portableDirectory
+          @(
+            "Icy Seas Courier $version - portable Windows x64"
+            ""
+            "Extract this ZIP, then run courier-desktop.exe. No installation is required."
+            "Requires Windows x64 and the Microsoft Edge WebView2 Runtime. This ZIP does not install WebView2."
+            "If WebView2 is missing, get the Evergreen Runtime from https://developer.microsoft.com/microsoft-edge/webview2/."
+            "If Windows reports a missing VCRUNTIME or MSVCP DLL, install Microsoft's current Visual C++ x64 Redistributable."
+            "See https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist."
+            ""
+            "Courier stores transfer state in your Windows account's local app-data folder and"
+            "Registry credentials in Windows Credential Manager, not beside this executable."
+            "The portable ZIP and NSIS installer use the same per-user Courier data."
+            "Deleting the extracted folder does not delete your saved Courier data."
+          ) | Set-Content -LiteralPath (Join-Path $portableDirectory "README.txt") -Encoding utf8
+          $archive = Join-Path $env:RUNNER_TEMP "Icy-Seas-Courier_${version}_windows-x64-portable.zip"
+          Compress-Archive -Path (Join-Path $portableDirectory "*") -DestinationPath $archive -CompressionLevel Optimal
+          "COURIER_PORTABLE_ARCHIVE=$archive" >> $env:GITHUB_ENV
+
+      - name: Extract and launch the portable Windows x64 build
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $extractedDirectory = Join-Path $env:RUNNER_TEMP "courier-portable-smoke"
+          Expand-Archive -LiteralPath $env:COURIER_PORTABLE_ARCHIVE -DestinationPath $extractedDirectory
+          $executable = Join-Path $extractedDirectory "courier-desktop.exe"
+          if (!(Test-Path -LiteralPath $executable -PathType Leaf) -or
+              !(Test-Path -LiteralPath (Join-Path $extractedDirectory "README.txt") -PathType Leaf)) {
+            throw "The extracted portable ZIP must contain courier-desktop.exe and README.txt."
+          }
+          if ('${{ steps.esigner.outputs.enabled }}' -eq 'true') {
+            $signature = Get-AuthenticodeSignature -FilePath $executable
+            if ($signature.Status -ne "Valid") {
+              throw "The portable executable does not have a valid Authenticode signature: $($signature.Status)."
+            }
+          }
+          $process = Start-Process -FilePath $executable -WorkingDirectory $extractedDirectory -PassThru
+          try {
+            Start-Sleep -Seconds 5
+            if ($process.HasExited) {
+              throw "The portable executable exited during its startup smoke test (exit code $($process.ExitCode))."
+            }
+          }
+          finally {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+            }
+          }
+
       - name: Install and launch the signed Windows NSIS bundle
         if: runner.os == 'Windows' && steps.esigner.outputs.enabled == 'true'
         shell: pwsh
@@ -307,7 +370,7 @@ jobs:
             -BundleDirectory "$env:GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/release/bundle/nsis" `
             -InstallDirectory "$env:RUNNER_TEMP/CourierReleaseInstallerSmoke"
 
-      - name: Attach verified Windows release artifact
+      - name: Attach verified Windows release artifacts
         if: runner.os == 'Windows'
         shell: pwsh
         working-directory: apps/courier-desktop
@@ -320,7 +383,11 @@ jobs:
           if ($installer.Count -ne 1) {
             throw "Expected exactly one NSIS installer to attach; found $($installer.Count)."
           }
-          gh release upload "${{ github.event.release.tag_name }}" $installer[0].FullName --clobber
+          if (!(Test-Path -LiteralPath $env:COURIER_PORTABLE_ARCHIVE -PathType Leaf)) {
+            throw "The portable ZIP was not found at $env:COURIER_PORTABLE_ARCHIVE."
+          }
+          gh release upload "${{ github.event.release.tag_name }}" `
+            $installer[0].FullName $env:COURIER_PORTABLE_ARCHIVE --clobber
 
       - name: Remove the temporary signing keychain
         if: always() && runner.os == 'macOS'

@@ -14,7 +14,7 @@ use courier_core::{
     FileRecord, HashAlgorithm, Transfer, TransportMemberRecord, TransportObjectRecord,
 };
 use courier_transfer::{MultipartStore, RemotePart, StoreError, UploadSession};
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, StatusCode, header::HeaderMap};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -29,6 +29,8 @@ pub enum RegistryError {
     Rejected { status: StatusCode, detail: String },
     #[error("Registry response did not match local transfer state: {0}")]
     State(String),
+    #[error("download paused")]
+    Paused,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -304,30 +306,134 @@ impl RegistryClient {
         .await
     }
 
-    pub async fn download_object(
+    pub async fn download_object_resumable(
         &self,
         url: &str,
         destination: &Path,
+        expected_bytes: Option<u64>,
+        pause: Arc<AtomicBool>,
         mut progress: impl FnMut(u64),
     ) -> Result<u64, RegistryError> {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
-        let mut response = self.http.get(url).send().await?;
+        let partial_path = destination.with_extension("part");
+        if let Ok(metadata) = tokio::fs::metadata(destination).await {
+            let size = metadata.len();
+            if expected_bytes.is_none_or(|expected| expected == size) {
+                progress(size);
+                return Ok(size);
+            }
+            tokio::fs::remove_file(destination).await?;
+        }
+
+        let mut offset = tokio::fs::metadata(&partial_path)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if expected_bytes.is_some_and(|expected| offset > expected) {
+            tokio::fs::remove_file(&partial_path).await?;
+            offset = 0;
+        }
+        if pause.load(Ordering::Acquire) {
+            return Err(RegistryError::Paused);
+        }
+        if expected_bytes == Some(offset) && offset > 0 {
+            tokio::fs::rename(&partial_path, destination).await?;
+            progress(offset);
+            return Ok(offset);
+        }
+
+        let mut request = self.http.get(url);
+        if offset > 0 {
+            request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
+        }
+        let sending = request.send();
+        tokio::pin!(sending);
+        let mut response = loop {
+            tokio::select! {
+                result = &mut sending => break result?,
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    if pause.load(Ordering::Acquire) {
+                        return Err(RegistryError::Paused);
+                    }
+                }
+            }
+        };
         let status = response.status();
         if !status.is_success() {
-            return Err(RegistryError::Rejected {
-                status,
-                detail: "object storage rejected the download".into(),
-            });
+            let error = map_object_store_response(response).await;
+            return Err(RegistryError::State(error.to_string()));
         }
-        let mut output = tokio::fs::File::create(destination).await?;
-        let mut received = 0_u64;
-        while let Some(chunk) = response.chunk().await? {
+
+        let append = if offset > 0 && status == StatusCode::PARTIAL_CONTENT {
+            let content_range = response
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            if !content_range.starts_with(&format!("bytes {offset}-")) {
+                return Err(RegistryError::State(format!(
+                    "object storage returned an invalid Content-Range for resume at byte {offset}"
+                )));
+            }
+            true
+        } else if offset > 0 && status == StatusCode::OK {
+            // Some compatible S3 services ignore Range. Restart from zero rather
+            // than appending a full response to the existing partial file.
+            offset = 0;
+            false
+        } else if status == StatusCode::PARTIAL_CONTENT && offset == 0 {
+            return Err(RegistryError::State(
+                "object storage returned a partial response without a resume offset".into(),
+            ));
+        } else {
+            false
+        };
+
+        let mut output = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(append)
+            .truncate(!append)
+            .open(&partial_path)
+            .await?;
+        if append {
+            output.seek(std::io::SeekFrom::End(0)).await?;
+        }
+        let mut received = offset;
+        progress(received);
+        loop {
+            let chunk = tokio::select! {
+                result = response.chunk() => result?,
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    if pause.load(Ordering::Acquire) {
+                        output.flush().await?;
+                        output.sync_data().await?;
+                        return Err(RegistryError::Paused);
+                    }
+                    continue;
+                }
+            };
+            let Some(chunk) = chunk else { break };
+            if pause.load(Ordering::Acquire) {
+                output.flush().await?;
+                output.sync_data().await?;
+                return Err(RegistryError::Paused);
+            }
             output.write_all(&chunk).await?;
             received = received.saturating_add(chunk.len() as u64);
             progress(received);
         }
         output.flush().await?;
+        output.sync_data().await?;
+        drop(output);
+        if expected_bytes.is_some_and(|expected| expected != received) {
+            return Err(RegistryError::State(format!(
+                "downloaded object has {received} bytes; expected {}",
+                expected_bytes.unwrap_or_default()
+            )));
+        }
+        tokio::fs::rename(&partial_path, destination).await?;
         Ok(received)
     }
     pub fn unauthenticated(base_url: impl Into<String>) -> Self {
@@ -868,10 +974,7 @@ impl MultipartStore for RegistryMultipartStore {
             }
         };
         if !response.status().is_success() {
-            return Err(map_status(
-                response.status(),
-                "presigned part upload rejected".into(),
-            ));
+            return Err(map_object_store_response(response).await);
         }
         let etag = response
             .headers()
@@ -945,6 +1048,7 @@ fn map_registry_error(error: RegistryError) -> StoreError {
         RegistryError::Io(error) => StoreError::Permanent(error.to_string()),
         RegistryError::Rejected { status, detail } => map_status(status, detail),
         RegistryError::State(detail) => StoreError::Permanent(detail),
+        RegistryError::Paused => StoreError::Permanent("download paused".into()),
     }
 }
 
@@ -963,6 +1067,141 @@ fn map_status(status: StatusCode, detail: String) -> StoreError {
         408 | 425 | 429 | 500..=599 => StoreError::Transient(detail),
         _ => StoreError::Permanent(detail),
     }
+}
+
+async fn map_object_store_response(response: reqwest::Response) -> StoreError {
+    let status = response.status();
+    let destination = response.url().host_str().map(str::to_owned);
+    let headers = response.headers().clone();
+    let body = response_body_preview(response).await;
+    let (detail, cloudflare, cloudflare_challenge) =
+        object_store_response_detail(status, destination.as_deref(), &headers, &body);
+
+    if cloudflare_challenge {
+        return StoreError::Permanent(detail);
+    }
+
+    // A Cloudflare-generated 400 is not an S3 validation result. It can be a
+    // transient edge or tunnel failure, and every retry obtains a fresh
+    // presigned URL before replaying the idempotent part PUT.
+    if cloudflare && status == StatusCode::BAD_REQUEST {
+        StoreError::Transient(detail)
+    } else {
+        map_status(status, detail)
+    }
+}
+
+async fn response_body_preview(response: reqwest::Response) -> String {
+    use futures_util::StreamExt;
+
+    const MAX_RESPONSE_BYTES: usize = 1_024;
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while bytes.len() < MAX_RESPONSE_BYTES {
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
+        let Ok(chunk) = chunk else {
+            break;
+        };
+        let remaining = MAX_RESPONSE_BYTES - bytes.len();
+        bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn object_store_response_detail(
+    status: StatusCode,
+    destination: Option<&str>,
+    headers: &HeaderMap,
+    body: &str,
+) -> (String, bool, bool) {
+    let cloudflare = header_value(headers, "cf-ray").is_some()
+        || header_value(headers, "server")
+            .is_some_and(|value| value.eq_ignore_ascii_case("cloudflare"));
+    let provider = if cloudflare {
+        "Cloudflare"
+    } else {
+        "object store"
+    };
+    let mut evidence = vec![format!("HTTP {status}"), format!("provider {provider}")];
+    let cloudflare_challenge = cloudflare && is_cloudflare_challenge(body);
+    if cloudflare_challenge {
+        evidence.push("Cloudflare security verification challenge detected".into());
+    }
+    if let Some(destination) = destination {
+        evidence.push(format!("destination {destination}"));
+    }
+    for name in [
+        "cf-ray",
+        "server",
+        "content-type",
+        "x-amz-request-id",
+        "x-amz-id-2",
+        "x-goog-request-id",
+    ] {
+        if let Some(value) = header_value(headers, name) {
+            evidence.push(format!("{name} {value}"));
+        }
+    }
+    let mut detail = format!("Object-store request rejected ({})", evidence.join("; "));
+    if let Some(preview) = safe_response_preview(body) {
+        detail.push_str(&format!(". Response preview: {preview}"));
+    }
+    if cloudflare_challenge {
+        detail.push_str(
+            ". Courier cannot complete a browser CAPTCHA or JavaScript challenge during a presigned object-store request; ask the Courier administrator to exempt the S3 upload hostname from Cloudflare challenges.",
+        );
+    }
+    (detail, cloudflare, cloudflare_challenge)
+}
+
+fn is_cloudflare_challenge(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    [
+        "cf-chl-",
+        "/cdn-cgi/challenge-platform",
+        "just a moment...",
+        "captcha",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let value = headers.get(name)?.to_str().ok()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(truncate_diagnostic(value, 160))
+}
+
+fn safe_response_preview(body: &str) -> Option<String> {
+    let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return None;
+    }
+    let lower = compact.to_ascii_lowercase();
+    if [
+        "x-amz-signature",
+        "x-amz-credential",
+        "x-amz-security-token",
+        "authorization:",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return Some("omitted because the response contained signed-request material".into());
+    }
+    Some(truncate_diagnostic(&compact, 480))
+}
+
+fn truncate_diagnostic(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_owned();
+    }
+    let truncated = value.chars().take(limit).collect::<String>();
+    format!("{truncated}…")
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -1014,6 +1253,70 @@ mod tests {
             map_status(StatusCode::UNPROCESSABLE_ENTITY, String::new()),
             StoreError::Permanent(_)
         ));
+    }
+
+    #[test]
+    fn cloudflare_rejections_include_safe_support_evidence_and_retry() {
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-ray", "a1b2c3d4-SEA".parse().unwrap());
+        headers.insert("server", "cloudflare".parse().unwrap());
+        headers.insert("content-type", "text/html".parse().unwrap());
+        let (detail, cloudflare, challenge) = object_store_response_detail(
+            StatusCode::BAD_REQUEST,
+            Some("s3.icyseascolab.io"),
+            &headers,
+            "<html><title>400 Bad Request</title><center>cloudflare</center></html>",
+        );
+
+        assert!(cloudflare);
+        assert!(!challenge);
+        assert!(detail.contains("HTTP 400 Bad Request"));
+        assert!(detail.contains("destination s3.icyseascolab.io"));
+        assert!(detail.contains("cf-ray a1b2c3d4-SEA"));
+        assert!(matches!(
+            if cloudflare {
+                StoreError::Transient(detail)
+            } else {
+                StoreError::Permanent(detail)
+            },
+            StoreError::Transient(_)
+        ));
+    }
+
+    #[test]
+    fn object_store_diagnostics_keep_s3_request_ids_but_redact_signed_material() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-request-id", "request-123".parse().unwrap());
+        let (detail, cloudflare, challenge) = object_store_response_detail(
+            StatusCode::FORBIDDEN,
+            Some("s3.example.test"),
+            &headers,
+            "Signature failure X-Amz-Signature=should-not-appear",
+        );
+
+        assert!(!cloudflare);
+        assert!(!challenge);
+        assert!(detail.contains("x-amz-request-id request-123"));
+        assert!(detail.contains("omitted because the response contained signed-request material"));
+        assert!(!detail.contains("should-not-appear"));
+    }
+
+    #[test]
+    fn cloudflare_challenges_tell_the_user_that_browser_verification_is_unsupported() {
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-ray", "challenge-ray".parse().unwrap());
+        headers.insert("server", "cloudflare".parse().unwrap());
+        let (detail, cloudflare, challenge) = object_store_response_detail(
+            StatusCode::FORBIDDEN,
+            Some("s3.icyseascolab.io"),
+            &headers,
+            "<html><title>Just a moment...</title><div id=cf-chl-widget></div></html>",
+        );
+
+        assert!(cloudflare);
+        assert!(challenge);
+        assert!(detail.contains("security verification challenge detected"));
+        assert!(detail.contains("cannot complete a browser CAPTCHA"));
     }
 
     #[tokio::test]

@@ -17,4 +17,4 @@ Courier defaults to the hosted HTTPS Registry at `https://courier.icyseascolab.i
 
 ## Releases
 
-Signed macOS DMGs, a Windows NSIS installer, and a Linux AppImage are produced by the version-tagged GitHub Actions release workflow. See [Courier Desktop releases](../../docs/desktop-releases.md) for Apple signing setup, release creation, and verification.
+Signed macOS DMGs, a Windows NSIS installer and portable x64 ZIP, and a Linux AppImage are produced by the version-tagged GitHub Actions release workflow. The Windows ZIP runs after extraction when Microsoft Edge WebView2 Runtime is installed; its transfer state and credentials stay in the current user's Windows data stores, not in the extracted folder. See [Courier Desktop releases](../../docs/desktop-releases.md) for signing setup, release creation, and verification.
