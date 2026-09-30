@@ -381,7 +381,7 @@ fn initialize_local_state(app: &AppHandle) -> Result<(), String> {
         );
     }
     match cleanup_stale_staged_packs(
-        &database.parent().unwrap_or_else(|| Path::new(".")),
+        database.parent().unwrap_or_else(|| Path::new(".")),
         SystemTime::now(),
     ) {
         Ok(removed) if removed > 0 => record_diagnostic(
@@ -1627,8 +1627,14 @@ fn pack_upload_source(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let (transport_bytes, cached) =
-            stage_or_measure_pack(&members, &temporary, path, options, cache_budget)?;
+        let (transport_bytes, cached) = stage_or_measure_pack(
+            &members,
+            &temporary,
+            path,
+            options,
+            cache_budget,
+            &mut || {},
+        )?;
         if !cached || object.transport_bytes != Some(transport_bytes) {
             let _ = fs::remove_file(path);
             return Err(format!(
@@ -1670,6 +1676,13 @@ struct PreparedTransportPlan {
     objects: Vec<TransportObjectRecord>,
     members: Vec<TransportMemberRecord>,
     upload_sources: Vec<FileRecord>,
+}
+
+#[derive(Clone, Copy)]
+struct CacheBoundary {
+    capacity: u64,
+    remaining: u64,
+    already_full: bool,
 }
 
 struct CappedWriter<W> {
@@ -1756,8 +1769,10 @@ fn stage_or_measure_pack(
     destination: &Path,
     options: PackOptions,
     cache_limit: u64,
+    on_cache_limit: &mut dyn FnMut(),
 ) -> Result<(u64, bool), String> {
     if cache_limit == 0 {
+        on_cache_limit();
         return Ok((measure_pack_transport_bytes(members, options)?, false));
     }
     let output = File::create(temporary).map_err(display)?;
@@ -1793,6 +1808,7 @@ fn stage_or_measure_pack(
         }
         Err(error) if cache_budget_exceeded(&error) => {
             let _ = fs::remove_file(temporary);
+            on_cache_limit();
             Ok((measure_pack_transport_bytes(members, options)?, false))
         }
         Err(error) => {
@@ -1802,6 +1818,7 @@ fn stage_or_measure_pack(
     }
 }
 
+#[cfg(test)]
 fn prepare_transport_plan(
     transfer_id: Uuid,
     files: &[FileRecord],
@@ -1816,12 +1833,44 @@ fn prepare_transport_plan(
     )
 }
 
+fn cache_limit_source_description(members: &[&FileRecord]) -> String {
+    match members {
+        [] => "an unknown source file".into(),
+        [file] => file.relative_path.to_string_lossy().into_owned(),
+        files => format!(
+            "{} small files ({} through {})",
+            files.len(),
+            files[0].relative_path.display(),
+            files[files.len() - 1].relative_path.display()
+        ),
+    }
+}
+
+#[cfg(test)]
 fn prepare_transport_plan_with_options(
     transfer_id: Uuid,
     files: &[FileRecord],
     cache_root: &Path,
     options: PackOptions,
     cache_budget: u64,
+) -> Result<PreparedTransportPlan, String> {
+    prepare_transport_plan_with_observer(
+        transfer_id,
+        files,
+        cache_root,
+        options,
+        cache_budget,
+        &mut |_, _| {},
+    )
+}
+
+fn prepare_transport_plan_with_observer(
+    transfer_id: Uuid,
+    files: &[FileRecord],
+    cache_root: &Path,
+    options: PackOptions,
+    cache_budget: u64,
+    on_cache_limit: &mut dyn FnMut(&[&FileRecord], CacheBoundary),
 ) -> Result<PreparedTransportPlan, String> {
     let plan = plan_packs(files, options).map_err(display)?;
     let pack_directory = cache_root.join("packs").join(transfer_id.to_string());
@@ -1837,12 +1886,24 @@ fn prepare_transport_plan_with_options(
         let object_id = Uuid::new_v4();
         let destination = pack_directory.join(format!("{object_id}.iscpack.zst"));
         let temporary = pack_directory.join(format!("{object_id}.tmp"));
+        let remaining_cache = cache_budget.saturating_sub(cached_bytes);
+        let mut cache_limit_callback = || {
+            on_cache_limit(
+                &pack,
+                CacheBoundary {
+                    capacity: cache_budget,
+                    remaining: remaining_cache,
+                    already_full: remaining_cache == 0,
+                },
+            )
+        };
         let (transport_bytes, cached) = stage_or_measure_pack(
             &pack,
             &temporary,
             &destination,
             options,
-            cache_budget.saturating_sub(cached_bytes),
+            remaining_cache,
+            &mut cache_limit_callback,
         )?;
         if cached {
             cached_bytes = cached_bytes.saturating_add(transport_bytes);
@@ -1892,12 +1953,24 @@ fn prepare_transport_plan_with_options(
         let object_id = Uuid::new_v4();
         let destination = pack_directory.join(format!("{object_id}.iscpack.zst"));
         let temporary = pack_directory.join(format!("{object_id}.tmp"));
+        let remaining_cache = cache_budget.saturating_sub(cached_bytes);
+        let mut cache_limit_callback = || {
+            on_cache_limit(
+                &[file],
+                CacheBoundary {
+                    capacity: cache_budget,
+                    remaining: remaining_cache,
+                    already_full: remaining_cache == 0,
+                },
+            );
+        };
         let (compressed_size, cached) = stage_or_measure_pack(
             &[file],
             &temporary,
             &destination,
             options,
-            cache_budget.saturating_sub(cached_bytes),
+            remaining_cache,
+            &mut cache_limit_callback,
         )?;
         let use_compressed = compressed_size < file.size && compressed_size <= cache_budget;
         if use_compressed {
@@ -2102,7 +2175,43 @@ async fn create_inventory(
                 let cache_root = database
                     .parent()
                     .ok_or_else(|| "Courier data directory is unavailable".to_string())?;
-                let plan = prepare_transport_plan(transfer.id, &files, cache_root)?;
+                let total_bytes = files.iter().map(|file| file.size).sum::<u64>();
+                let cache_capacity = pack_cache_budget(PackOptions::default());
+                let mut report_cache_limit = |members: &[&FileRecord], boundary: CacheBoundary| {
+                    let source_description = cache_limit_source_description(members);
+                    let capacity_mib = boundary.capacity as f64 / (1024.0 * 1024.0);
+                    let remaining_mib = boundary.remaining as f64 / (1024.0 * 1024.0);
+                    let detail = if boundary.already_full {
+                        format!(
+                            "Transport staging cache has no remaining space ({capacity_mib:.0} MiB per-transfer limit). Measuring compression without caching: {source_description}"
+                        )
+                    } else {
+                        format!(
+                            "A staging attempt reached its current allowance ({remaining_mib:.0} MiB available; {capacity_mib:.0} MiB per-transfer limit) while processing {source_description}. The temporary pack was discarded; Courier is measuring compressed size without caching, which reads the source again."
+                        )
+                    };
+                    record_diagnostic(&worker_app, "info", detail.clone());
+                    let _ = worker_app.emit(
+                        "courier://inventory-progress",
+                        InventoryProgressEvent {
+                            transfer_id: transfer.id,
+                            files_analyzed: files.len() as u64,
+                            total_files: files.len() as u64,
+                            bytes_analyzed: total_bytes,
+                            total_bytes,
+                            current_path: detail,
+                            phase: "packaging",
+                        },
+                    );
+                };
+                let plan = prepare_transport_plan_with_observer(
+                    transfer.id,
+                    &files,
+                    cache_root,
+                    PackOptions::default(),
+                    cache_capacity,
+                    &mut report_cache_limit,
+                )?;
                 store
                     .replace_transport_plan(transfer.id, &plan.objects, &plan.members)
                     .map_err(display)?;
@@ -3261,9 +3370,32 @@ mod tests {
         };
         // One independently encoded pack is larger than this limit, so none can
         // be retained. Their measured byte lengths still form a valid plan.
-        let plan =
-            prepare_transport_plan_with_options(transfer_id, &files, directory.path(), options, 8)
-                .unwrap();
+        let mut cache_limit_events = Vec::new();
+        let mut observe_cache_limit = |members: &[&FileRecord], boundary: CacheBoundary| {
+            cache_limit_events.push((
+                members[0].relative_path.clone(),
+                boundary.capacity,
+                boundary.remaining,
+                boundary.already_full,
+            ));
+        };
+        let plan = prepare_transport_plan_with_observer(
+            transfer_id,
+            &files,
+            directory.path(),
+            options,
+            8,
+            &mut observe_cache_limit,
+        )
+        .unwrap();
+        assert_eq!(cache_limit_events.len(), 3);
+        assert!(
+            cache_limit_events
+                .iter()
+                .all(|(_, capacity, remaining, full)| {
+                    *capacity == 8 && *remaining == 8 && !full
+                })
+        );
 
         assert_eq!(plan.objects.len(), 3);
         assert!(

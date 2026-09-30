@@ -1053,7 +1053,11 @@ fn map_registry_error(error: RegistryError) -> StoreError {
 }
 
 fn map_transport(error: reqwest::Error) -> StoreError {
-    if error.is_timeout() || error.is_connect() {
+    // A request can fail after it has been built and while its body is being
+    // sent (for example, if the connection is reset). Those are transport
+    // failures too, and retrying the same multipart part is safe. Builder and
+    // other local/configuration errors remain permanent.
+    if error.is_timeout() || error.is_connect() || error.is_request() || error.is_body() {
         StoreError::Transient(error.to_string())
     } else {
         StoreError::Permanent(error.to_string())
@@ -1251,6 +1255,43 @@ mod tests {
         ));
         assert!(matches!(
             map_status(StatusCode::UNPROCESSABLE_ENTITY, String::new()),
+            StoreError::Permanent(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn interrupted_request_send_is_retryable_but_builder_errors_are_not() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_headers = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request_headers
+                .windows(4)
+                .any(|window| window == b"\r\n\r\n")
+            {
+                let count = stream.read(&mut buffer).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request_headers.extend_from_slice(&buffer[..count]);
+            }
+            // Closing without a response simulates a peer dropping an upload.
+        });
+
+        let send_error = Client::new()
+            .put(format!("http://{address}/part"))
+            .body(vec![0_u8; 8 * 1024 * 1024])
+            .send()
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(map_transport(send_error).is_retryable());
+
+        let builder_error = Client::new().get("not a valid URL").build().unwrap_err();
+        assert!(matches!(
+            map_transport(builder_error),
             StoreError::Permanent(_)
         ));
     }

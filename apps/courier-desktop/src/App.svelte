@@ -333,7 +333,7 @@
     const progressDetail = progress.phase === "discovering"
       ? progress.currentPath || "Finding files in the selected source"
       : progress.phase === "packaging"
-        ? `Creating resumable packages · ${progress.filesAnalyzed.toLocaleString()} of ${progress.totalFiles.toLocaleString()} files`
+        ? progress.currentPath || "Creating resumable packages"
         : `${fileNumber.toLocaleString()} of ${progress.totalFiles.toLocaleString()} files · ${formatBytes(progress.bytesAnalyzed)} of ${formatBytes(progress.totalBytes)}${progress.currentPath ? ` · ${progress.currentPath}` : ""}`;
     touchActivity(title, progressDetail);
     inventoryCommandRunning = true;
