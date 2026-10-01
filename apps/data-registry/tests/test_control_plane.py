@@ -396,6 +396,15 @@ def test_health_is_process_liveness_only(client: TestClient) -> None:
     assert client.get("/health").json() == {"status": "ok"}
 
 
+def test_version_endpoint_reports_registry_build_metadata(client: TestClient) -> None:
+    response = client.get("/api/v1/version")
+
+    assert response.status_code == 200
+    assert response.json()["service"] == "Icy Seas Data Registry"
+    assert response.json()["version"] == client.app.version
+    assert response.json()["build"]
+
+
 def test_root_serves_courier_landing_page(client: TestClient) -> None:
     response = client.get("/")
 
@@ -403,7 +412,10 @@ def test_root_serves_courier_landing_page(client: TestClient) -> None:
     assert response.headers["content-type"].startswith("text/html")
     assert "Icy Seas Courier" in response.text
     assert "independently verified" in response.text
+    assert 'id="registry-build"' in response.text
+    assert "script-src 'self'" in response.headers["content-security-policy"]
     assert "default-src 'none'" in response.headers["content-security-policy"]
+    assert "Registry v${version}" in client.get("/landing.js").text
     assert client.get("/favicon.svg").headers["content-type"].startswith("image/svg+xml")
 
 

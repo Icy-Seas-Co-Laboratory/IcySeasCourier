@@ -36,6 +36,8 @@ services:
     image: icy-seas-data-registry:dev
     build:
       context: apps/data-registry
+      args:
+        REGISTRY_BUILD_ID: ${REGISTRY_BUILD_ID:-local}
     environment:
       REGISTRY_ENVIRONMENT: ${REGISTRY_ENVIRONMENT:-development}
       REGISTRY_DATABASE_URL: postgresql+psycopg://registry:${POSTGRES_PASSWORD:-registry}@postgres:5432/registry
@@ -96,6 +98,8 @@ services:
     image: icy-seas-data-registry:dev
     build:
       context: apps/data-registry
+      args:
+        REGISTRY_BUILD_ID: ${REGISTRY_BUILD_ID:-local}
     command: ["python", "-m", "data_registry.worker"]
     environment:
       REGISTRY_ENVIRONMENT: ${REGISTRY_ENVIRONMENT:-development}

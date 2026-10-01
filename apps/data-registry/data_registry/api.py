@@ -10,6 +10,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 
 from .audit import record_event
+from .build_info import REGISTRY_BUILD, REGISTRY_VERSION
 from .db import engine
 from .dependencies import (
     AdminActor,
@@ -44,6 +45,7 @@ from .schemas import (
     AdminTransferDetail,
     AdminTransferSummary,
     AuditEventResponse,
+    BuildInfoResponse,
     CompleteMultipartRequest,
     CompleteMultipartResponse,
     DownloadDatasetSummary,
@@ -88,6 +90,16 @@ from .security import (
 router = APIRouter()
 admin = APIRouter(prefix="/api/v1/admin", tags=["administration"])
 client = APIRouter(prefix="/api/v1", tags=["courier"])
+
+
+@client.get("/version", response_model=BuildInfoResponse)
+def build_info() -> BuildInfoResponse:
+    """Report non-sensitive version and build metadata for support diagnostics."""
+    return BuildInfoResponse(
+        service="Icy Seas Data Registry",
+        version=REGISTRY_VERSION,
+        build=REGISTRY_BUILD,
+    )
 
 
 def owned_transfer(database: Database, identity: CourierIdentity, transfer_id: str) -> Transfer:

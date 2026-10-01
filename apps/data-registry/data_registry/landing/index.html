@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <script src="/landing.js" defer></script>
     <title>Icy Seas Courier</title>
     <style>
       :root {
@@ -77,6 +78,20 @@
         color: #688087;
         font-size: 0.82rem;
       }
+      .build-chip {
+        display: inline-flex;
+        align-items: center;
+        margin-top: 0.9rem;
+        padding: 0.35rem 0.65rem;
+        border: 1px solid rgb(40 116 134 / 22%);
+        border-radius: 999px;
+        background: rgb(40 116 134 / 7%);
+        color: #287486;
+        font-size: 0.75rem;
+        font-variant-numeric: tabular-nums;
+        font-weight: 650;
+        letter-spacing: 0.02em;
+      }
       @media (prefers-color-scheme: dark) {
         :root {
           color: #e3f3f5;
@@ -103,6 +118,11 @@
           border-color: rgb(213 239 242 / 10%);
           color: #8ba5ab;
         }
+        .build-chip {
+          border-color: rgb(116 196 210 / 24%);
+          background: rgb(116 196 210 / 9%);
+          color: #91d5df;
+        }
       }
     </style>
   </head>
@@ -116,7 +136,13 @@
         your project contact.
       </p>
       <p class="status">Courier Registry online</p>
-      <footer>Uploaded datasets are independently verified before they are marked complete.</footer>
+      <footer>
+        Uploaded datasets are independently verified before they are marked complete.
+        <br />
+        <span class="build-chip" id="registry-build" aria-live="polite">
+          Registry build info loading
+        </span>
+      </footer>
     </main>
   </body>
 </html>

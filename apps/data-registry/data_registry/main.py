@@ -7,6 +7,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .api import router
+from .build_info import REGISTRY_VERSION
 from .config import Settings, get_settings
 from .logging_config import configure_logging
 from .middleware import SecurityMiddleware
@@ -24,7 +25,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     application = FastAPI(
         title="Icy Seas Data Registry",
-        version="0.1.0",
+        version=REGISTRY_VERSION,
         lifespan=lifespan,
         docs_url=None if settings.environment != "development" else "/docs",
         redoc_url=None if settings.environment != "development" else "/redoc",
@@ -40,7 +41,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             headers={
                 "Cache-Control": "public, max-age=300",
                 "Content-Security-Policy": (
-                    "default-src 'none'; style-src 'unsafe-inline'; "
+                    "default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; "
+                    "connect-src 'self'; "
                     "img-src 'self'; frame-ancestors 'none'; base-uri 'none'"
                 ),
             },
@@ -52,6 +54,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             Path(__file__).parent / "landing" / "favicon.svg",
             media_type="image/svg+xml",
             headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    @application.get("/landing.js", include_in_schema=False)
+    def landing_script() -> FileResponse:
+        return FileResponse(
+            Path(__file__).parent / "landing" / "landing.js",
+            media_type="text/javascript",
+            headers={"Cache-Control": "public, max-age=300"},
         )
 
     application.include_router(router)

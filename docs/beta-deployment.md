@@ -69,7 +69,8 @@ Cloudflare Free and Pro plans limit request bodies to 100 MB. Courier therefore 
 Back up existing state before upgrading. Build the shared Registry image first, then start the isolated stack. The manually managed tunnel runs separately on the host:
 
 ```bash
-docker compose build data-registry
+# The public landing page reports this image's commit alongside the Registry version.
+REGISTRY_BUILD_ID=$(git rev-parse --short HEAD) docker compose build data-registry
 docker compose up -d postgres seaweedfs data-registry courier-gateway ingest-worker
 docker compose ps
 docker compose logs --tail=100 courier-gateway data-registry ingest-worker
@@ -80,6 +81,7 @@ The Registry container applies Alembic migrations before starting. Validate thro
 ```bash
 curl --fail https://courier.icyseascolab.io/
 curl --fail https://courier.icyseascolab.io/health
+curl --fail https://courier.icyseascolab.io/api/v1/version
 curl --fail https://courier.icyseascolab.io/ready
 ```
 

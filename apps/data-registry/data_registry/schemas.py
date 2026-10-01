@@ -16,6 +16,12 @@ class SystemConfigResponse(BaseModel):
     hash_algorithm: HashAlgorithm
 
 
+class BuildInfoResponse(BaseModel):
+    service: str
+    version: str
+    build: str
+
+
 class AdminAuthenticationStatus(BaseModel):
     configured: bool
 
