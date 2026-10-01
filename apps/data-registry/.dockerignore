@@ -3,4 +3,4 @@ __pycache__
 .pytest_cache
 .ruff_cache
 tests
-
+data_registry/_build_id.py

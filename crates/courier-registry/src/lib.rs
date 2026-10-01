@@ -11,7 +11,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use courier_core::{
-    FileRecord, HashAlgorithm, Transfer, TransportMemberRecord, TransportObjectRecord,
+    FileRecord, HashAlgorithm, RetryPolicy, Transfer, TransportMemberRecord, TransportObjectRecord,
 };
 use courier_transfer::{MultipartStore, RemotePart, StoreError, UploadSession};
 use reqwest::{Client, StatusCode, header::HeaderMap};
@@ -109,6 +109,13 @@ pub struct RegistryDownloadPlan {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegistrySystemConfig {
     pub hash_algorithm: HashAlgorithm,
+}
+
+#[derive(Debug)]
+pub struct RegistryDiagnosticProbe {
+    pub health: String,
+    pub readiness: String,
+    pub version: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -266,6 +273,37 @@ fn http_client() -> Client {
 }
 
 impl RegistryClient {
+    /// Read-only, unauthenticated checks for a failed transfer's support report.
+    /// Never includes request bodies, credentials, or signed object URLs.
+    pub async fn diagnostic_probe(&self) -> RegistryDiagnosticProbe {
+        let client = match Client::builder()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(4))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                let failure = format!("probe unavailable: {error}");
+                return RegistryDiagnosticProbe {
+                    health: failure.clone(),
+                    readiness: failure.clone(),
+                    version: failure,
+                };
+            }
+        };
+        let (health, readiness, version) = tokio::join!(
+            probe_status(&client, format!("{}/health", self.base_url)),
+            probe_status(&client, format!("{}/ready", self.base_url)),
+            probe_version(&client, format!("{}/api/v1/version", self.base_url)),
+        );
+        RegistryDiagnosticProbe {
+            health,
+            readiness,
+            version,
+        }
+    }
+
     pub async fn system_config(&self) -> Result<RegistrySystemConfig, RegistryError> {
         self.send_json(
             self.http
@@ -541,7 +579,7 @@ impl RegistryClient {
         source_name: &str,
         hash_algorithm: HashAlgorithm,
     ) -> Result<RegistryTransfer, RegistryError> {
-        self.send_json(
+        self.send_upload_json(
             self.authorized(
                 self.http
                     .post(format!("{}/api/v1/transfers", self.base_url)),
@@ -638,7 +676,7 @@ impl RegistryClient {
         server_transfer_id: &str,
         manifest_snapshot: &str,
     ) -> Result<ManifestReceipt, RegistryError> {
-        self.send_json(
+        self.send_upload_json(
             self.authorized(self.http.put(format!(
                 "{}/api/v1/transfers/{server_transfer_id}/manifest",
                 self.base_url
@@ -653,7 +691,7 @@ impl RegistryClient {
         &self,
         server_transfer_id: &str,
     ) -> Result<RegistryTransfer, RegistryError> {
-        self.send_json(self.authorized(self.http.post(format!(
+        self.send_upload_json(self.authorized(self.http.post(format!(
             "{}/api/v1/transfers/{server_transfer_id}/finalize",
             self.base_url
         )))?)
@@ -724,6 +762,100 @@ impl RegistryClient {
             });
         }
         Ok(response.json().await?)
+    }
+
+    async fn send_upload_json<T: DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<T, RegistryError> {
+        let policy = RetryPolicy::default();
+        for attempt in 0..policy.max_attempts {
+            let mut replay = request.try_clone().ok_or_else(|| {
+                RegistryError::State("upload request cannot be safely replayed".into())
+            })?;
+            if let Some(auth) = &self.auth {
+                let token = auth
+                    .lock()
+                    .map_err(|_| {
+                        RegistryError::State("Registry credentials are unavailable".into())
+                    })?
+                    .access_token
+                    .clone();
+                replay = replay.bearer_auth(token);
+            }
+            match self.send_json(replay).await {
+                Ok(value) => return Ok(value),
+                Err(error)
+                    if upload_request_retryable(&error) && attempt + 1 < policy.max_attempts =>
+                {
+                    tokio::time::sleep(policy.delay(attempt)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("the default retry policy permits at least one attempt")
+    }
+}
+
+async fn probe_status(client: &Client, url: String) -> String {
+    match client.get(url).send().await {
+        Ok(response) => format!("HTTP {}", response.status()),
+        Err(error) if error.is_timeout() => "timed out".into(),
+        Err(error) if error.is_connect() => "connection failed".into(),
+        Err(_) => "request failed".into(),
+    }
+}
+
+async fn probe_version(client: &Client, url: String) -> String {
+    let mut response = match client.get(url).send().await {
+        Ok(response) => response,
+        Err(error) if error.is_timeout() => return "timed out".into(),
+        Err(error) if error.is_connect() => return "connection failed".into(),
+        Err(_) => return "request failed".into(),
+    };
+    let status = response.status();
+    if !status.is_success() {
+        return format!("HTTP {status}");
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > 2048)
+    {
+        return "response too large".into();
+    }
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len() + chunk.len() > 2048 {
+                    return "response too large".into();
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(_) => return "response unreadable".into(),
+        }
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return "invalid version response".into();
+    };
+    let version = value.get("version").and_then(serde_json::Value::as_str);
+    let build = value.get("build").and_then(serde_json::Value::as_str);
+    match (version, build) {
+        (Some(version), Some(build)) if version.len() <= 80 && build.len() <= 80 => {
+            format!("version {version:?}, build {build:?}")
+        }
+        _ => "invalid version response".into(),
+    }
+}
+
+fn upload_request_retryable(error: &RegistryError) -> bool {
+    match error {
+        RegistryError::Rejected { status, .. } => RetryPolicy::retries_http_status(status.as_u16()),
+        RegistryError::Transport(error) => {
+            error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
+        }
+        _ => false,
     }
 }
 
@@ -1090,7 +1222,7 @@ fn map_status(status: StatusCode, detail: String) -> StoreError {
     match status.as_u16() {
         401 | 403 => StoreError::AuthorizationExpired,
         404 => StoreError::UploadNotFound,
-        408 | 425 | 429 | 500..=599 => StoreError::Transient(detail),
+        code if RetryPolicy::retries_http_status(code) => StoreError::Transient(detail),
         _ => StoreError::Permanent(detail),
     }
 }
@@ -1100,21 +1232,17 @@ async fn map_object_store_response(response: reqwest::Response) -> StoreError {
     let destination = response.url().host_str().map(str::to_owned);
     let headers = response.headers().clone();
     let body = response_body_preview(response).await;
-    let (detail, cloudflare, cloudflare_challenge) =
+    let (detail, _cloudflare, cloudflare_challenge) =
         object_store_response_detail(status, destination.as_deref(), &headers, &body);
 
     if cloudflare_challenge {
         return StoreError::Permanent(detail);
     }
 
-    // A Cloudflare-generated 400 is not an S3 validation result. It can be a
-    // transient edge or tunnel failure, and every retry obtains a fresh
-    // presigned URL before replaying the idempotent part PUT.
-    if cloudflare && status == StatusCode::BAD_REQUEST {
-        StoreError::Transient(detail)
-    } else {
-        map_status(status, detail)
-    }
+    // Each multipart part attempt obtains a fresh presigned URL before
+    // replaying the same part. Keep HTTP failures within the bounded retry
+    // policy even when a proxy or object store reports a client error.
+    map_status(status, detail)
 }
 
 async fn response_body_preview(response: reqwest::Response) -> String {
@@ -1322,6 +1450,10 @@ mod tests {
     #[test]
     fn status_mapping_preserves_retry_and_authorization_meaning() {
         assert!(matches!(
+            map_status(StatusCode::BAD_REQUEST, String::new()),
+            StoreError::Transient(_)
+        ));
+        assert!(matches!(
             map_status(StatusCode::UNAUTHORIZED, String::new()),
             StoreError::AuthorizationExpired
         ));
@@ -1331,6 +1463,14 @@ mod tests {
         ));
         assert!(matches!(
             map_status(StatusCode::UNPROCESSABLE_ENTITY, String::new()),
+            StoreError::Transient(_)
+        ));
+        assert!(matches!(
+            map_status(StatusCode::NOT_FOUND, String::new()),
+            StoreError::UploadNotFound
+        ));
+        assert!(matches!(
+            map_status(StatusCode::PAYLOAD_TOO_LARGE, String::new()),
             StoreError::Permanent(_)
         ));
     }
@@ -1391,13 +1531,89 @@ mod tests {
         assert!(detail.contains("destination s3.icyseascolab.io"));
         assert!(detail.contains("cf-ray a1b2c3d4-SEA"));
         assert!(matches!(
-            if cloudflare {
-                StoreError::Transient(detail)
-            } else {
-                StoreError::Permanent(detail)
-            },
+            map_status(StatusCode::BAD_REQUEST, detail),
             StoreError::Transient(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn upload_request_replays_after_plain_bad_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for (status, body) in [
+                ("400 Bad Request", r#"{"detail":"edge rejected request"}"#),
+                ("200 OK", r#"{"value":"accepted"}"#),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert_ne!(read, 0);
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                assert!(String::from_utf8_lossy(&request).starts_with("GET /probe "));
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        #[derive(Deserialize)]
+        struct Response {
+            value: String,
+        }
+        let client = RegistryClient::unauthenticated(format!("http://{address}"));
+        let result: Response = client
+            .send_upload_json(client.http.get(format!("http://{address}/probe")))
+            .await
+            .unwrap();
+        assert_eq!(result.value, "accepted");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn diagnostic_probe_collects_public_status_and_version() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert_ne!(read, 0);
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let request = String::from_utf8_lossy(&request);
+                assert!(!request.to_ascii_lowercase().contains("authorization:"));
+                let body = if request.starts_with("GET /api/v1/version ") {
+                    r#"{"service":"Registry","version":"1.2.3","build":"abc123"}"#
+                } else {
+                    assert!(
+                        request.starts_with("GET /health ") || request.starts_with("GET /ready ")
+                    );
+                    r#"{"status":"ok"}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let probe = RegistryClient::unauthenticated(format!("http://{address}"))
+            .diagnostic_probe()
+            .await;
+        assert_eq!(probe.health, "HTTP 200 OK");
+        assert_eq!(probe.readiness, "HTTP 200 OK");
+        assert_eq!(probe.version, "version \"1.2.3\", build \"abc123\"");
+        server.join().unwrap();
     }
 
     #[test]

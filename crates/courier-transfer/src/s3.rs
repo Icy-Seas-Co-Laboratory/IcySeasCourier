@@ -244,10 +244,10 @@ where
         return match code {
             "NoSuchUpload" => StoreError::UploadNotFound,
             "ExpiredToken" | "RequestExpired" => StoreError::AuthorizationExpired,
-            "InternalError" | "RequestTimeout" | "ServiceUnavailable" | "SlowDown" => {
-                StoreError::Transient(format!("S3 service error {code}"))
+            "EntityTooLarge" | "RequestEntityTooLarge" => {
+                StoreError::Permanent(format!("S3 service error {code}: {error:?}"))
             }
-            _ => StoreError::Permanent(format!("S3 service error {code}: {error:?}")),
+            _ => StoreError::Transient(format!("S3 service error {code}: {error:?}")),
         };
     }
     match error {

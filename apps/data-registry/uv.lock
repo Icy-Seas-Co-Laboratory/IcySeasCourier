@@ -497,7 +497,7 @@ wheels = [
 
 [[package]]
 name = "icy-seas-data-registry"
-version = "0.1.0"
+version = "0.3.2"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },

@@ -28,7 +28,7 @@ impl RetryPolicy {
     }
 
     pub fn retries_http_status(status: u16) -> bool {
-        matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+        (400..=599).contains(&status) && !matches!(status, 404 | 413)
     }
 }
 
@@ -37,7 +37,12 @@ mod tests {
     use super::*;
     #[test]
     fn classifies_transient_statuses() {
+        assert!(RetryPolicy::retries_http_status(400));
+        assert!(RetryPolicy::retries_http_status(401));
+        assert!(RetryPolicy::retries_http_status(422));
         assert!(RetryPolicy::retries_http_status(503));
-        assert!(!RetryPolicy::retries_http_status(401));
+        assert!(!RetryPolicy::retries_http_status(404));
+        assert!(!RetryPolicy::retries_http_status(413));
+        assert!(!RetryPolicy::retries_http_status(302));
     }
 }

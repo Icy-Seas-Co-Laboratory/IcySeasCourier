@@ -1,6 +1,6 @@
 [project]
 name = "icy-seas-data-registry"
-version = "0.1.0"
+version = "0.3.2"
 description = "Control plane for reliable Icy Seas scientific dataset ingestion"
 requires-python = ">=3.12"
 dependencies = [

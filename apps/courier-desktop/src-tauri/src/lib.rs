@@ -2929,6 +2929,7 @@ fn run_upload(
                 "error",
                 format!("Upload interrupted for local transfer {transfer_id}: {error}"),
             );
+            record_upload_failure_diagnostics(&app, &store, &transfer, &database);
             return Err(error);
         }
     }
@@ -2962,6 +2963,106 @@ fn pause_download(runtime: State<'_, RuntimeState>, transfer_id: String) -> Resu
         .ok_or_else(|| "Dataset is not currently being retrieved".to_string())?;
     pause.store(true, Ordering::Release);
     Ok(())
+}
+
+fn record_upload_failure_diagnostics(
+    app: &AppHandle,
+    store: &TransferStore,
+    transfer: &Transfer,
+    database: &Path,
+) {
+    let source = match fs::metadata(&transfer.source_root) {
+        Ok(metadata) if metadata.is_dir() => "accessible directory".to_string(),
+        Ok(_) => "no longer a directory".to_string(),
+        Err(error) => format!("unavailable ({:?})", error.kind()),
+    };
+    let local_state = match fs::metadata(database) {
+        Ok(metadata) => format!("accessible, {} bytes", metadata.len()),
+        Err(error) => format!("unavailable ({:?})", error.kind()),
+    };
+    let processors = std::thread::available_parallelism()
+        .map(|count| count.get().to_string())
+        .unwrap_or_else(|_| "unknown".into());
+    record_diagnostic(
+        app,
+        "info",
+        format!(
+            "Upload failure environment: Courier {}, platform {} {}, logical bytes {}, source {}, local state {}, available processors {}",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            transfer.original_bytes,
+            source,
+            local_state,
+            processors,
+        ),
+    );
+
+    let base_url = store
+        .transfer_registry(transfer.id)
+        .ok()
+        .flatten()
+        .or_else(|| configured_registry_url(store).ok());
+    if let Some(base_url) = base_url.and_then(|value| normalize_registry_url(&value).ok()) {
+        let probe = tauri::async_runtime::block_on(
+            RegistryClient::unauthenticated(&base_url).diagnostic_probe(),
+        );
+        record_diagnostic(
+            app,
+            "info",
+            format!(
+                "Registry postmortem check at {base_url}: health {}, readiness {}, version {}",
+                probe.health, probe.readiness, probe.version,
+            ),
+        );
+    } else {
+        record_diagnostic(
+            app,
+            "warning",
+            "Registry postmortem check unavailable: no valid Registry origin",
+        );
+    }
+    match save_last_upload_failure_report(app, database) {
+        Ok(path) => record_diagnostic(
+            app,
+            "info",
+            format!("Saved upload failure diagnostics to {}", path.display()),
+        ),
+        Err(error) => record_diagnostic(
+            app,
+            "warning",
+            format!("Could not save upload failure diagnostics: {error}"),
+        ),
+    }
+}
+
+fn save_last_upload_failure_report(app: &AppHandle, database: &Path) -> Result<PathBuf, String> {
+    let events = app
+        .state::<RuntimeState>()
+        .diagnostics
+        .lock()
+        .map_err(|_| "diagnostic events are unavailable".to_string())?
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let path = database.with_file_name("courier-last-upload-failure.txt");
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).map_err(display)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(display)?;
+    }
+    file.write_all(diagnostic_report(&events).as_bytes())
+        .map_err(display)?;
+    Ok(path)
 }
 
 fn emit_upload_activity(
@@ -3071,7 +3172,7 @@ fn diagnostic_events(runtime: State<'_, RuntimeState>) -> Result<Vec<DiagnosticE
 }
 
 #[tauri::command]
-fn open_diagnostics_window(app: AppHandle) -> Result<(), String> {
+async fn open_diagnostics_window(app: AppHandle) -> Result<(), String> {
     let window = if let Some(window) = app.get_webview_window("diagnostics") {
         window
     } else {

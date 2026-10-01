@@ -17,6 +17,8 @@ manifests retain their recorded algorithm.
 
 The Data Registry is Courier's control plane. It manages projects, distinct upload and read-only download invitations, short-lived access sessions with rotating refresh credentials, transfers, provenance, and audit events. Download invitations dynamically list only completed, verified transfers in their authorized projects. Dataset bytes never pass through FastAPI: the API issues short-lived object URLs and Courier performs verified reconstruction locally.
 
+The Registry has its own version in `pyproject.toml`. Increase it and refresh `uv.lock` whenever deployable Registry code changes; CI enforces this. Docker images automatically stamp a `src-...` fingerprint of the packaged source, and `REGISTRY_BUILD_ID` can override it with a commit ID. The landing page and `/api/v1/version` report both values.
+
 ## Development
 
 ```bash

@@ -69,12 +69,15 @@ Cloudflare Free and Pro plans limit request bodies to 100 MB. Courier therefore 
 Back up existing state before upgrading. Build the shared Registry image first, then start the isolated stack. The manually managed tunnel runs separately on the host:
 
 ```bash
-# The public landing page reports this image's commit alongside the Registry version.
-REGISTRY_BUILD_ID=$(git rev-parse --short HEAD) docker compose build data-registry
+# The image automatically reports a fingerprint of its Registry source.
+docker compose build data-registry
+# Optional: REGISTRY_BUILD_ID=$(git rev-parse --short HEAD) docker compose build data-registry
 docker compose up -d postgres seaweedfs data-registry courier-gateway ingest-worker
 docker compose ps
 docker compose logs --tail=100 courier-gateway data-registry ingest-worker
 ```
+
+The Registry version comes from `apps/data-registry/pyproject.toml`; bump it and refresh `uv.lock` for each deployable backend change. CI checks the bump. If no build ID is supplied, the image reports a deterministic `src-...` fingerprint of its packaged source. An explicit `REGISTRY_BUILD_ID` can show the Git commit instead.
 
 The Registry container applies Alembic migrations before starting. Validate through the public HTTPS endpoint:
 

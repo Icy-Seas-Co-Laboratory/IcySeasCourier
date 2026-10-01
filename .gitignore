@@ -6,6 +6,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 *.pyc
+apps/data-registry/data_registry/_build_id.py
 /.courier/
 /.signing/
 /exports/

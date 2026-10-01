@@ -37,7 +37,7 @@ services:
     build:
       context: apps/data-registry
       args:
-        REGISTRY_BUILD_ID: ${REGISTRY_BUILD_ID:-local}
+        REGISTRY_BUILD_ID: ${REGISTRY_BUILD_ID:-}
     environment:
       REGISTRY_ENVIRONMENT: ${REGISTRY_ENVIRONMENT:-development}
       REGISTRY_DATABASE_URL: postgresql+psycopg://registry:${POSTGRES_PASSWORD:-registry}@postgres:5432/registry
@@ -99,7 +99,7 @@ services:
     build:
       context: apps/data-registry
       args:
-        REGISTRY_BUILD_ID: ${REGISTRY_BUILD_ID:-local}
+        REGISTRY_BUILD_ID: ${REGISTRY_BUILD_ID:-}
     command: ["python", "-m", "data_registry.worker"]
     environment:
       REGISTRY_ENVIRONMENT: ${REGISTRY_ENVIRONMENT:-development}

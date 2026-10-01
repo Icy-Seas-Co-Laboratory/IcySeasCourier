@@ -70,10 +70,16 @@ jobs:
         working-directory: apps/data-registry
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
           enable-cache: true
+      - name: Require Registry version bump for backend changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python ../../scripts/check-registry-version.py "$BASE_SHA"
       - run: uv sync --dev --locked
       - run: uv run ruff check .
       - run: uv run ruff format --check .
