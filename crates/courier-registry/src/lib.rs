@@ -14,7 +14,10 @@ use courier_core::{
     FileRecord, HashAlgorithm, RetryPolicy, Transfer, TransportMemberRecord, TransportObjectRecord,
 };
 use courier_transfer::{MultipartStore, RemotePart, StoreError, UploadSession};
-use reqwest::{Client, StatusCode, header::HeaderMap};
+use reqwest::{
+    Client, StatusCode,
+    header::{AUTHORIZATION, HeaderMap, HeaderValue},
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -745,7 +748,7 @@ impl RegistryClient {
             .map_err(|_| RegistryError::State("Registry credentials are unavailable".into()))?
             .access_token
             .clone();
-        Ok(request.bearer_auth(bearer))
+        replace_bearer_auth(request, &bearer)
     }
 
     async fn send_json<T: DeserializeOwned>(
@@ -797,8 +800,7 @@ impl RegistryClient {
                 state.access_token = session.access_token.clone();
                 state.refresh_token = Some(session.refresh_token.clone());
             }
-            response = retry
-                .bearer_auth(&session.access_token)
+            response = replace_bearer_auth(retry, &session.access_token)?
                 .send()
                 .await
                 .inspect_err(|error| {
@@ -836,7 +838,7 @@ impl RegistryClient {
                     })?
                     .access_token
                     .clone();
-                replay = replay.bearer_auth(token);
+                replay = replace_bearer_auth(replay, &token)?;
             }
             match self.send_json(replay).await {
                 Ok(value) => return Ok(value),
@@ -858,6 +860,20 @@ impl RegistryClient {
         }
         unreachable!("the default retry policy permits at least one attempt")
     }
+}
+
+fn replace_bearer_auth(
+    request: reqwest::RequestBuilder,
+    token: &str,
+) -> Result<reqwest::RequestBuilder, RegistryError> {
+    let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|_| RegistryError::State("Registry credentials are invalid".into()))?;
+    value.set_sensitive(true);
+    let mut headers = HeaderMap::new();
+    headers.insert(AUTHORIZATION, value);
+    // RequestBuilder::bearer_auth appends. Upload retries and session refreshes
+    // must replace the prior value so the wire request has one Authorization.
+    Ok(request.headers(headers))
 }
 
 async fn probe_status(client: &Client, url: String) -> String {
@@ -1839,6 +1855,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manifest_upload_sends_one_authorization_header_and_preserves_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let header_end = request
+                .windows(4)
+                .position(|bytes| bytes == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            assert!(headers.starts_with("PUT /api/v1/transfers/ISC-TR-TEST/manifest HTTP/1.1"));
+            let auth = headers
+                .lines()
+                .filter(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+                .collect::<Vec<_>>();
+            assert_eq!(auth, ["authorization: Bearer access-token"]);
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .and_then(|value| value.parse::<usize>().ok())
+                })
+                .unwrap();
+            while request.len() - header_end < length {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            assert_eq!(
+                &request[header_end..header_end + length],
+                br#"{"test":true}"#
+            );
+            let body = r#"{"transfer_id":"ISC-TR-TEST","manifest_sha256":"digest","files":[],"transport_objects":[]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let client = RegistryClient::renewable(
+            format!("http://{address}"),
+            "access-token",
+            "refresh-token",
+            Arc::new(|_| Ok(())),
+        );
+        let receipt = client
+            .submit_manifest("ISC-TR-TEST", r#"{"test":true}"#)
+            .await
+            .unwrap();
+        assert_eq!(receipt.transfer_id, "ISC-TR-TEST");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn diagnostic_probe_collects_public_status_and_version() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -1940,6 +2020,15 @@ mod tests {
                 }
                 let request = String::from_utf8_lossy(&request);
                 assert!(request.contains(expected));
+                let authorization = request
+                    .lines()
+                    .filter(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+                    .collect::<Vec<_>>();
+                match index {
+                    0 => assert_eq!(authorization, ["authorization: Bearer old-access"]),
+                    1 => assert!(authorization.is_empty()),
+                    _ => assert_eq!(authorization, ["authorization: Bearer new-access"]),
+                }
                 let (status, body) = match index {
                     0 => ("401 Unauthorized", r#"{"detail":"expired"}"#),
                     1 => (

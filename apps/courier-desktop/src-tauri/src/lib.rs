@@ -2981,7 +2981,8 @@ fn record_upload_failure_diagnostics(
 ) {
     let source = match fs::metadata(&transfer.source_root) {
         Ok(metadata) if metadata.is_dir() => "accessible directory".to_string(),
-        Ok(_) => "no longer a directory".to_string(),
+        Ok(metadata) if metadata.is_file() => "accessible file".to_string(),
+        Ok(_) => "unsupported source type".to_string(),
         Err(error) => format!("unavailable ({:?})", error.kind()),
     };
     let local_state = match fs::metadata(database) {
