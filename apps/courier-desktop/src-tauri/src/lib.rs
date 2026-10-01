@@ -2585,6 +2585,14 @@ fn run_upload(
             &device_unlocked,
         )
         .await?;
+        let diagnostic_app = app.clone();
+        let client = client.with_diagnostic_observer(Arc::new(move |level, message| {
+            record_diagnostic(
+                &diagnostic_app,
+                level,
+                format!("Upload {transfer_id}: {message}"),
+            );
+        }));
         emit_upload_activity(
             &app,
             transfer_id,

@@ -253,6 +253,7 @@ pub struct RegistryClient {
     auth: Option<Arc<Mutex<AuthState>>>,
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
     session_observer: Option<SessionObserver>,
+    diagnostic_observer: Option<DiagnosticObserver>,
     http: Client,
 }
 
@@ -263,6 +264,7 @@ struct AuthState {
 }
 
 type SessionObserver = Arc<dyn Fn(&RegistrySession) -> Result<(), String> + Send + Sync>;
+type DiagnosticObserver = Arc<dyn Fn(&str, String) + Send + Sync>;
 
 fn http_client() -> Client {
     Client::builder()
@@ -492,6 +494,7 @@ impl RegistryClient {
             auth: None,
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             session_observer: None,
+            diagnostic_observer: None,
             http: http_client(),
         }
     }
@@ -505,6 +508,7 @@ impl RegistryClient {
             }))),
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             session_observer: None,
+            diagnostic_observer: None,
             http: http_client(),
         }
     }
@@ -523,7 +527,19 @@ impl RegistryClient {
             }))),
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             session_observer: Some(session_observer),
+            diagnostic_observer: None,
             http: http_client(),
+        }
+    }
+
+    pub fn with_diagnostic_observer(mut self, observer: DiagnosticObserver) -> Self {
+        self.diagnostic_observer = Some(observer);
+        self
+    }
+
+    fn observe(&self, level: &str, message: String) {
+        if let Some(observer) = &self.diagnostic_observer {
+            observer(level, message);
         }
     }
 
@@ -561,14 +577,22 @@ impl RegistryClient {
             .post(format!("{}/api/v1/auth/sessions/refresh", self.base_url))
             .json(&RefreshRequest { refresh_token })
             .send()
-            .await?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(RegistryError::Rejected {
-                status,
-                detail: response.text().await.unwrap_or_default(),
-            });
+            .await
+            .inspect_err(|error| {
+                self.observe(
+                    "warning",
+                    format!(
+                        "Registry session refresh POST transport failed ({})",
+                        transport_category(error)
+                    ),
+                );
+            })?;
+        if !response.status().is_success() {
+            let error = registry_rejection(response, "Registry session refresh", "POST").await;
+            self.observe("warning", error.to_string());
+            return Err(error);
         }
+        self.observe("info", "Registry session refresh succeeded".into());
         Ok(response.json().await?)
     }
 
@@ -729,11 +753,32 @@ impl RegistryClient {
         request: reqwest::RequestBuilder,
     ) -> Result<T, RegistryError> {
         let retry = request.try_clone();
-        let mut response = request.send().await?;
+        let method = retry
+            .as_ref()
+            .and_then(reqwest::RequestBuilder::try_clone)
+            .and_then(|request| request.build().ok())
+            .map(|request| request.method().to_string())
+            .unwrap_or_else(|| "unknown".into());
+        let mut response = request.send().await.inspect_err(|error| {
+            self.observe(
+                "warning",
+                format!(
+                    "Registry {method} request transport failed ({})",
+                    transport_category(error)
+                ),
+            );
+        })?;
         if response.status() == StatusCode::UNAUTHORIZED
             && let (Some(auth), Some(observer), Some(retry)) =
                 (&self.auth, &self.session_observer, retry)
         {
+            self.observe(
+                "info",
+                format!(
+                    "Registry {method} {} returned HTTP 401; attempting session refresh",
+                    response.url().path()
+                ),
+            );
             let _guard = self.refresh_lock.lock().await;
             let refresh_token = auth
                 .lock()
@@ -752,14 +797,24 @@ impl RegistryClient {
                 state.access_token = session.access_token.clone();
                 state.refresh_token = Some(session.refresh_token.clone());
             }
-            response = retry.bearer_auth(&session.access_token).send().await?;
+            response = retry
+                .bearer_auth(&session.access_token)
+                .send()
+                .await
+                .inspect_err(|error| {
+                    self.observe(
+                        "warning",
+                        format!(
+                            "Registry {method} request after session refresh failed ({})",
+                            transport_category(error)
+                        ),
+                    );
+                })?;
         }
-        let status = response.status();
-        if !status.is_success() {
-            return Err(RegistryError::Rejected {
-                status,
-                detail: response.text().await.unwrap_or_default(),
-            });
+        if !response.status().is_success() {
+            let error = registry_rejection(response, "Registry request", &method).await;
+            self.observe("warning", error.to_string());
+            return Err(error);
         }
         Ok(response.json().await?)
     }
@@ -788,6 +843,14 @@ impl RegistryClient {
                 Err(error)
                     if upload_request_retryable(&error) && attempt + 1 < policy.max_attempts =>
                 {
+                    self.observe(
+                        "info",
+                        format!(
+                            "Retrying Registry upload request after attempt {} of {}",
+                            attempt + 1,
+                            policy.max_attempts
+                        ),
+                    );
                     tokio::time::sleep(policy.delay(attempt)).await;
                 }
                 Err(error) => return Err(error),
@@ -1114,7 +1177,14 @@ impl MultipartStore for RegistryMultipartStore {
                     {
                         return Err(StoreError::Paused);
                     }
-                    break result.map_err(map_transport)?;
+                    break result.map_err(|error| {
+                        let error = map_transport(error);
+                        self.client.observe(
+                            "warning",
+                            format!("Object-store part {part_number} PUT transport failed: {error}"),
+                        );
+                        error
+                    })?;
                 }
                 _ = tokio::time::sleep(Duration::from_millis(25)), if pause.is_some() => {
                     if pause
@@ -1127,7 +1197,12 @@ impl MultipartStore for RegistryMultipartStore {
             }
         };
         if !response.status().is_success() {
-            return Err(map_object_store_response(response).await);
+            let error = map_object_store_response(response).await;
+            self.client.observe(
+                "warning",
+                format!("Object-store part {part_number} PUT failed: {error}"),
+            );
+            return Err(error);
         }
         let etag = response
             .headers()
@@ -1206,15 +1281,33 @@ fn map_registry_error(error: RegistryError) -> StoreError {
     }
 }
 
+fn transport_category(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connection"
+    } else if error.is_body() {
+        "request body"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "other"
+    }
+}
+
 fn map_transport(error: reqwest::Error) -> StoreError {
     // A request can fail after it has been built and while its body is being
     // sent (for example, if the connection is reset). Those are transport
     // failures too, and retrying the same multipart part is safe. Builder and
     // other local/configuration errors remain permanent.
-    if error.is_timeout() || error.is_connect() || error.is_request() || error.is_body() {
-        StoreError::Transient(error.to_string())
+    let retryable =
+        error.is_timeout() || error.is_connect() || error.is_request() || error.is_body();
+    // reqwest errors may carry a presigned URL. Never persist its query string.
+    let detail = error.without_url().to_string();
+    if retryable {
+        StoreError::Transient(detail)
     } else {
-        StoreError::Permanent(error.to_string())
+        StoreError::Permanent(detail)
     }
 }
 
@@ -1225,6 +1318,84 @@ fn map_status(status: StatusCode, detail: String) -> StoreError {
         code if RetryPolicy::retries_http_status(code) => StoreError::Transient(detail),
         _ => StoreError::Permanent(detail),
     }
+}
+
+async fn registry_rejection(
+    response: reqwest::Response,
+    phase: &str,
+    method: &str,
+) -> RegistryError {
+    let status = response.status();
+    let host = response.url().host_str().map(str::to_owned);
+    let path = response.url().path().to_owned();
+    let headers = response.headers().clone();
+    let body = response_body_preview(response).await;
+    RegistryError::Rejected {
+        status,
+        detail: registry_response_detail(
+            phase,
+            method,
+            status,
+            host.as_deref(),
+            &path,
+            &headers,
+            &body,
+        ),
+    }
+}
+
+fn registry_response_detail(
+    phase: &str,
+    method: &str,
+    status: StatusCode,
+    host: Option<&str>,
+    path: &str,
+    headers: &HeaderMap,
+    body: &str,
+) -> String {
+    let mut evidence = vec![
+        format!("HTTP {status}"),
+        format!("method {method}"),
+        format!("path {path}"),
+    ];
+    if let Some(host) = host {
+        evidence.push(format!("destination {host}"));
+    }
+    for name in [
+        "cf-ray",
+        "cf-error-type",
+        "cf-error-origin",
+        "server",
+        "content-type",
+        "x-request-id",
+    ] {
+        if let Some(value) = header_value(headers, name) {
+            evidence.push(format!("{name} {value}"));
+        }
+    }
+    let body_kind = if body.is_empty() {
+        "empty"
+    } else if body.trim_start().starts_with('<') {
+        if body.to_ascii_lowercase().contains("cloudflare") {
+            "HTML mentioning Cloudflare"
+        } else {
+            "HTML"
+        }
+    } else if serde_json::from_str::<serde_json::Value>(body).is_ok() {
+        "JSON"
+    } else {
+        "other"
+    };
+    evidence.push(format!("response type {body_kind}"));
+    let mut detail = format!("{phase} rejected ({})", evidence.join("; "));
+    // Authentication responses can contain credentials or invitation details.
+    // Their status, headers, and body type are enough to investigate edge errors.
+    if !path.starts_with("/api/v1/auth/")
+        && let Some(preview) = safe_response_preview(body)
+    {
+        detail.push_str(&format!(". Response preview: {preview}"));
+    }
+    detail
 }
 
 async fn map_object_store_response(response: reqwest::Response) -> StoreError {
@@ -1534,6 +1705,98 @@ mod tests {
             map_status(StatusCode::BAD_REQUEST, detail),
             StoreError::Transient(_)
         ));
+    }
+
+    #[test]
+    fn registry_refresh_diagnostics_identify_edge_response_without_credentials() {
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-ray", "abc123-SEA".parse().unwrap());
+        headers.insert("cf-error-type", "400".parse().unwrap());
+        headers.insert("cf-error-origin", "validation".parse().unwrap());
+        headers.insert("server", "cloudflare".parse().unwrap());
+        headers.insert("content-type", "text/html".parse().unwrap());
+        let detail = registry_response_detail(
+            "Registry session refresh",
+            "POST",
+            StatusCode::BAD_REQUEST,
+            Some("courier.example.test"),
+            "/api/v1/auth/sessions/refresh",
+            &headers,
+            "<html>cloudflare refresh_token=private-value</html>",
+        );
+        assert!(detail.contains("Registry session refresh rejected"));
+        assert!(detail.contains("HTTP 400 Bad Request"));
+        assert!(detail.contains("method POST"));
+        assert!(detail.contains("cf-ray abc123-SEA"));
+        assert!(detail.contains("cf-error-origin validation"));
+        assert!(detail.contains("response type HTML mentioning Cloudflare"));
+        assert!(!detail.contains("private-value"));
+        assert!(matches!(
+            map_status(StatusCode::BAD_REQUEST, detail),
+            StoreError::Transient(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_reports_the_cloudflare_response_after_authorization_expires() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for (path, status, body) in [
+                (
+                    "/api/v1/transfers/ISC-TR-TEST",
+                    "401 Unauthorized",
+                    "expired",
+                ),
+                (
+                    "/api/v1/auth/sessions/refresh",
+                    "400 Bad Request",
+                    "<html>cloudflare private-refresh-token</html>",
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                assert!(String::from_utf8_lossy(&request).contains(path));
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nServer: cloudflare\r\nCF-Ray: example-SEA\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let events = observed.clone();
+        let client = RegistryClient::renewable(
+            format!("http://{address}"),
+            "private-access-token",
+            "private-refresh-token",
+            Arc::new(|_| Ok(())),
+        )
+        .with_diagnostic_observer(Arc::new(move |_, message| {
+            events.lock().unwrap().push(message);
+        }));
+
+        let error = client.transfer_status("ISC-TR-TEST").await.unwrap_err();
+        server.join().unwrap();
+        let messages = observed.lock().unwrap().join("\n");
+        assert!(messages.contains("returned HTTP 401; attempting session refresh"));
+        assert!(messages.contains("Registry session refresh rejected"));
+        assert!(messages.contains("cf-ray example-SEA"));
+        assert!(matches!(
+            error,
+            RegistryError::Rejected {
+                status: StatusCode::BAD_REQUEST,
+                ..
+            }
+        ));
+        assert!(!messages.contains("private-refresh-token"));
+        assert!(!error.to_string().contains("private-refresh-token"));
     }
 
     #[tokio::test]
