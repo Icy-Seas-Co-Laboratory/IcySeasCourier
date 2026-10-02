@@ -13,10 +13,11 @@ pub struct MultipartLimits {
 impl Default for MultipartLimits {
     fn default() -> Self {
         Self {
-            // Stay below Cloudflare's 100 MB request limit on Free and Pro plans.
-            target_part_size: 64 * 1024 * 1024,
+            // Leave time for slower uploads to finish before Cloudflare's
+            // 125-second proxy read timeout.
+            target_part_size: 16 * 1024 * 1024,
             minimum_part_size: 5 * 1024 * 1024,
-            maximum_part_size: 5 * 1024 * 1024 * 1024,
+            maximum_part_size: 64 * 1024 * 1024,
             maximum_parts: 10_000,
         }
     }
@@ -112,12 +113,19 @@ mod tests {
     }
 
     #[test]
-    fn default_parts_fit_through_cloudflare_free_and_pro() {
+    fn default_parts_leave_room_for_slow_cloudflare_uploads() {
         assert_eq!(
             MultipartLimits::default().target_part_size,
+            16 * 1024 * 1024
+        );
+        assert_eq!(
+            MultipartLimits::default().minimum_part_size,
+            5 * 1024 * 1024
+        );
+        assert_eq!(
+            MultipartLimits::default().maximum_part_size,
             64 * 1024 * 1024
         );
-        assert!(MultipartLimits::default().target_part_size < 100_000_000);
     }
 
     #[test]

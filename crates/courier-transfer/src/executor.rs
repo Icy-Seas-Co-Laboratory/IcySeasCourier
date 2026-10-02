@@ -1,12 +1,14 @@
 use std::io::ErrorKind;
 
 use courier_core::{
-    CourierError, FileRecord, PartStatus, RetryPolicy, TransferStore, verify_source_unchanged,
+    CourierError, FileRecord, PartRecord, PartStatus, RetryPolicy, TransferStore,
+    verify_source_unchanged,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::{
-    MultipartStore, ReconcileError, RemotePart, StoreError, UploadSession, reconcile_file,
+    MultipartLimits, MultipartStore, PlanError, ReconcileError, RemotePart, StoreError,
+    UploadSession, plan_parts, reconcile_file,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +32,8 @@ pub trait UploadObserver: Send + Sync {
     fn part_confirmed(&self, _event: PartUploadEvent) {}
 
     fn reconciled(&self, _source_bytes_confirmed: u64) {}
+
+    fn part_plan_revised(&self, _previous_parts: usize, _new_parts: usize, _target_bytes: u64) {}
 }
 
 struct NoopObserver;
@@ -47,6 +51,8 @@ pub enum UploadError {
     Local(#[from] CourierError),
     #[error(transparent)]
     Reconcile(#[from] ReconcileError),
+    #[error(transparent)]
+    Plan(#[from] PlanError),
     #[error(transparent)]
     Remote(#[from] StoreError),
     #[error("part {part_number} exhausted {attempts} attempts: {source}")]
@@ -108,6 +114,16 @@ pub async fn upload_missing_parts_observed(
     }
     let (session, existing) = reconcile_with_retry(database, store, file, retry).await?;
     let mut parts = database.parts_for_file(file.id)?;
+    if let Some(replanned) = replan_large_unconfirmed_parts(file.id, file.size, &parts)? {
+        let previous_parts = parts.len();
+        database.replace_part_plan(file.id, &replanned)?;
+        observer.part_plan_revised(
+            previous_parts,
+            replanned.len(),
+            MultipartLimits::default().target_part_size,
+        );
+        parts = replanned;
+    }
     observer.reconciled(
         parts
             .iter()
@@ -215,6 +231,62 @@ pub async fn upload_missing_parts_observed(
             .map(|part| part.source_length)
             .sum(),
     })
+}
+
+/// After remote reconciliation, retain the accepted prefix and split only its
+/// unconfirmed tail. Multipart part numbers and ETags in that prefix stay put.
+fn replan_large_unconfirmed_parts(
+    file_id: uuid::Uuid,
+    file_size: u64,
+    parts: &[PartRecord],
+) -> Result<Option<Vec<PartRecord>>, PlanError> {
+    let limits = MultipartLimits::default();
+    let confirmed_prefix = parts
+        .iter()
+        .take_while(|part| part.status == PartStatus::Complete)
+        .count();
+    let tail = &parts[confirmed_prefix..];
+    if tail.is_empty()
+        || tail.iter().any(|part| part.status == PartStatus::Complete)
+        || tail
+            .iter()
+            .all(|part| part.source_length <= limits.target_part_size)
+    {
+        return Ok(None);
+    }
+    let mut next_offset = 0_u64;
+    for (index, part) in parts.iter().enumerate() {
+        if part.file_id != file_id
+            || part.part_number != index as u32 + 1
+            || part.source_offset != next_offset
+        {
+            return Err(PlanError::InvalidLimits);
+        }
+        next_offset = next_offset
+            .checked_add(part.source_length)
+            .ok_or(PlanError::InvalidLimits)?;
+    }
+    if next_offset != file_size {
+        return Err(PlanError::InvalidLimits);
+    }
+    let Some(remaining) = file_size.checked_sub(tail[0].source_offset) else {
+        return Err(PlanError::InvalidLimits);
+    };
+    let Some(available_parts) = limits.maximum_parts.checked_sub(confirmed_prefix as u32) else {
+        return Err(PlanError::InvalidLimits);
+    };
+    let tail_limits = MultipartLimits {
+        maximum_parts: available_parts,
+        ..limits
+    };
+    let mut new_tail = plan_parts(file_id, remaining, tail_limits)?;
+    for part in &mut new_tail {
+        part.part_number += confirmed_prefix as u32;
+        part.source_offset += tail[0].source_offset;
+    }
+    let mut replanned = parts[..confirmed_prefix].to_vec();
+    replanned.extend(new_tail);
+    Ok(Some(replanned))
 }
 
 async fn reconcile_with_retry(
@@ -330,6 +402,86 @@ mod tests {
     use super::*;
     use crate::{MultipartLimits, RemotePart, UploadSession, plan_parts};
 
+    #[test]
+    fn splits_only_the_unconfirmed_tail_of_an_older_multipart_plan() {
+        const MIB: u64 = 1024 * 1024;
+        let mut database = TransferStore::open_in_memory().unwrap();
+        let transfer = Transfer::draft(PathBuf::from("/source"), None);
+        database.create_transfer(&transfer).unwrap();
+        let file = FileRecord {
+            id: Uuid::new_v4(),
+            transfer_id: transfer.id,
+            relative_path: "large.bin".into(),
+            absolute_path: "/source/large.bin".into(),
+            size: 128 * MIB,
+            mtime_ns: 1,
+            hash_algorithm: courier_core::HashAlgorithm::Sha256,
+            sha256: "unused".into(),
+            status: FileStatus::Ready,
+            bytes_completed: 0,
+        };
+        database
+            .replace_inventory(transfer.id, std::slice::from_ref(&file))
+            .unwrap();
+        let old_plan = plan_parts(
+            file.id,
+            file.size,
+            MultipartLimits {
+                target_part_size: 64 * MIB,
+                ..MultipartLimits::default()
+            },
+        )
+        .unwrap();
+        database.replace_part_plan(file.id, &old_plan).unwrap();
+        database
+            .reconcile_remote_parts(file.id, &[(1, "accepted-etag".into())])
+            .unwrap();
+
+        let current = database.parts_for_file(file.id).unwrap();
+        let replanned = replan_large_unconfirmed_parts(file.id, file.size, &current)
+            .unwrap()
+            .unwrap();
+        database.replace_part_plan(file.id, &replanned).unwrap();
+        let saved = database.parts_for_file(file.id).unwrap();
+        assert_eq!(saved.len(), 5);
+        assert_eq!(saved[0], current[0]);
+        assert_eq!(saved[0].etag.as_deref(), Some("accepted-etag"));
+        for (index, part) in saved.iter().enumerate().skip(1) {
+            assert_eq!(part.part_number, index as u32 + 1);
+            assert_eq!(part.source_offset, (64 + (index as u64 - 1) * 16) * MIB);
+            assert_eq!(part.source_length, 16 * MIB);
+            assert_eq!(part.status, PartStatus::Pending);
+        }
+        assert_eq!(
+            database.files_for_transfer(transfer.id).unwrap()[0].bytes_completed,
+            64 * MIB
+        );
+    }
+
+    #[test]
+    fn splits_a_failed_first_part_into_sixteen_mib_ranges() {
+        const MIB: u64 = 1024 * 1024;
+        let file_id = Uuid::new_v4();
+        let mut old = plan_parts(
+            file_id,
+            64 * MIB,
+            MultipartLimits {
+                target_part_size: 64 * MIB,
+                ..MultipartLimits::default()
+            },
+        )
+        .unwrap();
+        old[0].status = PartStatus::Failed;
+        old[0].attempt_count = 8;
+        let new = replan_large_unconfirmed_parts(file_id, 64 * MIB, &old)
+            .unwrap()
+            .unwrap();
+        assert_eq!(new.len(), 4);
+        assert!(new.iter().all(|part| part.source_length == 16 * MIB));
+        assert_eq!(new[0].source_offset, 0);
+        assert_eq!(new[3].source_offset, 48 * MIB);
+        assert!(new.iter().all(|part| part.status == PartStatus::Pending));
+    }
     #[derive(Default)]
     struct FlakyStore {
         attempts: Mutex<HashMap<u32, u32>>,

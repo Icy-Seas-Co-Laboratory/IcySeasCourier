@@ -244,8 +244,8 @@ impl TransferStore {
             .map_err(Into::into)
     }
 
-    pub fn replace_part_plan(&mut self, file_id: Uuid, parts: &[PartRecord]) -> Result<()> {
-        let tx = self.conn.transaction()?;
+    pub fn replace_part_plan(&self, file_id: Uuid, parts: &[PartRecord]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
         let is_transport_object = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM transport_objects WHERE id=?1)",
             [file_id.to_string()],
@@ -264,6 +264,7 @@ impl TransferStore {
             for part in parts {
                 tx.execute("INSERT INTO parts (file_id,part_number,source_offset,source_length,transport_length,checksum,etag,attempt_count,status,last_error) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![part.file_id.to_string(), part.part_number, part.source_offset, part.source_length, part.transport_length, part.checksum, part.etag, part.attempt_count, part.status.to_string(), part.last_error])?;
             }
+            tx.execute("UPDATE files SET bytes_completed=COALESCE((SELECT SUM(source_length) FROM parts WHERE file_id=?1 AND status='complete'),0) WHERE id=?1", [file_id.to_string()])?;
         }
         tx.commit()?;
         Ok(())

@@ -62,7 +62,7 @@ The S3 hostname is required. The Registry returns presigned URLs built from `REG
 
 Cloudflare supplies the original scheme and client address headers. The loopback gateway preserves those headers and has a fixed Docker address; Registry trusts only that address to supply them. Registry prefers `CF-Connecting-IP` over `X-Forwarded-For` for Cloudflare traffic. This is what allows `REGISTRY_REQUIRE_HTTPS=true` while the local tunnel origin remains HTTP.
 
-Cloudflare Free and Pro plans limit request bodies to 100 MB. Courier therefore uses 64 MiB multipart parts. A cache-bypass rule for `s3.icyseascolab.io` is recommended; S3 upload requests must not be transformed. Confirm that zone settings do not reduce the maximum upload size below 64 MiB.
+Cloudflare Free and Pro plans limit request bodies to 100 MB, and proxied requests can time out before a slow upload finishes. Courier uses 16 MiB multipart parts by default and can split the unfinished tail of an older 64 MiB plan after reconciling accepted S3 parts. S3 requires each nonfinal part to be at least 5 MiB. A cache-bypass rule for `s3.icyseascolab.io` is recommended; S3 upload requests must not be transformed. Confirm that zone settings do not reduce the maximum upload size below 64 MiB, which the planner can require for objects near S3's 10,000-part limit.
 
 ## Start and validate services
 

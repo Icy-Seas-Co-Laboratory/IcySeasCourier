@@ -1469,6 +1469,21 @@ impl UploadObserver for DesktopObserver {
         self.pause.load(Ordering::Acquire)
     }
 
+    fn part_plan_revised(&self, previous_parts: usize, new_parts: usize, target_bytes: u64) {
+        record_diagnostic(
+            &self.app,
+            "info",
+            format!(
+                "Upload {}: reconciled accepted S3 parts and split the unfinished upload of {} from {} to {} parts ({} MiB target)",
+                self.transfer_id,
+                self.current_file,
+                previous_parts,
+                new_parts,
+                target_bytes / (1024 * 1024),
+            ),
+        );
+    }
+
     fn part_confirmed(&self, event: PartUploadEvent) {
         let object_confirmed = self
             .object_confirmed_transport_bytes

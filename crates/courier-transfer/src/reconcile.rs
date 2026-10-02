@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use courier_core::{FileRecord, TransferStore};
 
 use crate::{MultipartStore, RemotePart, StoreError, UploadSession};
@@ -12,6 +10,12 @@ pub enum ReconcileError {
     Remote(#[from] StoreError),
     #[error("remote upload contains unexpected part {0}")]
     UnexpectedRemotePart(u32),
+    #[error("remote part {part_number} has {remote_size} bytes; local plan expects {planned_size}")]
+    RemotePartSizeMismatch {
+        part_number: u32,
+        remote_size: u64,
+        planned_size: u64,
+    },
 }
 
 /// Starts or resumes one file upload, then makes local confirmed-part state
@@ -42,16 +46,26 @@ pub async fn reconcile_file(
     };
 
     let remote = store.list_parts(&session).await?;
-    let expected: HashSet<u32> = database
+    let planned = database
         .parts_for_file(file.id)?
         .into_iter()
-        .map(|part| part.part_number)
-        .collect();
+        .map(|part| (part.part_number, part.source_length))
+        .collect::<std::collections::HashMap<_, _>>();
     if let Some(part) = remote
         .iter()
-        .find(|part| !expected.contains(&part.part_number))
+        .find(|part| !planned.contains_key(&part.part_number))
     {
         return Err(ReconcileError::UnexpectedRemotePart(part.part_number));
+    }
+    for part in &remote {
+        let planned_size = planned[&part.part_number];
+        if part.size != 0 && part.size != planned_size {
+            return Err(ReconcileError::RemotePartSizeMismatch {
+                part_number: part.part_number,
+                remote_size: part.size,
+                planned_size,
+            });
+        }
     }
     let confirmed: Vec<(u32, String)> = remote
         .iter()
@@ -176,5 +190,22 @@ mod tests {
         assert_eq!(parts[0].etag.as_deref(), Some("accepted-before-crash"));
         assert_eq!(parts[0].status, courier_core::PartStatus::Complete);
         assert_eq!(parts[1].status, courier_core::PartStatus::Pending);
+
+        store.parts.lock().unwrap().insert(
+            "upload-1".into(),
+            vec![RemotePart {
+                part_number: 1,
+                etag: "unexpected-size".into(),
+                size: 6,
+            }],
+        );
+        assert!(matches!(
+            reconcile_file(&database, &store, &file).await,
+            Err(ReconcileError::RemotePartSizeMismatch {
+                part_number: 1,
+                remote_size: 6,
+                planned_size: 5,
+            })
+        ));
     }
 }
