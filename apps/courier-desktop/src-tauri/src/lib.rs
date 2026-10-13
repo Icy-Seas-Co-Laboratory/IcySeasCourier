@@ -37,6 +37,7 @@ struct RuntimeState {
     session_gate: Arc<tokio::sync::Mutex<()>>,
     device_unlocked: Arc<AtomicBool>,
     diagnostics: Mutex<VecDeque<DiagnosticEvent>>,
+    live_objects: Mutex<HashMap<Uuid, LiveObjectProgress>>,
 }
 
 impl Default for RuntimeState {
@@ -48,6 +49,7 @@ impl Default for RuntimeState {
             session_gate: Arc::new(tokio::sync::Mutex::new(())),
             device_unlocked: Arc::new(AtomicBool::new(!cfg!(target_os = "macos"))),
             diagnostics: Mutex::new(VecDeque::new()),
+            live_objects: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -71,6 +73,85 @@ struct TransferProgressEvent {
     total_bytes: u64,
     current_file: String,
     status: &'static str,
+}
+
+#[derive(Clone)]
+struct LiveObjectProgress {
+    object_id: Uuid,
+    phase: &'static str,
+    confirmed_bytes: u64,
+    sent_bytes: u64,
+    total_bytes: Option<u64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileProgressView {
+    id: Uuid,
+    relative_path: String,
+    size: u64,
+    status: &'static str,
+    packed: bool,
+    active: bool,
+    confirmed_bytes: u64,
+    sent_bytes: u64,
+    transport_bytes: Option<u64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileProgressPage {
+    files: Vec<FileProgressView>,
+    total: u64,
+    offset: u64,
+    limit: u64,
+}
+
+fn update_live_object(app: &AppHandle, transfer_id: Uuid, progress: LiveObjectProgress) {
+    if let Ok(mut objects) = app.state::<RuntimeState>().live_objects.lock() {
+        objects.insert(transfer_id, progress);
+    }
+}
+
+fn file_progress_label(
+    file_status: FileStatus,
+    transfer_status: TransferStatus,
+    live_phase: Option<&'static str>,
+    paused: bool,
+    running: bool,
+) -> &'static str {
+    if file_status == FileStatus::Uploaded {
+        return if transfer_status == TransferStatus::Complete {
+            "Verified"
+        } else {
+            "Uploaded"
+        };
+    }
+    if file_status == FileStatus::SourceModified {
+        return "Source changed";
+    }
+    if file_status == FileStatus::Failed {
+        return "Failed";
+    }
+    if transfer_status == TransferStatus::Paused {
+        return "Paused";
+    }
+    if paused {
+        return "Pausing";
+    }
+    if transfer_status == TransferStatus::Uploading && !running {
+        return "Waiting to resume";
+    }
+    if transfer_status == TransferStatus::Uploading {
+        if let Some(phase) = live_phase {
+            return phase;
+        }
+    }
+    match transfer_status {
+        TransferStatus::Interrupted => "Waiting to resume",
+        TransferStatus::Failed => "Not uploaded",
+        _ => "Queued",
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -1459,6 +1540,7 @@ struct DesktopObserver {
     base_confirmed: u64,
     total: u64,
     current_file: String,
+    object_id: Uuid,
     object_original_bytes: u64,
     object_transport_bytes: u64,
     object_confirmed_transport_bytes: Arc<AtomicU64>,
@@ -1493,6 +1575,21 @@ impl UploadObserver for DesktopObserver {
             .base_confirmed
             .saturating_add(self.scaled(object_confirmed));
         self.confirmed.store(confirmed, Ordering::Relaxed);
+        update_live_object(
+            &self.app,
+            self.transfer_id,
+            LiveObjectProgress {
+                object_id: self.object_id,
+                phase: "Uploading",
+                confirmed_bytes: self
+                    .object_confirmed_transport_bytes
+                    .load(Ordering::Relaxed),
+                sent_bytes: self
+                    .object_confirmed_transport_bytes
+                    .load(Ordering::Relaxed),
+                total_bytes: Some(self.object_transport_bytes),
+            },
+        );
         let _ = self.app.emit(
             "courier://progress",
             TransferProgressEvent {
@@ -1513,6 +1610,21 @@ impl UploadObserver for DesktopObserver {
             .base_confirmed
             .saturating_add(self.scaled(source_bytes_confirmed));
         self.confirmed.store(confirmed, Ordering::Relaxed);
+        update_live_object(
+            &self.app,
+            self.transfer_id,
+            LiveObjectProgress {
+                object_id: self.object_id,
+                phase: "Uploading",
+                confirmed_bytes: self
+                    .object_confirmed_transport_bytes
+                    .load(Ordering::Relaxed),
+                sent_bytes: self
+                    .object_confirmed_transport_bytes
+                    .load(Ordering::Relaxed),
+                total_bytes: Some(self.object_transport_bytes),
+            },
+        );
         let _ = self.app.emit(
             "courier://progress",
             TransferProgressEvent {
@@ -2325,6 +2437,84 @@ async fn list_transfers(app: AppHandle) -> Result<Vec<Transfer>, String> {
 }
 
 #[tauri::command]
+async fn transfer_file_status(
+    app: AppHandle,
+    transfer_id: Uuid,
+    offset: u64,
+) -> Result<FileProgressPage, String> {
+    let database = database_path(&app)?;
+    let runtime = app.state::<RuntimeState>();
+    let live = runtime
+        .live_objects
+        .lock()
+        .map_err(display)?
+        .get(&transfer_id)
+        .cloned();
+    let (running, paused) = {
+        let controls = runtime.controls.lock().map_err(display)?;
+        let control = controls.get(&transfer_id);
+        (
+            control.is_some(),
+            control.is_some_and(|flag| flag.load(Ordering::Acquire)),
+        )
+    };
+    let live = if running { live } else { None };
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = TransferStore::open(database).map_err(display)?;
+        let transfer = store
+            .get_transfer(transfer_id)
+            .map_err(display)?
+            .ok_or_else(|| "Transfer not found".to_string())?;
+        let page = store
+            .transfer_file_progress(transfer_id, offset, 100, live.as_ref().map(|p| p.object_id))
+            .map_err(display)?;
+        let files = page
+            .files
+            .into_iter()
+            .map(|file| {
+                let active = live
+                    .as_ref()
+                    .filter(|p| Some(p.object_id) == file.object_id);
+                let confirmed = active.map_or(file.object_confirmed_bytes, |p| {
+                    p.confirmed_bytes.max(file.object_confirmed_bytes)
+                });
+                FileProgressView {
+                    id: file.id,
+                    relative_path: file.relative_path.to_string_lossy().into_owned(),
+                    size: file.size,
+                    status: file_progress_label(
+                        file.status,
+                        transfer.status,
+                        active.map(|p| p.phase),
+                        paused,
+                        running,
+                    ),
+                    packed: file.kind == Some(TransportObjectKind::Pack),
+                    active: active.is_some()
+                        && running
+                        && !paused
+                        && transfer.status == TransferStatus::Uploading
+                        && file.status != FileStatus::Uploaded,
+                    confirmed_bytes: confirmed,
+                    sent_bytes: active.map_or(confirmed, |p| p.sent_bytes.max(confirmed)),
+                    transport_bytes: active
+                        .and_then(|p| p.total_bytes)
+                        .or(file.object_transport_bytes),
+                }
+            })
+            .collect();
+        Ok(FileProgressPage {
+            files,
+            total: page.total,
+            offset: page.offset,
+            limit: page.limit,
+        })
+    })
+    .await
+    .map_err(display)?
+}
+
+#[tauri::command]
 async fn transfer_sizes(app: AppHandle, transfer_id: Uuid) -> Result<TransferSizes, String> {
     let database = database_path(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
@@ -2742,6 +2932,17 @@ fn run_upload(
                 confirmed.fetch_add(object.original_bytes, Ordering::Relaxed);
                 continue;
             }
+            update_live_object(
+                &app,
+                transfer_id,
+                LiveObjectProgress {
+                    object_id: object.id,
+                    phase: "Preparing",
+                    confirmed_bytes: 0,
+                    sent_bytes: 0,
+                    total_bytes: object.transport_bytes,
+                },
+            );
             let source = match object.kind {
                 TransportObjectKind::File => {
                     let member = object_members
@@ -2782,6 +2983,7 @@ fn run_upload(
                         format!("Uploading packed group ({} files)", object_members.len())
                     }
                 },
+                object_id: object.id,
                 object_original_bytes: object.original_bytes,
                 object_transport_bytes: source.size,
                 object_confirmed_transport_bytes: object_confirmed_transport_bytes.clone(),
@@ -2800,6 +3002,18 @@ fn run_upload(
                     source.size
                 ),
             );
+            update_live_object(
+                &app,
+                transfer_id,
+                LiveObjectProgress {
+                    object_id: object.id,
+                    phase: "Uploading",
+                    confirmed_bytes: 0,
+                    sent_bytes: 0,
+                    total_bytes: Some(source.size),
+                },
+            );
+            let progress_object_id = object.id;
             let progress_app = app.clone();
             let progress_file = observer.current_file.clone();
             let progress_object_original = object.original_bytes;
@@ -2825,6 +3039,17 @@ fn run_upload(
                         transport_sent,
                         progress_object_original,
                         progress_object_transport,
+                    );
+                    update_live_object(
+                        &progress_app,
+                        transfer_id,
+                        LiveObjectProgress {
+                            object_id: progress_object_id,
+                            phase: "Uploading",
+                            confirmed_bytes: progress_confirmed_transport.load(Ordering::Relaxed),
+                            sent_bytes: transport_sent.min(progress_object_transport),
+                            total_bytes: Some(progress_object_transport),
+                        },
                     );
                     let _ = progress_app.emit(
                         "courier://progress",
@@ -2853,9 +3078,23 @@ fn run_upload(
             if observer.should_pause() {
                 return Err(UploadError::Paused.to_string());
             }
+            update_live_object(
+                &app,
+                transfer_id,
+                LiveObjectProgress {
+                    object_id: object.id,
+                    phase: "Finalizing file",
+                    confirmed_bytes: source.size,
+                    sent_bytes: source.size,
+                    total_bytes: Some(source.size),
+                },
+            );
             complete_uploaded_file(&store, &remote, &source, &retry)
                 .await
                 .map_err(display)?;
+            if let Ok(mut objects) = app.state::<RuntimeState>().live_objects.lock() {
+                objects.remove(&transfer_id);
+            }
             for member in object_members {
                 store.mark_file_uploaded(member.file_id).map_err(display)?;
             }
@@ -2899,6 +3138,9 @@ fn run_upload(
         Ok(())
     });
 
+    if let Ok(mut objects) = app.state::<RuntimeState>().live_objects.lock() {
+        objects.remove(&transfer_id);
+    }
     match result {
         Ok(()) => {
             store
@@ -3246,6 +3488,79 @@ fn save_diagnostic_report(
     Ok(())
 }
 
+/// The SQLite outbox is independent of the in-memory diagnostics ring. Run
+/// synchronization outside the upload worker so outages never block dataset bytes.
+fn start_transfer_event_sync(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut cursor = None;
+        loop {
+            let worker_app = app.clone();
+            if let Ok(Ok(next)) = tauri::async_runtime::spawn_blocking(move || {
+                sync_pending_transfer_events(&worker_app, cursor)
+            })
+            .await
+            {
+                cursor = next;
+            }
+            tokio::time::sleep(Duration::from_secs(15)).await;
+        }
+    });
+}
+
+fn sync_pending_transfer_events(
+    app: &AppHandle,
+    after: Option<Uuid>,
+) -> Result<Option<Uuid>, String> {
+    let database = database_path(app)?;
+    let runtime = app.state::<RuntimeState>();
+    let credential_cache = runtime.credentials.clone();
+    let session_gate = runtime.session_gate.clone();
+    let device_unlocked = runtime.device_unlocked.clone();
+    let store = TransferStore::open(&database).map_err(display)?;
+    let mut transfers = store
+        .transfers_with_pending_events(after)
+        .map_err(display)?;
+    if transfers.is_empty() && after.is_some() {
+        transfers = store.transfers_with_pending_events(None).map_err(display)?;
+    }
+    let next = transfers.last().copied();
+    for transfer_id in transfers {
+        let Some(transfer) = store.get_transfer(transfer_id).map_err(display)? else {
+            continue;
+        };
+        let Some(server_transfer_id) = transfer.server_transfer_id.as_deref() else {
+            continue;
+        };
+        let Some(session_id) = store
+            .transfer_registry_session(transfer_id)
+            .map_err(display)?
+        else {
+            continue;
+        };
+        let Some(base_url) = store.transfer_registry(transfer_id).map_err(display)? else {
+            continue;
+        };
+        // Keep errors queued without recursively generating synchronization logs.
+        let _ = tauri::async_runtime::block_on(async {
+            let (client, _) = active_registry_session(
+                &store,
+                &session_id,
+                &normalize_registry_url(&base_url)?,
+                &database,
+                &credential_cache,
+                &session_gate,
+                &device_unlocked,
+            )
+            .await?;
+            client
+                .sync_transfer_events(&store, transfer_id, server_transfer_id)
+                .await
+                .map_err(display)
+        });
+    }
+    Ok(next)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -3264,6 +3579,7 @@ pub fn run() {
                     format!("Local state startup check failed: {error}"),
                 );
             }
+            start_transfer_event_sync(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -3276,6 +3592,7 @@ pub fn run() {
             create_inventory,
             list_transfers,
             transfer_sizes,
+            transfer_file_status,
             clear_transfers,
             clear_incomplete_transfers,
             clear_transfer,
@@ -3301,6 +3618,48 @@ mod tests {
     use filetime::{FileTime, set_file_mtime};
 
     use super::*;
+
+    #[test]
+    fn file_status_keeps_upload_confirmation_distinct_from_verification() {
+        use FileStatus::{Ready, SourceModified, Uploaded};
+        use TransferStatus::{Complete, Interrupted, Paused, Uploading, Verifying};
+        assert_eq!(
+            file_progress_label(Uploaded, Verifying, Some("Uploading"), false, true),
+            "Uploaded"
+        );
+        assert_eq!(
+            file_progress_label(Uploaded, Complete, None, false, false),
+            "Verified"
+        );
+        assert_eq!(
+            file_progress_label(Ready, Uploading, Some("Preparing"), false, true),
+            "Preparing"
+        );
+        assert_eq!(
+            file_progress_label(Ready, Uploading, Some("Uploading"), true, true),
+            "Pausing"
+        );
+        assert_eq!(
+            file_progress_label(Ready, Paused, None, true, true),
+            "Paused"
+        );
+        assert_eq!(
+            file_progress_label(Ready, Interrupted, Some("Uploading"), false, false),
+            "Waiting to resume"
+        );
+        assert_eq!(
+            file_progress_label(Ready, Uploading, None, false, false),
+            "Waiting to resume"
+        );
+        assert_eq!(
+            file_progress_label(SourceModified, Paused, None, true, false),
+            "Source changed"
+        );
+        assert_eq!(
+            file_progress_label(Ready, Uploading, None, false, true),
+            "Queued"
+        );
+    }
 
     #[test]
     fn credential_store_errors_explain_the_local_remediation_boundary() {

@@ -6,7 +6,8 @@ use uuid::Uuid;
 
 use crate::{
     CourierError, FileRecord, PartRecord, RegistrySessionRecord, Result, Transfer,
-    TransportMemberRecord, TransportObjectKind, TransportObjectRecord, model::TransferStatus,
+    TransferFileProgress, TransferFileProgressPage, TransportMemberRecord, TransportObjectKind,
+    TransportObjectRecord, model::TransferStatus,
 };
 
 pub struct TransferStore {
@@ -92,7 +93,80 @@ impl TransferStore {
                 "../migrations/011_immutable_manifest_snapshot.sql"
             ))?;
         }
+        if version < 12 {
+            self.conn
+                .execute_batch(include_str!("../migrations/012_transfer_events.sql"))?;
+        }
         Ok(())
+    }
+
+    pub fn record_transfer_event(
+        &self,
+        transfer_id: Uuid,
+        kind: &str,
+        details: &crate::TransferEventDetails,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO transfer_events(id,transfer_id,occurred_at,kind,details_json) VALUES (?1,?2,?3,?4,?5)",
+            params![Uuid::new_v4().to_string(), transfer_id.to_string(), Utc::now().to_rfc3339(), kind, serde_json::to_string(details)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn pending_transfer_events(
+        &self,
+        transfer_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<crate::TransferEvent>> {
+        let mut query = self.conn.prepare(
+            "SELECT id,occurred_at,kind,details_json FROM transfer_events WHERE transfer_id=?1 AND synced_at IS NULL ORDER BY sequence LIMIT ?2",
+        )?;
+        let rows = query.query_map(params![transfer_id.to_string(), limit.min(100)], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (id, occurred_at, kind, details) = row?;
+            let payload = serde_json::json!({"id":id,"occurred_at":occurred_at,"kind":kind,"details":serde_json::from_str::<serde_json::Value>(&details)?});
+            events.push(serde_json::from_value(payload)?);
+        }
+        Ok(events)
+    }
+
+    /// Acknowledgement retains local history and marks only this transfer's matching UUIDs.
+    pub fn acknowledge_transfer_events(&self, transfer_id: Uuid, ids: &[Uuid]) -> Result<()> {
+        let transaction = self.conn.unchecked_transaction()?;
+        for id in ids {
+            transaction.execute(
+                "UPDATE transfer_events SET synced_at=?1 WHERE transfer_id=?2 AND id=?3",
+                params![
+                    Utc::now().to_rfc3339(),
+                    transfer_id.to_string(),
+                    id.to_string()
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn transfers_with_pending_events(&self, after: Option<Uuid>) -> Result<Vec<Uuid>> {
+        let mut query = self.conn.prepare(
+            "SELECT id FROM transfers WHERE server_transfer_id IS NOT NULL AND id > ?1 AND EXISTS (SELECT 1 FROM transfer_events WHERE transfer_id=transfers.id AND synced_at IS NULL) ORDER BY id LIMIT 20",
+        )?;
+        let ids = query.query_map(
+            [after.map(|id| id.to_string()).unwrap_or_default()],
+            |row| row.get::<_, String>(0),
+        )?;
+        ids.map(|id| {
+            Uuid::parse_str(&id?).map_err(|error| CourierError::Configuration(error.to_string()))
+        })
+        .collect()
     }
 
     pub fn create_transfer(&self, transfer: &Transfer) -> Result<()> {
@@ -242,6 +316,103 @@ impl TransferStore {
         let rows = stmt.query_map([transfer_id.to_string()], row_to_file)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    /// Returns at most 100 logical files without loading inventory or pack membership graphs.
+    /// The active object is a runtime hint; confirmed bytes come only from recovery records.
+    pub fn transfer_file_progress(
+        &self,
+        transfer_id: Uuid,
+        offset: u64,
+        limit: u64,
+        active_object_id: Option<Uuid>,
+    ) -> Result<TransferFileProgressPage> {
+        let limit = limit.clamp(1, 100);
+        let sql_offset = i64::try_from(offset).unwrap_or(i64::MAX);
+        let total = self.conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE transfer_id=?1",
+            [transfer_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let mut statement = self.conn.prepare(
+            "WITH page AS (
+                SELECT f.id,f.relative_path,f.size,f.status,o.id AS object_id,o.kind,
+                       o.transport_bytes,
+                       CASE WHEN o.id=?2 THEN 0 ELSE 1 END AS active_order
+                FROM files f
+                LEFT JOIN transport_members m ON m.file_id=f.id
+                LEFT JOIN transport_objects o ON o.id=m.object_id AND o.transfer_id=f.transfer_id
+                WHERE f.transfer_id=?1
+                ORDER BY active_order, f.status='uploaded', f.relative_path, f.id
+                LIMIT ?3 OFFSET ?4
+             ), confirmed AS (
+                SELECT t.object_id,SUM(t.transport_length) AS bytes
+                FROM (SELECT DISTINCT object_id FROM page WHERE object_id IS NOT NULL) objects
+                JOIN transport_parts t ON t.object_id=objects.object_id
+                WHERE t.status='complete'
+                GROUP BY t.object_id
+             )
+             SELECT p.id,p.relative_path,p.size,p.status,p.object_id,p.kind,p.transport_bytes,
+                    COALESCE(c.bytes,0)
+             FROM page p LEFT JOIN confirmed c ON c.object_id=p.object_id
+             ORDER BY p.active_order,p.status='uploaded',p.relative_path,p.id",
+        )?;
+        let rows = statement.query_map(
+            params![
+                transfer_id.to_string(),
+                active_object_id.map(|id| id.to_string()),
+                limit,
+                sql_offset
+            ],
+            |row| {
+                let parse_id = |column| -> rusqlite::Result<Uuid> {
+                    let value: String = row.get(column)?;
+                    Uuid::parse_str(&value).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            column,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                };
+                let status: String = row.get(3)?;
+                let status = serde_json::from_str(&format!("\"{status}\"")).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                let kind: Option<String> = row.get(5)?;
+                let kind = match kind.as_deref() {
+                    Some("file") => Some(TransportObjectKind::File),
+                    Some("pack") => Some(TransportObjectKind::Pack),
+                    None => None,
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                };
+                Ok(TransferFileProgress {
+                    id: parse_id(0)?,
+                    relative_path: row.get::<_, String>(1)?.into(),
+                    size: row.get(2)?,
+                    status,
+                    object_id: if row.get::<_, Option<String>>(4)?.is_some() {
+                        Some(parse_id(4)?)
+                    } else {
+                        None
+                    },
+                    kind,
+                    object_transport_bytes: row.get(6)?,
+                    object_confirmed_bytes: row.get(7)?,
+                })
+            },
+        )?;
+        let files = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(TransferFileProgressPage {
+            files,
+            total,
+            offset,
+            limit,
+        })
     }
 
     pub fn replace_part_plan(&self, file_id: Uuid, parts: &[PartRecord]) -> Result<()> {
@@ -834,6 +1005,135 @@ mod tests {
     }
 
     #[test]
+    fn failed_event_migration_rolls_back_and_can_be_reopened() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("migration.sqlite");
+        {
+            let store = TransferStore::open(&path).unwrap();
+            let mut names = store
+                .conn
+                .prepare("SELECT name FROM sqlite_master WHERE type='trigger'")
+                .unwrap();
+            let triggers = names
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            drop(names);
+            for name in triggers {
+                store
+                    .conn
+                    .execute_batch(&format!("DROP TRIGGER {name}"))
+                    .unwrap();
+            }
+            store
+                .conn
+                .execute_batch(
+                    "DROP TABLE transfer_events; DELETE FROM schema_migrations WHERE version=12;",
+                )
+                .unwrap();
+            let broken = include_str!("../migrations/012_transfer_events.sql")
+                .replace("COMMIT;", "INVALID SQL; COMMIT;");
+            assert!(store.conn.execute_batch(&broken).is_err());
+            // Dropping the connection after the error rolls back all migration changes.
+        }
+        let store = TransferStore::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 12);
+        // Replaying after a concurrent opener read version 11 is safe too.
+        store
+            .conn
+            .execute_batch(include_str!("../migrations/012_transfer_events.sql"))
+            .unwrap();
+    }
+
+    #[test]
+    fn event_sync_cursor_can_pass_unsynced_older_batches() {
+        let store = TransferStore::open_in_memory().unwrap();
+        for _ in 0..25 {
+            let transfer = Transfer::draft(PathBuf::from("/source"), None);
+            store.create_transfer(&transfer).unwrap();
+            store
+                .bind_registry_transfer(transfer.id, &format!("ISC-TR-{}", transfer.id))
+                .unwrap();
+        }
+        let first = store.transfers_with_pending_events(None).unwrap();
+        assert_eq!(first.len(), 20);
+        let second = store
+            .transfers_with_pending_events(first.last().copied())
+            .unwrap();
+        assert_eq!(second.len(), 5);
+        assert!(second.iter().all(|id| !first.contains(id)));
+        assert!(
+            store
+                .transfers_with_pending_events(second.last().copied())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.transfers_with_pending_events(None).unwrap(), first);
+    }
+
+    #[test]
+    fn event_outbox_survives_restart_and_acknowledges_only_matching_transfer() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("recovery.sqlite");
+        let transfer = Transfer::draft(PathBuf::from("/private/source"), None);
+        let other = Transfer::draft(PathBuf::from("/other"), None);
+        let ids = {
+            let store = TransferStore::open(&path).unwrap();
+            store.create_transfer(&transfer).unwrap();
+            store.create_transfer(&other).unwrap();
+            store
+                .transition(transfer.id, TransferStatus::Inventorying)
+                .unwrap();
+            let events = store.pending_transfer_events(transfer.id, 100).unwrap();
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[1].details.state, Some(TransferStatus::Inventorying));
+            assert!(!serde_json::to_string(&events).unwrap().contains("/private"));
+            events.iter().map(|event| event.id).collect::<Vec<_>>()
+        };
+        let store = TransferStore::open(&path).unwrap();
+        assert_eq!(
+            store
+                .pending_transfer_events(transfer.id, 100)
+                .unwrap()
+                .len(),
+            2
+        );
+        store.acknowledge_transfer_events(other.id, &ids).unwrap();
+        assert_eq!(
+            store
+                .pending_transfer_events(transfer.id, 100)
+                .unwrap()
+                .len(),
+            2
+        );
+        store
+            .acknowledge_transfer_events(transfer.id, &ids)
+            .unwrap();
+        assert!(
+            store
+                .pending_transfer_events(transfer.id, 100)
+                .unwrap()
+                .is_empty()
+        );
+        let retained: u32 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM transfer_events WHERE transfer_id=?1",
+                [transfer.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, 2);
+    }
+
+    #[test]
     fn registry_status_reconciliation_ignores_a_late_verifying_response() {
         let store = TransferStore::open_in_memory().unwrap();
         let transfer = finalizing_transfer(&store);
@@ -1010,6 +1310,168 @@ mod tests {
         );
         assert_eq!(
             store.files_for_transfer(transfer.id).unwrap()[0].bytes_completed,
+            0
+        );
+    }
+
+    #[test]
+    fn file_progress_shares_pack_counters_and_recovers_partial_uploads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.sqlite");
+        let transfer = Transfer::draft("/source".into(), None);
+        let pack_id = Uuid::new_v4();
+        let file_id = Uuid::new_v4();
+        let mut files: Vec<_> = (0..3).map(|_| fixture_file(transfer.id)).collect();
+        files[0].relative_path = "a-standalone.bin".into();
+        files[1].relative_path = "z-pack-first.bin".into();
+        files[2].relative_path = "z-pack-second.bin".into();
+        {
+            let mut store = TransferStore::open(&path).unwrap();
+            store.create_transfer(&transfer).unwrap();
+            store.replace_inventory(transfer.id, &files).unwrap();
+            let objects = [
+                TransportObjectRecord {
+                    id: pack_id,
+                    transfer_id: transfer.id,
+                    kind: TransportObjectKind::Pack,
+                    compression: "zstd".into(),
+                    encoding_version: 2,
+                    original_bytes: 40,
+                    transport_bytes: Some(12),
+                    cache_path: None,
+                },
+                TransportObjectRecord {
+                    id: file_id,
+                    transfer_id: transfer.id,
+                    kind: TransportObjectKind::File,
+                    compression: "none".into(),
+                    encoding_version: 1,
+                    original_bytes: 20,
+                    transport_bytes: Some(20),
+                    cache_path: None,
+                },
+            ];
+            let members = [
+                TransportMemberRecord {
+                    object_id: file_id,
+                    file_id: files[0].id,
+                    member_index: 0,
+                },
+                TransportMemberRecord {
+                    object_id: pack_id,
+                    file_id: files[1].id,
+                    member_index: 0,
+                },
+                TransportMemberRecord {
+                    object_id: pack_id,
+                    file_id: files[2].id,
+                    member_index: 1,
+                },
+            ];
+            store
+                .replace_transport_plan(transfer.id, &objects, &members)
+                .unwrap();
+            for object in &objects {
+                let parts: Vec<_> = (1..=2)
+                    .map(|number| PartRecord {
+                        file_id: object.id,
+                        part_number: number,
+                        source_offset: 0,
+                        source_length: 6,
+                        transport_length: None,
+                        checksum: None,
+                        etag: None,
+                        attempt_count: 0,
+                        status: PartStatus::Pending,
+                        last_error: None,
+                    })
+                    .collect();
+                store.replace_part_plan(object.id, &parts).unwrap();
+            }
+            store
+                .confirm_part(pack_id, 1, "pack-etag", None, 6)
+                .unwrap();
+            store.record_part_failure(pack_id, 2, "retry").unwrap();
+            store
+                .confirm_part(file_id, 1, "file-etag", None, 10)
+                .unwrap();
+            store.mark_file_uploaded(files[0].id).unwrap();
+        }
+        let store = TransferStore::open(&path).unwrap();
+        let page = store
+            .transfer_file_progress(transfer.id, 0, 100, Some(pack_id))
+            .unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(page.files[0].id, files[1].id);
+        assert_eq!(page.files[1].id, files[2].id);
+        for row in &page.files[..2] {
+            assert_eq!(row.kind, Some(TransportObjectKind::Pack));
+            assert_eq!(row.object_transport_bytes, Some(12));
+            assert_eq!(row.object_confirmed_bytes, 6);
+            assert_eq!(row.status, FileStatus::Ready);
+        }
+        assert_eq!(page.files[2].kind, Some(TransportObjectKind::File));
+        assert_eq!(page.files[2].object_confirmed_bytes, 10);
+        assert_eq!(page.files[2].status, FileStatus::Uploaded);
+        // Active standalone object wins even though it is already uploaded.
+        let active = store
+            .transfer_file_progress(transfer.id, 0, 1, Some(file_id))
+            .unwrap();
+        assert_eq!(active.files[0].id, files[0].id);
+        let second = store
+            .transfer_file_progress(transfer.id, 1, 1, Some(file_id))
+            .unwrap();
+        assert_eq!(second.files[0].id, files[1].id);
+        let empty = store
+            .transfer_file_progress(transfer.id, u64::MAX, 100, None)
+            .unwrap();
+        assert!(empty.files.is_empty());
+        assert_eq!(
+            store.get_transfer(transfer.id).unwrap().unwrap().status,
+            TransferStatus::Draft
+        );
+    }
+
+    #[test]
+    fn file_progress_limits_pages_and_handles_inventory_before_planning() {
+        let mut store = TransferStore::open_in_memory().unwrap();
+        let transfer = Transfer::draft("/source".into(), None);
+        store.create_transfer(&transfer).unwrap();
+        let files: Vec<_> = (0..105)
+            .map(|index| {
+                let mut file = fixture_file(transfer.id);
+                file.relative_path = format!("file-{index:03}.bin").into();
+                file
+            })
+            .collect();
+        store.replace_inventory(transfer.id, &files).unwrap();
+        let first = store
+            .transfer_file_progress(transfer.id, 0, u64::MAX, None)
+            .unwrap();
+        assert_eq!(first.limit, 100);
+        assert_eq!(first.files.len(), 100);
+        assert_eq!(first.total, 105);
+        assert!(first.files.iter().all(|row| row.object_id.is_none()
+            && row.kind.is_none()
+            && row.object_transport_bytes.is_none()
+            && row.object_confirmed_bytes == 0));
+        let last = store
+            .transfer_file_progress(transfer.id, 100, 100, None)
+            .unwrap();
+        assert_eq!(last.files.len(), 5);
+        assert_eq!(last.files[0].relative_path, PathBuf::from("file-100.bin"));
+        assert_eq!(
+            store
+                .transfer_file_progress(transfer.id, 0, 0, None)
+                .unwrap()
+                .limit,
+            1
+        );
+        assert_eq!(
+            store
+                .transfer_file_progress(Uuid::new_v4(), 0, 100, None)
+                .unwrap()
+                .total,
             0
         );
     }

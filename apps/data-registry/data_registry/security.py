@@ -87,6 +87,27 @@ def decrypt_totp_secret(value: str, settings: Settings) -> str:
     )
 
 
+def encrypt_invitation_code(code: str, settings: Settings) -> str:
+    key = hashlib.sha256(
+        b"courier-invitation-code-v1\0" + settings.token_pepper.get_secret_value().encode()
+    ).digest()
+    nonce = secrets.token_bytes(12)
+    ciphertext = AESGCM(key).encrypt(nonce, code.encode(), b"courier-invitation-code-v1")
+    return base64.urlsafe_b64encode(nonce + ciphertext).decode("ascii")
+
+
+def decrypt_invitation_code(value: str, settings: Settings) -> str:
+    key = hashlib.sha256(
+        b"courier-invitation-code-v1\0" + settings.token_pepper.get_secret_value().encode()
+    ).digest()
+    payload = base64.urlsafe_b64decode(value.encode("ascii"))
+    return (
+        AESGCM(key)
+        .decrypt(payload[:12], payload[12:], b"courier-invitation-code-v1")
+        .decode("ascii")
+    )
+
+
 def generate_admin_session_token(
     settings: Settings, *, now: datetime | None = None
 ) -> tuple[str, datetime]:

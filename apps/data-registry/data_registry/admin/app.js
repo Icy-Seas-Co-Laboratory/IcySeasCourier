@@ -1,4 +1,4 @@
-const state = { token: "", expiresAt: 0, sessionLifetime: 0, lastActivity: 0, renewing: false, totpConfigured: null, setupPending: false, overview: null, projects: [], invitations: [], transfers: [], audit: [], downloadCommand: "", retrieveCommand: "" };
+const state = { generation: 0, token: "", expiresAt: 0, sessionLifetime: 0, lastActivity: 0, renewing: false, totpConfigured: null, setupPending: false, overview: null, projects: [], invitations: [], transfers: [], audit: [], downloadCommand: "", retrieveCommand: "", project: "", browser: null, logTransfer: "", logOffset: 0 };
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[character]);
@@ -12,26 +12,39 @@ const when = (value) => value ? new Intl.DateTimeFormat(undefined, { dateStyle: 
 const badge = (status) => `<span class="status ${escapeHtml(status)}">${escapeHtml(status)}</span>`;
 
 async function api(path, options = {}) {
+  const generation = state.generation;
   const response = await fetch(`/api/v1/admin${path}`, {
+    cache: "no-store",
     ...options,
     headers: { "Content-Type": "application/json", "Authorization": `Bearer ${state.token}`, ...(options.headers || {}) },
   });
+  if (generation !== state.generation) throw new DOMException('Session changed', 'AbortError');
   if (response.status === 401 && state.token) {
     lockConsole("Your administrator session expired. Sign in again to continue.");
   }
   if (response.status === 204) return null;
   const payload = await response.json().catch(() => ({}));
+  if (generation !== state.generation) throw new DOMException('Session changed', 'AbortError');
   if (!response.ok) throw new Error(typeof payload.detail === "string" ? payload.detail : JSON.stringify(payload.detail || payload));
   return payload;
 }
 
 function lockConsole(message = "") {
+  state.generation++;
   state.token = "";
   state.expiresAt = 0;
   state.sessionLifetime = 0;
   state.renewing = false;
   state.downloadCommand = "";
   state.retrieveCommand = "";
+  state.invitations = [];
+  $$("dialog[open]").forEach((dialog) => dialog.close());
+  $("#dialog-body").replaceChildren();
+  $("#detail-body").replaceChildren();
+  $("#browser-entries").replaceChildren();
+  $("#logs-entries").replaceChildren();
+  $("#project-body").replaceChildren();
+  state.browser = null; state.project = ""; state.logTransfer = "";
   $("#admin-key").value = "";
   $("#totp-code").value = "";
   $("#console").hidden = true;
@@ -110,6 +123,7 @@ async function loadAll() {
   ]);
   Object.assign(state, { overview, projects, invitations, transfers, audit });
   renderAll();
+  if ($("#project-dialog").open && state.project) await showProject(state.project, false);
   $("#last-refresh").textContent = `Updated ${new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
 }
 
@@ -165,11 +179,11 @@ function invitationStatus(item) {
 
 function renderInvitations() {
   if (!state.invitations.length) { $("#invitation-table").innerHTML = `<div class="empty">No invitations have been issued.</div>`; return; }
-  $("#invitation-table").innerHTML = `<table><thead><tr><th>Projects</th><th>Access</th><th>Issued by</th><th>Uses</th><th>Expires</th><th>Status</th><th></th></tr></thead><tbody>${state.invitations.map((item) => { const status = invitationStatus(item); return `<tr><td><strong>${item.project_codes.map(escapeHtml).join(", ")}</strong><span class="sub">${escapeHtml(item.id)}</span></td><td>${badge(item.purpose)}</td><td>${escapeHtml(item.created_by)}</td><td>${item.use_count} / ${item.maximum_uses ?? "unlimited"}</td><td>${when(item.expires_at)}</td><td>${badge(status)}</td><td>${status === "active" ? `<button class="secondary danger" data-revoke="${escapeHtml(item.id)}">Revoke</button>` : ""}</td></tr>`; }).join("")}</tbody></table>`;
+  $("#invitation-table").innerHTML = `<table><thead><tr><th>Projects</th><th>Access</th><th>Issued by</th><th>Uses</th><th>Expires</th><th>Status</th><th></th></tr></thead><tbody>${state.invitations.map((item) => { const status = invitationStatus(item); return `<tr><td><strong>${item.project_codes.map(escapeHtml).join(", ")}</strong><span class="sub">${escapeHtml(item.id)}</span></td><td>${badge(item.purpose)}</td><td>${escapeHtml(item.created_by)}</td><td>${item.use_count} / ${item.maximum_uses ?? "unlimited"}</td><td>${when(item.expires_at)}</td><td>${badge(status)}</td><td><button class="secondary" data-edit-invitation="${escapeHtml(item.id)}">View / edit</button> ${status === "active" ? `<button class="secondary danger" data-revoke="${escapeHtml(item.id)}">Revoke</button>` : ""}</td></tr>`; }).join("")}</tbody></table>`;
 }
 
 function renderProjects() {
-  $("#project-grid").innerHTML = state.projects.length ? state.projects.map((item) => `<article class="card project"><code>${escapeHtml(item.project_code)}</code><h3>${escapeHtml(item.name)}</h3><p>${escapeHtml(item.description || "No description provided.")}</p>${badge(item.status)}<span class="sub">Created ${when(item.created_at)}</span></article>`).join("") : `<div class="empty">No projects yet.</div>`;
+  $("#project-grid").innerHTML = state.projects.length ? state.projects.map((item) => `<article class="card project"><code>${escapeHtml(item.project_code)}</code><h3>${escapeHtml(item.name)}</h3><p>${escapeHtml(item.description || "No description provided.")}</p>${badge(item.status)}<span class="sub">Created ${when(item.created_at)}</span><button class="secondary" data-project="${escapeHtml(item.project_code)}">Open project</button></article>`).join("") : `<div class="empty">No projects yet.</div>`;
 }
 
 function auditList(items) {
@@ -190,11 +204,11 @@ async function showTransfer(id) {
   try {
     const item = await api(`/transfers/${encodeURIComponent(id)}`);
     $("#detail-title").textContent = item.source_name;
-    const retry = item.status === "failed" ? `<button class="secondary danger" data-retry="${escapeHtml(item.transfer_id)}">Retry verification</button>` : "";
-    const download = item.status === "complete" ? `<button class="primary" data-download="${escapeHtml(item.transfer_id)}">Generate download commands</button>` : "";
-    const remove = `<button class="secondary danger" data-delete-transfer="${escapeHtml(item.transfer_id)}">${item.status === "complete" ? "Delete completed transfer" : "Purge incomplete transfer"}</button>`;
+    const retry = item.status === "failed" ? `<button type="button" class="secondary danger" data-retry="${escapeHtml(item.transfer_id)}">Retry verification</button>` : "";
+    const download = item.status === "complete" ? `<button type="button" class="primary" data-download="${escapeHtml(item.transfer_id)}">Generate download commands</button>` : "";
+    const remove = `<button type="button" class="secondary danger" data-delete-transfer="${escapeHtml(item.transfer_id)}">${item.status === "complete" ? "Delete completed transfer" : "Purge incomplete transfer"}</button>`;
     const savings = item.transport_bytes === null || item.original_bytes === 0 ? "—" : `${((1 - item.transport_bytes / item.original_bytes) * 100).toLocaleString(undefined, { maximumFractionDigits: 1 })}%`;
-    $("#detail-body").innerHTML = `<div class="detail-grid"><div><span>Registry ID</span><strong>${escapeHtml(item.transfer_id)}</strong></div><div><span>Project</span><strong>${escapeHtml(item.project_code)}</strong></div><div><span>Status</span><strong>${badge(item.status)}</strong></div><div><span>Digest policy</span><strong>${escapeHtml(item.hash_algorithm.toUpperCase())}</strong></div><div><span>Original data</span><strong>${bytes(item.original_bytes)}</strong></div><div><span>Packaged data</span><strong>${item.transport_bytes === null ? "Pending" : bytes(item.transport_bytes)}</strong></div><div><span>Size reduction</span><strong>${savings}</strong></div><div><span>Files</span><strong>${item.file_count.toLocaleString()}</strong></div><div><span>Attempts</span><strong>${item.verification_attempt_count}</strong></div><div><span>Verified</span><strong>${when(item.verified_at)}</strong></div></div>${item.verification_error ? `<div class="error">${escapeHtml(item.verification_error)}</div>` : ""}<div class="evidence"><span>Canonical manifest SHA-256</span><code>${escapeHtml(item.manifest_sha256 || "Not submitted")}</code></div><div id="download-plan"></div><h3>File verification evidence</h3><div class="table-card">${fileTable(item.files)}</div><div class="dialog-actions">${retry}${download}${remove}</div>`;
+    $("#detail-body").innerHTML = `<div class="detail-grid"><div><span>Registry ID</span><strong>${escapeHtml(item.transfer_id)}</strong></div><div><span>Project</span><strong>${escapeHtml(item.project_code)}</strong></div><div><span>Status</span><strong>${badge(item.status)}</strong></div><div><span>Digest policy</span><strong>${escapeHtml(item.hash_algorithm.toUpperCase())}</strong></div><div><span>Original data</span><strong>${bytes(item.original_bytes)}</strong></div><div><span>Packaged data</span><strong>${item.transport_bytes === null ? "Pending" : bytes(item.transport_bytes)}</strong></div><div><span>Size reduction</span><strong>${savings}</strong></div><div><span>Files</span><strong>${item.file_count.toLocaleString()}</strong></div><div><span>Attempts</span><strong>${item.verification_attempt_count}</strong></div><div><span>Verified</span><strong>${when(item.verified_at)}</strong></div></div>${item.verification_error ? `<div class="error">${escapeHtml(item.verification_error)}</div>` : ""}<div class="evidence"><span>Canonical manifest SHA-256</span><code>${escapeHtml(item.manifest_sha256 || "Not submitted")}</code></div><div id="download-plan"></div><h3>File verification evidence</h3><div class="table-card">${fileTable(item.files)}</div><div class="dialog-actions"><button type="button" class="secondary" data-logs="${escapeHtml(item.transfer_id)}">Transfer logs</button><button type="button" class="secondary" data-browse-project="${escapeHtml(item.project_code)}" data-browse-transfer="${escapeHtml(item.transfer_id)}">Browse files</button>${retry}${download}${remove}</div>`;
     $("#detail-dialog").showModal();
   } catch (error) { setError(error.message); }
 }
@@ -207,7 +221,7 @@ async function generateDownloadPlan(id) {
     ? "This downloads verified Courier transport objects. Pack files still require Courier unpacking to restore the original directory tree."
     : "This transfer contains standalone payloads; use the manifest file list to restore their original names and paths.";
   const commandStyle = "max-height:220px;overflow:auto;padding:11px;border-radius:7px;background:#182b34;color:#e5f2f5;font-size:10px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere";
-  $("#download-plan").innerHTML = `<div class="evidence"><span>Recommended · reconstruct and verify on the Registry host</span><p class="sub">Run from the Courier deployment directory. The completed dataset appears under the configured export directory.</p><pre id="retrieve-command" style="${commandStyle}">${escapeHtml(plan.server_retrieve_command)}</pre><button class="secondary" data-copy-retrieve>Copy retrieval command</button></div><div class="evidence"><span>Raw S3 transport objects · links expire in ${Math.round(plan.expires_in_seconds / 60)} minutes</span><p class="sub">${escapeHtml(warning)}</p><pre id="download-command" style="${commandStyle}">${escapeHtml(plan.shell_command)}</pre><button class="secondary" data-copy-download>Copy raw download commands</button></div>`;
+  $("#download-plan").innerHTML = `<div class="evidence"><span>Recommended · reconstruct and verify on the Registry host</span><p class="sub">Run from the Courier deployment directory. The completed dataset appears under the configured export directory.</p><pre id="retrieve-command" style="${commandStyle}">${escapeHtml(plan.server_retrieve_command)}</pre><button type="button" class="secondary" data-copy-retrieve>Copy retrieval command</button></div><div class="evidence"><span>Raw S3 transport objects · links expire in ${Math.round(plan.expires_in_seconds / 60)} minutes</span><p class="sub">${escapeHtml(warning)}</p><pre id="download-command" style="${commandStyle}">${escapeHtml(plan.shell_command)}</pre><button type="button" class="secondary" data-copy-download>Copy raw download commands</button></div>`;
 }
 
 function fileTable(files) {
@@ -218,15 +232,28 @@ function fileTable(files) {
 function openProjectForm() {
   $("#dialog-eyebrow").textContent = "Organization"; $("#dialog-title").textContent = "Create project";
   $("#dialog-body").innerHTML = `<div class="fields"><div class="field"><label for="project-code">Project code</label><input id="project-code" required pattern="P[0-9]{5}" placeholder="P26014"><small>Stable identifier: P followed by five digits.</small></div><div class="field"><label for="project-name">Name</label><input id="project-name" required maxlength="300"></div><div class="field"><label for="project-description">Description</label><textarea id="project-description"></textarea></div></div>`;
+  $("#dialog-submit").disabled = false;
   $("#form-dialog").dataset.action = "project"; $("#form-dialog").showModal();
 }
 
-function openInvitationForm() {
-  if (!state.projects.length) { setError("Create an active project before issuing an invitation."); return; }
+function openInvitationForm(item = null) {
+  if (!state.projects.length && !item) { setError("Create an active project before issuing an invitation."); return; }
   const defaultExpiry = new Date(Date.now() + 24 * 60 * 60 * 1000); defaultExpiry.setMinutes(defaultExpiry.getMinutes() - defaultExpiry.getTimezoneOffset());
-  $("#dialog-eyebrow").textContent = "Secure access"; $("#dialog-title").textContent = "Issue project invitation";
-  $("#dialog-body").innerHTML = `<div class="fields"><div class="field"><label for="invite-purpose">Access type</label><select id="invite-purpose"><option value="upload">Upload datasets</option><option value="download">Download verified datasets (read-only)</option></select><small>Download access follows the project and includes verified datasets added while the authorization remains valid.</small></div><div class="field"><label>Authorized projects</label><div class="checks">${state.projects.filter((item) => item.status === "active").map((item) => `<label class="check"><input type="checkbox" name="invite-project" value="${escapeHtml(item.project_code)}"> ${escapeHtml(item.project_code)} · ${escapeHtml(item.name)}</label>`).join("")}</div></div><div class="field"><label for="invite-expiry">Expires</label><input id="invite-expiry" type="datetime-local" value="${defaultExpiry.toISOString().slice(0, 16)}" required></div><div class="field"><label for="invite-uses">Maximum uses</label><input id="invite-uses" type="number" value="1" min="1" required></div><div class="field"><label for="invite-size">Maximum upload size in GB (upload invitations only)</label><input id="invite-size" type="number" min="0" step="0.1"></div><div class="field"><label for="invite-by">Issued by</label><input id="invite-by" type="email" value="registry-admin@icyseas.co" required></div></div>`;
-  $("#form-dialog").dataset.action = "invitation"; $("#form-dialog").showModal();
+  $("#dialog-eyebrow").textContent = "Secure access"; $("#dialog-title").textContent = item ? "Invitation settings" : "Issue project invitation";
+  $("#dialog-body").innerHTML = `${item ? `<div class="evidence"><span>Invitation code</span><code>${escapeHtml(item.invitation_code || "Legacy code was stored as a hash and cannot be recovered. Issue a new invitation if needed.")}</code></div>` : ""}<div class="fields"><div class="field"><label for="invite-purpose">Access type</label><select id="invite-purpose"><option value="upload">Upload datasets</option><option value="download">Download verified datasets (read-only)</option></select><small>Expiration limits new exchanges; revoke to end existing sessions. Download access follows the project and includes verified datasets added while the authorization remains valid.</small></div><div class="field"><label>Authorized projects</label><div class="checks">${state.projects.filter((project) => project.status === "active" || item?.project_codes.includes(project.project_code)).map((item) => `<label class="check"><input type="checkbox" name="invite-project" value="${escapeHtml(item.project_code)}"> ${escapeHtml(item.project_code)} · ${escapeHtml(item.name)}</label>`).join("")}</div></div><div class="field"><label for="invite-expiry">Expires</label><input id="invite-expiry" type="datetime-local" value="${defaultExpiry.toISOString().slice(0, 16)}" required></div><div class="field"><label for="invite-uses">Maximum uses</label><input id="invite-uses" type="number" value="1" min="1"><small>Leave blank for unlimited uses.</small></div><div class="field"><label for="invite-size">Maximum upload size in GB (upload invitations only)</label><input id="invite-size" type="number" min="0" step="0.1"></div><div class="field"><label for="invite-by">Issued by</label><input id="invite-by" type="email" value="registry-admin@icyseas.co" required></div></div>`;
+  $("#dialog-submit").disabled = Boolean(item?.revoked_at);
+  $("#form-dialog").dataset.action = "invitation";
+  $("#form-dialog").dataset.invitation = item?.id || "";
+  if (item) {
+    $("#invite-purpose").value = item.purpose;
+    const expiry = new Date(item.expires_at); expiry.setMinutes(expiry.getMinutes() - expiry.getTimezoneOffset());
+    $("#invite-expiry").value = expiry.toISOString().slice(0, 16);
+    $("#invite-uses").value = item.maximum_uses ?? "";
+    $("#invite-size").value = item.maximum_transfer_bytes === null ? "" : item.maximum_transfer_bytes / 1e9;
+    $("#invite-by").value = item.created_by;
+    $$('input[name="invite-project"]').forEach((input) => { input.checked = item.project_codes.includes(input.value); });
+  }
+  $("#form-dialog").showModal();
 }
 
 async function submitDialog(event) {
@@ -241,9 +268,10 @@ async function submitDialog(event) {
       if (!projectCodes.length) throw new Error("Select at least one project.");
       const size = $("#invite-size").value;
       const purpose = $("#invite-purpose").value;
-      const invitation = await api("/invitations", { method: "POST", body: JSON.stringify({ purpose, project_codes: projectCodes, expires_at: new Date($("#invite-expiry").value).toISOString(), maximum_uses: Number($("#invite-uses").value), maximum_transfer_bytes: purpose === "upload" && size ? Math.round(Number(size) * 1_000_000_000) : null, created_by: $("#invite-by").value.trim() }) });
-      window.prompt("Copy this invitation now. For security, it cannot be shown again.", invitation.invitation_code);
-      toast("Invitation issued");
+      const editing = $("#form-dialog").dataset.invitation;
+      const invitation = await api(editing ? `/invitations/${encodeURIComponent(editing)}` : "/invitations", { method: editing ? "PATCH" : "POST", body: JSON.stringify({ purpose, project_codes: projectCodes, expires_at: new Date($("#invite-expiry").value).toISOString(), maximum_uses: $("#invite-uses").value ? Number($("#invite-uses").value) : null, maximum_transfer_bytes: purpose === "upload" && size ? Math.round(Number(size) * 1_000_000_000) : null, created_by: $("#invite-by").value.trim() }) });
+      if (!editing) window.prompt("Invitation code (also available in View / edit).", invitation.invitation_code);
+      toast(editing ? "Invitation settings saved" : "Invitation issued");
     }
     $("#form-dialog").close(); await loadAll();
   } catch (error) { setError(error.message); }
@@ -275,6 +303,7 @@ $("#login-form").addEventListener("submit", async (event) => {
       }
       session = await authentication("/session", { admin_key: adminKey, totp_code: totpCode });
     }
+    state.generation++;
     state.token = session.access_token;
     state.expiresAt = new Date(session.expires_at).getTime();
     state.lastActivity = Date.now();
@@ -300,7 +329,7 @@ $("#login-form").addEventListener("submit", async (event) => {
 $("#logout").addEventListener("click", () => lockConsole());
 $("#refresh").addEventListener("click", () => loadAll().catch((error) => setError(error.message)));
 $("#transfer-search").addEventListener("input", renderTransfers); $("#transfer-filter").addEventListener("change", renderTransfers);
-$("#new-project").addEventListener("click", openProjectForm); $("#new-invitation").addEventListener("click", openInvitationForm); $("#form-dialog form").addEventListener("submit", submitDialog);
+$("#new-project").addEventListener("click", openProjectForm); $("#new-invitation").addEventListener("click", () => openInvitationForm()); $("#form-dialog form").addEventListener("submit", submitDialog);
 $$('nav button[data-view]').forEach((item) => item.addEventListener("click", () => showView(item.dataset.view)));
 $$('[data-go]').forEach((item) => item.addEventListener("click", () => showView(item.dataset.go)));
 document.addEventListener("click", async (event) => {
@@ -317,3 +346,98 @@ document.addEventListener("keydown", markActivity);
 document.addEventListener("visibilitychange", () => { if (!document.hidden && state.token) { markActivity(); maintainAdminSession().catch((error) => setError(error.message)); } });
 window.setInterval(() => { if (state.token && !document.hidden) { maintainAdminSession().then(() => state.token && loadAll()).catch((error) => setError(error.message)); } }, 15000);
 initializeLogin();
+
+function openDialog(id) { const dialog = $(`#${id}`); if (!dialog.open) dialog.showModal(); }
+async function showProject(code, open = true) {
+  const item = await api(`/projects/${encodeURIComponent(code)}/summary`);
+  state.project = code;
+  $('#project-title').textContent = `${code} · ${item.project.name}`;
+  const metric = (label, value) => `<div><span>${label}</span><strong>${value}</strong></div>`;
+  $('#project-body').innerHTML = `<p>${escapeHtml(item.project.description || '')}</p><div class="detail-grid">${[
+    metric('Transfers', item.total_transfers), metric('Live', item.active_transfers), metric('Verified transfers', item.completed_transfers), metric('Failed', item.failed_transfers),
+    metric('Manifest data', bytes(item.original_bytes)), metric('Available files', `${item.uploaded_file_count} / ${item.file_count}`), metric('Verified files', item.verified_file_count), metric('Recorded accepted parts', bytes(item.recorded_transport_bytes)),
+  ].join('')}</div><div class="dialog-actions"><button type="button" class="secondary" data-refresh-project="${escapeHtml(code)}">Refresh summary</button><button type="button" class="primary" data-browse-project="${escapeHtml(code)}">Browse project files</button></div><h3>Live transfers</h3>${transferTable(item.live_transfers)}<p class="sub">State reflects the latest Registry requests. Accepted-part bytes exclude a part still uploading; this is not device connectivity or a live speed measurement.</p>`;
+  if (open) openDialog('project-dialog');
+}
+
+async function openBrowser(code, transfer = '') {
+  const transfers = await api(`/transfers?project_code=${encodeURIComponent(code)}&limit=1000`);
+  state.browser = { code, transfer, path: '', offset: 0, entries: [], total: 0 };
+  $('#browser-transfer').innerHTML = `<option value="">All transfers</option>${transfers.map((item) => `<option value="${escapeHtml(item.transfer_id)}">${escapeHtml(item.source_name)} · ${escapeHtml(item.transfer_id)} · ${escapeHtml(item.status)}</option>`).join('')}`;
+  if (transfer && !transfers.some((item) => item.transfer_id === transfer)) $('#browser-transfer').add(new Option(transfer, transfer));
+  $('#browser-transfer').value = transfer;
+  $('#browser-status').textContent = '';
+  await loadBrowser(); openDialog('browser-dialog');
+}
+async function loadBrowser() {
+  const b = state.browser;
+  if (!b || !state.token) return;
+  const params = new URLSearchParams({ path: b.path, offset: b.offset, limit: 100 });
+  if (b.transfer) params.set('transfer_id', b.transfer);
+  const result = await api(`/projects/${encodeURIComponent(b.code)}/files?${params}`);
+  if (state.browser !== b) return;
+  b.entries = result.entries; b.total = result.total;
+  $('#browser-path').textContent = `${b.code} / ${b.path || ''}`;
+  $('#browser-up').disabled = !b.path;
+  $('#browser-entries').innerHTML = result.entries.length ? `<table><thead><tr><th>Select</th><th>Name</th><th>Transfer</th><th>Size</th><th>Availability</th></tr></thead><tbody>${result.entries.map((item, index) => `<tr><td>${item.kind === 'file' ? `<input type="checkbox" data-file-select="${index}" aria-label="Select ${escapeHtml(item.name)}" ${item.available ? '' : 'disabled'}>` : ''}</td><td>${item.kind === 'folder' ? `<button type="button" class="browser-name" data-folder="${index}">📁 ${escapeHtml(item.name)}</button>` : escapeHtml(item.name)}</td><td>${escapeHtml(item.transfer_id)}</td><td>${item.kind === 'file' ? bytes(item.original_size) : '—'}</td><td>${item.kind === 'file' ? badge(item.verified ? 'verified' : item.available ? 'available' : 'uploading') : 'Folder'}</td></tr>`).join('')}</tbody></table>` : '<div class="empty">No files in this folder yet.</div>';
+  $('#browser-page').textContent = `${result.total ? b.offset + 1 : 0}–${Math.min(b.offset + 100, result.total)} of ${result.total}`;
+  $('#browser-prev').disabled = b.offset === 0; $('#browser-next').disabled = b.offset + 100 >= result.total;
+}
+async function downloadSelected() {
+  const b = state.browser;
+  const selected = $$('[data-file-select]:checked').map((input) => b.entries[Number(input.dataset.fileSelect)]);
+  if (!selected.length) throw new Error('Select at least one available file.');
+  // File picker must run within the button gesture, before authorization awaits.
+  let handle = null;
+  if (selected.length === 1 && window.showSaveFilePicker) {
+    handle = await window.showSaveFilePicker({ suggestedName: selected[0].name });
+  }
+  $('#browser-download').disabled = true;
+  try {
+    for (const file of selected) {
+      if (!state.token) throw new Error('Administrator session ended.');
+      $('#browser-status').textContent = `Authorizing ${file.name}…`;
+      const plan = await api(`/transfers/${encodeURIComponent(file.transfer_id)}/files/${encodeURIComponent(file.file_id)}/download`, { method: 'POST' });
+      await courierDownload(plan, handle, (received, total) => { $('#browser-status').textContent = `Downloading ${file.name}: ${bytes(received)} / ${bytes(total)}`; });
+    }
+    $('#browser-status').textContent = `${selected.length} file(s) downloaded; sizes and digests matched.`;
+  } finally { $('#browser-download').disabled = false; }
+}
+async function showLogs(id) {
+  state.logTransfer = id; state.logOffset = 0; $('#logs-search').value = '';
+  await loadLogs(); openDialog('logs-dialog');
+}
+async function loadLogs() {
+  const params = new URLSearchParams({ search: $('#logs-search').value, offset: state.logOffset, limit: 100 });
+  const result = await api(`/transfers/${encodeURIComponent(state.logTransfer)}/logs?${params}`);
+  $('#logs-scope').textContent = result.scope;
+  $('#logs-entries').innerHTML = `<table><thead><tr><th>Time</th><th>Action / actor</th><th>Details</th></tr></thead><tbody>${result.events.map((item) => `<tr><td>${when(item.timestamp)}</td><td><strong>${escapeHtml(item.action)}</strong><span class="sub">${escapeHtml(item.actor)}</span></td><td><pre class="log-details">${escapeHtml(JSON.stringify(item.event_metadata, null, 2))}</pre></td></tr>`).join('')}</tbody></table>`;
+  $('#logs-page').textContent = `${result.total ? state.logOffset + 1 : 0}–${Math.min(state.logOffset + 100, result.total)} of ${result.total}`;
+  $('#logs-prev').disabled = state.logOffset === 0; $('#logs-next').disabled = state.logOffset + 100 >= result.total;
+}
+async function downloadLogs() {
+  const response = await fetch(`/api/v1/admin/transfers/${encodeURIComponent(state.logTransfer)}/logs/download`, { cache: 'no-store', headers: { Authorization: `Bearer ${state.token}` } });
+  if (!response.ok) { if (response.status === 401) lockConsole('Your administrator session expired.'); throw new Error(`Log download failed (${response.status}).`); }
+  const blob = await response.blob(); const url = URL.createObjectURL(blob); const link = document.createElement('a');
+  link.href = url; link.download = `${state.logTransfer}-logs.ndjson`; link.click(); setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+const reportFailure = (action) => action().catch((error) => { if (error.name !== 'AbortError') { setError(error.message); toast(error.message); } });
+document.addEventListener('click', (event) => {
+  const close = event.target.closest('[data-close-dialog]'); if (close) $(`#${close.dataset.closeDialog}`).close();
+  const project = event.target.closest('[data-project]'); if (project) reportFailure(() => showProject(project.dataset.project));
+  const refresh = event.target.closest('[data-refresh-project]'); if (refresh) reportFailure(() => showProject(refresh.dataset.refreshProject, false));
+  const browse = event.target.closest('[data-browse-project]'); if (browse) { event.preventDefault(); reportFailure(() => openBrowser(browse.dataset.browseProject, browse.dataset.browseTransfer || '')); }
+  const logs = event.target.closest('[data-logs]'); if (logs) { event.preventDefault(); reportFailure(() => showLogs(logs.dataset.logs)); }
+  const edit = event.target.closest('[data-edit-invitation]'); if (edit) reportFailure(async () => openInvitationForm(await api(`/invitations/${encodeURIComponent(edit.dataset.editInvitation)}`)));
+  const folder = event.target.closest('[data-folder]'); if (folder) { const entry = state.browser.entries[Number(folder.dataset.folder)]; Object.assign(state.browser, { path: entry.path, transfer: entry.transfer_id, offset: 0 }); if (![...$('#browser-transfer').options].some((option) => option.value === entry.transfer_id)) $('#browser-transfer').add(new Option(entry.transfer_id, entry.transfer_id)); $('#browser-transfer').value = entry.transfer_id; reportFailure(loadBrowser); }
+});
+$('#browser-transfer').addEventListener('change', () => { Object.assign(state.browser, { transfer: $('#browser-transfer').value, path: '', offset: 0 }); reportFailure(loadBrowser); });
+$('#browser-up').addEventListener('click', () => { state.browser.path = state.browser.path.split('/').slice(0, -1).join('/'); state.browser.offset = 0; reportFailure(loadBrowser); });
+$('#browser-refresh').addEventListener('click', () => reportFailure(loadBrowser));
+$('#browser-prev').addEventListener('click', () => { state.browser.offset -= 100; reportFailure(loadBrowser); });
+$('#browser-next').addEventListener('click', () => { state.browser.offset += 100; reportFailure(loadBrowser); });
+$('#browser-download').addEventListener('click', () => reportFailure(downloadSelected));
+$('#logs-search-form').addEventListener('submit', (event) => { event.preventDefault(); state.logOffset = 0; reportFailure(loadLogs); });
+$('#logs-prev').addEventListener('click', () => { state.logOffset -= 100; reportFailure(loadLogs); });
+$('#logs-next').addEventListener('click', () => { state.logOffset += 100; reportFailure(loadLogs); });
+$('#logs-download').addEventListener('click', () => reportFailure(downloadLogs));

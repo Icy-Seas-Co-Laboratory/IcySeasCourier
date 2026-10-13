@@ -66,7 +66,7 @@ Courier deliberately distinguishes `uploaded` from `complete`. Local upload comp
 
 ## Data Registry
 
-The FastAPI/PostgreSQL control plane supports projects, hashed upload and read-only download invitations, rotating renewable Courier sessions, scoped and idempotent transfer creation, immutable canonical v3 manifests, opaque transport object keys, narrowly scoped multipart and download authorization, audit events, schema migrations, request limits, security headers, and health/readiness endpoints.
+The FastAPI/PostgreSQL control plane supports projects, hashed upload and read-only download invitations with encrypted admin-recoverable codes, rotating renewable Courier sessions, scoped and idempotent transfer creation, immutable canonical v3 manifests, opaque transport object keys, narrowly scoped multipart and download authorization, audit events, schema migrations, request limits, security headers, and health/readiness endpoints.
 
 ```bash
 ./scripts/dev-up.sh

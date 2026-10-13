@@ -35,6 +35,23 @@
     originalBytes: number;
     transportBytes: number | null;
   }
+  interface FileProgressView {
+    id: string;
+    relativePath: string;
+    size: number;
+    status: string;
+    packed: boolean;
+    active: boolean;
+    confirmedBytes: number;
+    sentBytes: number;
+    transportBytes: number | null;
+  }
+  interface FileProgressPage {
+    files: FileProgressView[];
+    total: number;
+    offset: number;
+    limit: number;
+  }
   interface DownloadProgressEvent {
     transferId: string;
     receivedBytes: number;
@@ -80,6 +97,12 @@
   let uploadRate = 0;
   let lastUploadSample: { bytes: number; at: number } | null = null;
   let currentFile = "";
+  let filesExpanded = false;
+  let filePage: FileProgressPage | null = null;
+  let filePageTransferId = "";
+  let fileOffset = 0;
+  let refreshingFiles = false;
+  let fileStatusError = "";
   let packagedBytes: number | null = null;
   let uploadCommandRunning = false;
   let authorization: RegistryAuthorization | null = null;
@@ -141,6 +164,7 @@
     let unlistenDiagnostics: UnlistenFn | undefined;
     const heartbeatTimer = window.setInterval(() => (clock = Date.now()), 1000);
     const statusTimer = window.setInterval(() => {
+      if (step === "progress" && filesExpanded) void refreshFileStatus();
       if (step === "transfers") void refreshActiveTransfers();
       else void refreshVerificationStatus();
     }, 2000);
@@ -754,6 +778,7 @@
 
   function openTransfer(transfer: Transfer) {
     current = transfer;
+    filePage = null; filePageTransferId = ""; fileOffset = 0; fileStatusError = "";
     confirmedBytes = transfer.status === "finalizing" || transfer.status === "verifying" || transfer.status === "complete" ? transfer.original_bytes : 0;
     sentBytes = confirmedBytes;
     uploadRate = 0;
@@ -772,6 +797,38 @@
       step = transfer.status === "ready" ? "review" : "progress";
     }
     void loadTransferSizes(transfer.id);
+  }
+
+  async function refreshFileStatus() {
+    if (!current || refreshingFiles || !filesExpanded) return;
+    const transferId = current.id;
+    const offset = fileOffset;
+    refreshingFiles = true;
+    try {
+      const page = await invoke<FileProgressPage>("transfer_file_status", { transferId, offset });
+      if (current?.id !== transferId || offset !== fileOffset) return;
+      filePage = page;
+      filePageTransferId = transferId;
+      fileStatusError = "";
+    } catch (reason) {
+      if (current?.id === transferId) fileStatusError = message(reason);
+    } finally {
+      refreshingFiles = false;
+    }
+  }
+
+  function toggleFileStatus(event: Event) {
+    filesExpanded = (event.currentTarget as HTMLDetailsElement).open;
+    if (filesExpanded) {
+      if (filePageTransferId !== current?.id) { filePage = null; fileOffset = 0; }
+      void refreshFileStatus();
+    }
+  }
+
+  function changeFilePage(offset: number) {
+    fileOffset = Math.max(0, offset);
+    filePage = null;
+    void refreshFileStatus();
   }
 
   async function loadTransferSizes(transferId: string) {
@@ -796,6 +853,7 @@
       return;
     }
     step = "progress";
+    fileOffset = 0; filePage = null;
     current = { ...current, status: "uploading" };
     error = "";
     uploadCommandRunning = true;
@@ -1117,6 +1175,34 @@
         <div class="progress-details"><strong>{formatBytes(sentBytes)} / {formatBytes(current.original_bytes)}</strong><span>{uploadRate > 0 && current.status === "uploading" ? `${formatBytes(uploadRate)}/s` : statusLabel(current.status)}</span></div>
         {#if current.status === "uploading"}<div class="transfer-telemetry"><span><strong>{formatBytes(confirmedBytes)}</strong><small>Durably confirmed</small></span><span><strong>{formatBytes(Math.max(0, sentBytes - confirmedBytes))}</strong><small>Current request</small></span><span><strong>{activityAge()}</strong><small>Since last byte update</small></span></div>{/if}
         {#if currentFile}<div class="current-file"><span>Current file</span><code>{currentFile}</code></div>{/if}
+        <details class="file-status-section" open={filesExpanded} ontoggle={toggleFileStatus}>
+          <summary>Files in this transfer <span>{current.file_count.toLocaleString()} files</span></summary>
+          <div class="file-status-body">
+            <p class="file-status-note">Active files appear first. Files in a packed group upload together and share the group's progress. Files are marked verified only after independent Registry verification completes.</p>
+            {#if fileStatusError}<div class="notice error">Could not refresh file status: {fileStatusError}</div>{/if}
+            {#if filePage && filePageTransferId === current.id}
+              <div class="file-status-list" aria-label="Transfer file statuses">
+                {#each filePage.files as file (file.id)}
+                  <article class:active-file={file.active} class="file-status-row">
+                    <div class="file-status-name"><code>{file.relativePath}</code><small>{formatBytes(file.size)}{file.packed ? " · Packed group" : ""}</small></div>
+                    <div class="file-status-progress"><strong class:verified={file.status === "Verified"}>{file.status}</strong>
+                      {#if file.transportBytes !== null && file.status !== "Verified" && file.status !== "Uploaded"}
+                        <small>{file.packed ? "Group" : "File"}: {formatBytes(file.sentBytes)} / {formatBytes(file.transportBytes)}</small>
+                        <small>{formatBytes(file.confirmedBytes)} confirmed</small>
+                      {/if}
+                    </div>
+                  </article>
+                {:else}<p class="file-status-note">No files have been indexed for this transfer.</p>{/each}
+              </div>
+              <div class="file-status-pagination">
+                <button class="secondary small" disabled={refreshingFiles || filePage.offset === 0} onclick={() => changeFilePage(filePage!.offset - filePage!.limit)}>Previous</button>
+                <span>{filePage.total ? filePage.offset + 1 : 0}–{Math.min(filePage.offset + filePage.files.length, filePage.total)} of {filePage.total.toLocaleString()}</span>
+                <button class="secondary small" disabled={refreshingFiles || filePage.offset + filePage.limit >= filePage.total} onclick={() => changeFilePage(filePage!.offset + filePage!.limit)}>Next</button>
+                {#if fileOffset > 0}<button class="text-button" disabled={refreshingFiles} onclick={() => changeFilePage(0)}>Show active files</button>{/if}
+              </div>
+            {:else}<p class="file-status-note">{refreshingFiles ? "Loading file status…" : "File status will refresh shortly."}</p>{/if}
+          </div>
+        </details>
         {#if current.status === "complete"}
           <div class="notice info">The Registry independently reconstructed every logical file and matched its size and {(authorization?.hashAlgorithm ?? "sha256").toUpperCase()} digest to the immutable manifest.</div>
           {#if current.server_transfer_id}<div class="provenance"><span>Registry transfer</span><code>{current.server_transfer_id}</code></div>{/if}

@@ -56,6 +56,7 @@ from .schemas import (
     InvitationCreate,
     InvitationExchange,
     InvitationResponse,
+    InvitationUpdate,
     ManifestResponse,
     MultipartResponse,
     ObjectStatusResponse,
@@ -75,7 +76,9 @@ from .schemas import (
     VerificationFileResponse,
 )
 from .security import (
+    decrypt_invitation_code,
     decrypt_totp_secret,
+    encrypt_invitation_code,
     encrypt_totp_secret,
     generate_admin_session_token,
     generate_invitation_code,
@@ -343,26 +346,109 @@ def admin_overview(
     )
 
 
+def invitation_detail(item: UploadInvitation, settings: Configuration) -> AdminInvitationResponse:
+    return AdminInvitationResponse(
+        id=item.id,
+        invitation_code=(
+            decrypt_invitation_code(item.code_ciphertext, settings)
+            if item.code_ciphertext
+            else None
+        ),
+        expires_at=item.expires_at,
+        project_codes=sorted(project.project_code for project in item.projects),
+        maximum_transfer_bytes=item.maximum_transfer_bytes,
+        maximum_uses=item.maximum_uses,
+        use_count=item.use_count,
+        created_by=item.created_by,
+        created_at=item.created_at,
+        revoked_at=item.revoked_at,
+        purpose=item.purpose,
+    )
+
+
 @admin.get("/invitations", response_model=list[AdminInvitationResponse])
-def list_invitations(database: Database, _: AdminActor) -> list[AdminInvitationResponse]:
+def list_invitations(
+    database: Database, settings: Configuration, _: AdminActor
+) -> list[AdminInvitationResponse]:
     invitations = database.scalars(
         select(UploadInvitation).order_by(UploadInvitation.created_at.desc())
     ).all()
-    return [
-        AdminInvitationResponse(
-            id=item.id,
-            expires_at=item.expires_at,
-            project_codes=sorted(project.project_code for project in item.projects),
-            maximum_transfer_bytes=item.maximum_transfer_bytes,
-            maximum_uses=item.maximum_uses,
-            use_count=item.use_count,
-            created_by=item.created_by,
-            created_at=item.created_at,
-            revoked_at=item.revoked_at,
-            purpose=item.purpose,
+    return [invitation_detail(item, settings) for item in invitations]
+
+
+@admin.get("/invitations/{invitation_id}", response_model=AdminInvitationResponse)
+def get_invitation(
+    invitation_id: uuid.UUID, database: Database, settings: Configuration, _: AdminActor
+) -> AdminInvitationResponse:
+    invitation = database.get(UploadInvitation, invitation_id)
+    if invitation is None:
+        raise HTTPException(status_code=404, detail="invitation not found")
+    return invitation_detail(invitation, settings)
+
+
+@admin.patch("/invitations/{invitation_id}", response_model=AdminInvitationResponse)
+def update_invitation(
+    invitation_id: uuid.UUID,
+    payload: InvitationUpdate,
+    database: Database,
+    settings: Configuration,
+    actor: AdminActor,
+) -> AdminInvitationResponse:
+    invitation = database.scalar(
+        select(UploadInvitation).where(UploadInvitation.id == invitation_id).with_for_update()
+    )
+    if invitation is None:
+        raise HTTPException(status_code=404, detail="invitation not found")
+    if invitation.revoked_at is not None:
+        raise HTTPException(status_code=409, detail="revoked invitations cannot be edited")
+    changes = payload.model_dump(exclude_unset=True)
+    if payload.expires_at is not None and payload.expires_at <= datetime.now(UTC):
+        raise HTTPException(status_code=422, detail="expiration must be in the future")
+    maximum_uses = changes.get("maximum_uses", invitation.maximum_uses)
+    if maximum_uses is not None and maximum_uses < invitation.use_count:
+        raise HTTPException(status_code=422, detail="use limit cannot be below existing uses")
+    purpose = changes.get("purpose", invitation.purpose)
+    maximum_bytes = changes.get("maximum_transfer_bytes", invitation.maximum_transfer_bytes)
+    if purpose == "download" and maximum_bytes is not None:
+        raise HTTPException(
+            status_code=422, detail="download invitations cannot set an upload size limit"
         )
-        for item in invitations
-    ]
+    scope_changed = purpose != invitation.purpose
+    if payload.project_codes is not None:
+        projects = list(
+            database.scalars(select(Project).where(Project.project_code.in_(payload.project_codes)))
+        )
+        missing = sorted(
+            set(payload.project_codes) - {project.project_code for project in projects}
+        )
+        if missing:
+            raise HTTPException(status_code=404, detail={"missing_projects": missing})
+        scope_changed |= set(payload.project_codes) != {
+            project.project_code for project in invitation.projects
+        }
+        invitation.projects = projects
+    for field, value in changes.items():
+        if field != "project_codes":
+            setattr(invitation, field, value)
+    if scope_changed:
+        sessions = database.scalars(
+            select(CourierSession).where(
+                CourierSession.invitation_id == invitation.id,
+                CourierSession.revoked_at.is_(None),
+            )
+        )
+        for session in sessions:
+            session.revoked_at = datetime.now(UTC)
+    record_event(
+        database,
+        actor=actor,
+        action="invitation.updated",
+        object_type="upload_invitation",
+        object_id=str(invitation.id),
+        metadata={"changed_fields": sorted(changes), "sessions_revoked": scope_changed},
+    )
+    database.commit()
+    return invitation_detail(invitation, settings)
 
 
 def known_transport_bytes(transfer: Transfer) -> int | None:
@@ -582,7 +668,7 @@ def create_invitation(
     actor: AdminActor,
 ) -> InvitationResponse:
     now = datetime.now(UTC)
-    if payload.expires_at <= now:
+    if payload.expires_at.utcoffset() is None or payload.expires_at <= now:
         raise HTTPException(status_code=422, detail="expiration must be in the future")
     projects = list(
         database.scalars(select(Project).where(Project.project_code.in_(payload.project_codes)))
@@ -594,6 +680,7 @@ def create_invitation(
     code = generate_invitation_code()
     invitation = UploadInvitation(
         token_hash=hash_token(code, settings),
+        code_ciphertext=encrypt_invitation_code(code, settings),
         purpose=payload.purpose,
         expires_at=payload.expires_at,
         maximum_transfer_bytes=payload.maximum_transfer_bytes,
@@ -1065,6 +1152,14 @@ def initiate_multipart(
     if transport_object.multipart_upload_id is None:
         transport_object.multipart_upload_id = storage.create_multipart(transport_object.object_key)
         transport_object.status = "uploading"
+        record_event(
+            database,
+            actor=f"courier:{identity.id}",
+            action="transfer.multipart_started",
+            object_type="transfer",
+            object_id=transfer_id,
+            metadata={"object_id": str(object_id)},
+        )
         database.commit()
     else:
         response.status_code = status.HTTP_200_OK
@@ -1184,6 +1279,18 @@ def complete_multipart(
             transport_object.transfer.transport_bytes = sum(
                 size for size in sizes if size is not None
             )
+    record_event(
+        database,
+        actor=f"courier:{identity.id}",
+        action="transfer.multipart_completed",
+        object_type="transfer",
+        object_id=transfer_id,
+        metadata={
+            "object_id": str(object_id),
+            "part_count": len(payload.parts),
+            "recorded_bytes": sum(part.size or 0 for part in payload.parts),
+        },
+    )
     database.commit()
     return CompleteMultipartResponse(file_id=object_id, status="uploaded", etag=etag)
 

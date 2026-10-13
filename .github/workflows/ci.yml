@@ -32,6 +32,7 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm run build
+      - run: node --test ../../tests/admin/download.test.cjs
 
   windows-installer:
     name: Windows installer smoke test

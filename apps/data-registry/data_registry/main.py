@@ -6,8 +6,10 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from .admin_projects import router as admin_projects_router
 from .api import router
 from .build_info import REGISTRY_VERSION
+from .client_events import router as client_events_router
 from .config import Settings, get_settings
 from .logging_config import configure_logging
 from .middleware import SecurityMiddleware
@@ -65,6 +67,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     application.include_router(router)
+    application.include_router(admin_projects_router)
+    application.include_router(client_events_router)
     application.mount(
         "/admin",
         StaticFiles(directory=Path(__file__).parent / "admin", html=True),

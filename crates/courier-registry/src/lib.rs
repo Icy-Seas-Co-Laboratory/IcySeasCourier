@@ -11,7 +11,8 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use courier_core::{
-    FileRecord, HashAlgorithm, RetryPolicy, Transfer, TransportMemberRecord, TransportObjectRecord,
+    FileRecord, HashAlgorithm, RetryPolicy, Transfer, TransferStore, TransportMemberRecord,
+    TransportObjectRecord,
 };
 use courier_transfer::{MultipartStore, RemotePart, StoreError, UploadSession};
 use reqwest::{
@@ -723,6 +724,46 @@ impl RegistryClient {
             self.base_url
         )))?)
         .await
+    }
+
+    /// Sends one bounded outbox batch. A failed/ambiguous request leaves events
+    /// pending; server event UUIDs make replay safe after process restart.
+    pub async fn sync_transfer_events(
+        &self,
+        database: &TransferStore,
+        local_transfer_id: Uuid,
+        server_transfer_id: &str,
+    ) -> Result<usize, RegistryError> {
+        let events = database
+            .pending_transfer_events(local_transfer_id, 100)
+            .map_err(|error| RegistryError::State(error.to_string()))?;
+        if events.is_empty() {
+            return Ok(0);
+        }
+        #[derive(Deserialize)]
+        struct Acknowledgement {
+            acknowledged: Vec<Uuid>,
+        }
+        let response: Acknowledgement = self
+            .send_json(
+                self.authorized(self.http.post(format!(
+                    "{}/api/v1/transfers/{server_transfer_id}/events",
+                    self.base_url
+                )))?
+                .timeout(Duration::from_secs(10))
+                .json(&serde_json::json!({"events":events})),
+            )
+            .await?;
+        let expected = events.iter().map(|event| event.id).collect::<Vec<_>>();
+        if response.acknowledged != expected {
+            return Err(RegistryError::State(
+                "Registry event acknowledgement did not match the batch".into(),
+            ));
+        }
+        database
+            .acknowledge_transfer_events(local_transfer_id, &response.acknowledged)
+            .map_err(|error| RegistryError::State(error.to_string()))?;
+        Ok(response.acknowledged.len())
     }
 
     pub async fn transfer_status(
@@ -1562,6 +1603,95 @@ mod tests {
     use courier_core::{FileStatus, TransportObjectKind};
 
     use super::*;
+
+    #[tokio::test]
+    async fn event_sync_retains_outbox_after_failure_and_replays_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.sqlite");
+        let transfer = Transfer::draft(PathBuf::from("/source"), None);
+        let database = TransferStore::open(&path).unwrap();
+        database.create_transfer(&transfer).unwrap();
+        let ids = database
+            .pending_transfer_events(transfer.id, 100)
+            .unwrap()
+            .iter()
+            .map(|event| event.id)
+            .collect::<Vec<_>>();
+        let expected_ids = ids.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for status in [500, 200] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let header_end = request
+                    .windows(4)
+                    .position(|bytes| bytes == b"\r\n\r\n")
+                    .unwrap()
+                    + 4;
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                assert!(headers.starts_with("POST /api/v1/transfers/ISC-TR-TEST/events "));
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .unwrap();
+                while request.len() < header_end + length {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                bodies.push(request[header_end..].to_vec());
+                let body = if status == 200 {
+                    serde_json::json!({"acknowledged":expected_ids}).to_string()
+                } else {
+                    "{\"detail\":\"offline\"}".into()
+                };
+                write!(stream, "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            assert_eq!(bodies[0], bodies[1]);
+        });
+        let client = RegistryClient::authenticated(format!("http://{address}"), "access-token");
+        assert!(
+            client
+                .sync_transfer_events(&database, transfer.id, "ISC-TR-TEST")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            database
+                .pending_transfer_events(transfer.id, 100)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(database);
+        let database = TransferStore::open(&path).unwrap();
+        assert_eq!(
+            client
+                .sync_transfer_events(&database, transfer.id, "ISC-TR-TEST")
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            database
+                .pending_transfer_events(transfer.id, 100)
+                .unwrap()
+                .is_empty()
+        );
+        server.join().unwrap();
+    }
 
     #[test]
     fn manifest_paths_are_portable_and_relative() {

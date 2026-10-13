@@ -41,3 +41,26 @@ the project permission and logical-file contract stable when a future processing
 service adds an unpacked `icy-seas-staging` representation: clients and downstream
 tools can select a representation without treating packed incoming objects as the
 logical dataset or broadening access beyond the project.
+
+## Admin observability and downstream publication
+
+The Operations Console reads project aggregates and live Registry transfer states,
+browses immutable logical manifests, and authorizes direct S3 reads for available
+objects even before the whole transfer is verified. Browser extraction checks the
+selected file's digest before publication; preview availability never advances a
+Registry transfer to `complete`. New invitation codes are additionally encrypted
+for repeat administrator viewing; older hash-only codes remain unrecoverable.
+
+SQLite keeps an append-only typed operational event history and acknowledgement
+outbox. Desktop synchronization is independent of dataset upload, uses bounded
+batches with fair rotation among transfers, and retains unacknowledged events
+across outages/restarts. Registry ingestion binds each event to an owned transfer
+and deduplicates by UUID and canonical payload digest. Client observations do not
+change authoritative Registry state. Admin logs include Registry events and
+submitted client diagnostics, without free-form paths, credentials, or signed URLs.
+The development direct-S3 CLI has no Registry session; its events remain local.
+
+For lakeFS publication and SSD investigation, see
+[storage operations review](storage-operations-review.md). Publication would use a
+separate idempotent job and verified logical files; it does not change Courier's
+transport or verification protocol.

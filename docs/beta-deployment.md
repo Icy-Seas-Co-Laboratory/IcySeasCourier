@@ -242,3 +242,39 @@ Local desktop migration 009 is additive: it records the active Registry and the 
 ## Beta exit criteria
 
 The closed beta is successful when representative transfers repeatedly survive interruption, independently verify, and can be diagnosed by an operator; backup restoration is demonstrated; no admin route is reachable outside the approved networks; and testers can configure the Registry without terminal commands.
+
+## Admin observability update rollout
+
+Deploy the updated Registry and ingest worker together. Apply Alembic migrations
+through `0010` before serving the new API (the Registry container startup already
+runs `alembic upgrade head`). Deploy the updated desktop to synchronize durable
+client diagnostics; its SQLite event migration runs on startup. Back up PostgreSQL
+and preserve the token pepper, which now also decrypts stored invitation codes.
+Existing hash-only codes continue authenticating but cannot be redisplayed.
+
+Before browser file downloads, inspect the bucket's existing CORS configuration
+and merge a rule for the **exact admin page origin**, including scheme and port.
+For example, a local-development rule is:
+
+```json
+{
+  "AllowedOrigins": ["http://127.0.0.1:8020"],
+  "AllowedMethods": ["GET"],
+  "AllowedHeaders": ["*"],
+  "MaxAgeSeconds": 300
+}
+```
+
+Use the tailnet URL's origin for the beta console, rather than this development
+example. Apply the merged rules using your S3 administration tool against the
+internal SeaweedFS endpoint with credentials from secure environment/credential
+storage. Do not replace unrelated rules or use a wildcard origin. Browser reads
+use presigned URLs without cookies or an Authorization header. The Registry CSP
+allows the configured public S3 endpoint origin.
+
+Acceptance checks: reopen/edit a new invitation, open a project summary, browse a
+nested packed file after its object uploads while another object is still
+uploading, download it and check its digest, search/export logs, interrupt/restart
+a desktop transfer and confirm queued events eventually appear once connectivity
+returns. Historical device diagnostics cannot be reconstructed by this upgrade.
+No production deployment or bucket change is performed by the source patch.

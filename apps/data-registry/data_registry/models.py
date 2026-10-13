@@ -69,6 +69,7 @@ class UploadInvitation(Base):
     __tablename__ = "upload_invitations"
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    code_ciphertext: Mapped[str | None] = mapped_column(Text)
     purpose: Mapped[str] = mapped_column(String(20), default="upload")
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     maximum_transfer_bytes: Mapped[int | None] = mapped_column(BigInteger)
@@ -237,3 +238,10 @@ class AuditEvent(Base):
     object_type: Mapped[str] = mapped_column(String(80))
     object_id: Mapped[str] = mapped_column(String(80))
     event_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class TransferClientEvent(Base):
+    __tablename__ = "transfer_client_events"
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    transfer_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("transfers.id", ondelete="CASCADE"))
+    payload_sha256: Mapped[str] = mapped_column(String(64))

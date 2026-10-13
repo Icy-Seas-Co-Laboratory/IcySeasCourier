@@ -1,8 +1,8 @@
 use std::io::ErrorKind;
 
 use courier_core::{
-    CourierError, FileRecord, PartRecord, PartStatus, RetryPolicy, TransferStore,
-    verify_source_unchanged,
+    CourierError, FileRecord, PartRecord, PartStatus, RetryPolicy, TransferErrorClass,
+    TransferEventDetails, TransferStore, verify_source_unchanged,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -89,6 +89,61 @@ pub async fn upload_missing_parts(
 }
 
 pub async fn upload_missing_parts_observed(
+    database: &TransferStore,
+    store: &dyn MultipartStore,
+    file: &FileRecord,
+    retry: &RetryPolicy,
+    observer: &dyn UploadObserver,
+) -> Result<UploadProgress, UploadError> {
+    database.record_transfer_event(
+        file.transfer_id,
+        "object.upload_started",
+        &TransferEventDetails {
+            object_id: Some(file.id),
+            ..Default::default()
+        },
+    )?;
+    let result = upload_missing_parts_inner(database, store, file, retry, observer).await;
+    let (kind, error_class) = match &result {
+        Ok(_) => ("object.upload_succeeded", None),
+        Err(UploadError::Paused) => ("object.upload_paused", Some(TransferErrorClass::Paused)),
+        Err(error) => ("object.upload_failed", Some(upload_error_class(error))),
+    };
+    database.record_transfer_event(
+        file.transfer_id,
+        kind,
+        &TransferEventDetails {
+            object_id: Some(file.id),
+            error_class,
+            ..Default::default()
+        },
+    )?;
+    result
+}
+
+fn upload_error_class(error: &UploadError) -> TransferErrorClass {
+    match error {
+        UploadError::Local(CourierError::SourceModified(_)) => TransferErrorClass::SourceChanged,
+        UploadError::Local(_) => TransferErrorClass::Local,
+        UploadError::Remote(error) => store_error_class(error),
+        UploadError::RetriesExhausted { .. } => TransferErrorClass::RetriesExhausted,
+        UploadError::Paused => TransferErrorClass::Paused,
+        UploadError::Reconcile(_) => TransferErrorClass::Reconciliation,
+        _ => TransferErrorClass::InvalidPlan,
+    }
+}
+
+fn store_error_class(error: &StoreError) -> TransferErrorClass {
+    match error {
+        StoreError::Transient(_) => TransferErrorClass::Transient,
+        StoreError::AuthorizationExpired => TransferErrorClass::AuthorizationExpired,
+        StoreError::UploadNotFound => TransferErrorClass::UploadNotFound,
+        StoreError::Permanent(_) => TransferErrorClass::Permanent,
+        StoreError::Paused => TransferErrorClass::Paused,
+    }
+}
+
+async fn upload_missing_parts_inner(
     database: &TransferStore,
     store: &dyn MultipartStore,
     file: &FileRecord,
@@ -202,6 +257,17 @@ pub async fn upload_missing_parts_observed(
                 }
                 Err(error) => {
                     database.record_part_failure(file.id, part.part_number, &error.to_string())?;
+                    database.record_transfer_event(
+                        file.transfer_id,
+                        "part.attempt_failed",
+                        &TransferEventDetails {
+                            object_id: Some(file.id),
+                            part_number: Some(part.part_number),
+                            attempt: Some(attempt + 1),
+                            error_class: Some(store_error_class(&error)),
+                            ..Default::default()
+                        },
+                    )?;
                     if !error.is_retryable() {
                         return Err(error.into());
                     }
@@ -299,6 +365,16 @@ async fn reconcile_with_retry(
         match reconcile_file(database, store, file).await {
             Ok(result) => return Ok(result),
             Err(ReconcileError::Remote(error)) if error.is_retryable() => {
+                database.record_transfer_event(
+                    file.transfer_id,
+                    "object.reconciliation_retry",
+                    &TransferEventDetails {
+                        object_id: Some(file.id),
+                        attempt: Some(attempt + 1),
+                        error_class: Some(store_error_class(&error)),
+                        ..Default::default()
+                    },
+                )?;
                 if attempt + 1 == retry.max_attempts {
                     return Err(ReconcileError::Remote(error));
                 }
@@ -314,6 +390,29 @@ async fn reconcile_with_retry(
 /// accepted it, a HEAD check recognizes the finalized object and avoids
 /// restarting or duplicating the upload.
 pub async fn complete_uploaded_file(
+    database: &TransferStore,
+    store: &dyn MultipartStore,
+    file: &FileRecord,
+    retry: &RetryPolicy,
+) -> Result<CompletionOutcome, UploadError> {
+    let result = complete_uploaded_file_inner(database, store, file, retry).await;
+    let (kind, error_class) = match &result {
+        Ok(_) => ("object.completed", None),
+        Err(error) => ("object.completion_failed", Some(upload_error_class(error))),
+    };
+    database.record_transfer_event(
+        file.transfer_id,
+        kind,
+        &TransferEventDetails {
+            object_id: Some(file.id),
+            error_class,
+            ..Default::default()
+        },
+    )?;
+    result
+}
+
+async fn complete_uploaded_file_inner(
     database: &TransferStore,
     store: &dyn MultipartStore,
     file: &FileRecord,
@@ -359,6 +458,16 @@ pub async fn complete_uploaded_file(
         match store.complete(&session, &parts).await {
             Ok(()) => return Ok(CompletionOutcome::Completed),
             Err(error) => {
+                database.record_transfer_event(
+                    file.transfer_id,
+                    "object.completion_retry",
+                    &TransferEventDetails {
+                        object_id: Some(file.id),
+                        attempt: Some(attempt + 1),
+                        error_class: Some(store_error_class(&error)),
+                        ..Default::default()
+                    },
+                )?;
                 if store.object_exists(&session.object_key).await? {
                     return Ok(CompletionOutcome::AlreadyComplete);
                 }
@@ -532,7 +641,9 @@ mod tests {
             let count = attempts.entry(number).or_default();
             *count += 1;
             if number == 2 && *count == 1 {
-                return Err(StoreError::Transient("injected disconnect".into()));
+                return Err(StoreError::Transient(
+                    "https://secret.test?X-Amz-Signature=secret iscs_token".into(),
+                ));
             }
             Ok(RemotePart {
                 part_number: number,
@@ -659,6 +770,17 @@ mod tests {
         assert_eq!(progress.source_bytes_confirmed, 10);
         assert_eq!(store.attempts.lock().unwrap().get(&1), None);
         assert_eq!(store.attempts.lock().unwrap().get(&2), Some(&2));
+        let events = database.pending_transfer_events(transfer.id, 100).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "part.attempt_failed")
+        );
+        assert!(events.iter().any(|event| event.kind == "part.confirmed"));
+        let report = serde_json::to_string(&events).unwrap();
+        assert!(report.contains("transient"));
+        assert!(!report.contains("secret.test"));
+        assert!(!report.contains("iscs_token"));
     }
 
     #[tokio::test]

@@ -17,6 +17,19 @@ Courier defaults to the hosted HTTPS Registry at `https://courier.icyseascolab.i
 
 Upload HTTP failures use up to eight attempts with jittered backoff, including ordinary 400 responses. Missing multipart sessions, payload-size rejections, local validation errors, pauses, and Cloudflare browser challenges still stop immediately. After an upload is interrupted, Courier records the local source and state-file accessibility, platform and version, and short read-only Registry health, readiness, and version checks. It saves the session report as `courier-last-upload-failure.txt` beside the local SQLite database so it remains available after the app closes. The report may include local paths and should be shared only with trusted support staff.
 
+## File activity
+
+The upload transfer page has an expandable **Files in this transfer** section.
+It refreshes every two seconds while open, lists active files first, and shows
+preparing/uploading/finalizing, queued, paused, uploaded, and verified states.
+Pages contain up to 100 files, with a bounded scroll area for large inventories.
+Transport byte counts distinguish the current request from confirmed parts and
+survive restart through SQLite reconciliation. Packed members upload together;
+their displayed group byte counts describe the shared compressed object rather
+than inferred per-file percentages. Uploaded files are only labeled verified
+once independent Registry verification completes. Closing the section stops its
+file-status polling.
+
 ## Releases
 
 Signed macOS DMGs, a Windows NSIS installer and portable x64 ZIP, and a Linux AppImage are produced by the version-tagged GitHub Actions release workflow. The Windows ZIP runs after extraction when Microsoft Edge WebView2 Runtime is installed; its transfer state and credentials stay in the current user's Windows data stores, not in the extracted folder. See [Courier Desktop releases](../../docs/desktop-releases.md) for signing setup, release creation, and verification.

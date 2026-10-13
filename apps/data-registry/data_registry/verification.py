@@ -56,6 +56,14 @@ def claim_transfer(database: Session, settings: Settings) -> VerificationClaim |
     )
     database.add(attempt)
     database.flush()
+    record_event(
+        database,
+        actor="worker:ingest-verifier",
+        action="transfer.verification_started",
+        object_type="transfer",
+        object_id=transfer.public_id,
+        metadata={"attempt_number": attempt.attempt_number},
+    )
     claim = VerificationClaim(transfer_id=transfer.id, attempt_id=attempt.id)
     database.commit()
     return claim
@@ -112,6 +120,19 @@ def verify_claim(
     except Exception as error:
         permanent = transfer.verification_attempt_count >= settings.verification_max_attempts
         fail_verification(transfer, attempt, f"object storage error: {error}", permanent)
+    if attempt.status in {"failed", "retryable"}:
+        record_event(
+            database,
+            actor="worker:ingest-verifier",
+            action="transfer.verification_failed",
+            object_type="transfer",
+            object_id=transfer.public_id,
+            metadata={
+                "attempt_number": attempt.attempt_number,
+                "status": attempt.status,
+                "error": attempt.error,
+            },
+        )
     database.commit()
 
 

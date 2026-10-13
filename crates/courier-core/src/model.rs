@@ -251,3 +251,24 @@ pub struct TransportMemberRecord {
     pub file_id: Uuid,
     pub member_index: u32,
 }
+
+/// Logical file progress. Packed members share their transport object's counters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferFileProgress {
+    pub id: Uuid,
+    pub relative_path: PathBuf,
+    pub size: u64,
+    pub status: FileStatus,
+    pub object_id: Option<Uuid>,
+    pub kind: Option<TransportObjectKind>,
+    pub object_transport_bytes: Option<u64>,
+    pub object_confirmed_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferFileProgressPage {
+    pub files: Vec<TransferFileProgress>,
+    pub total: u64,
+    pub offset: u64,
+    pub limit: u64,
+}

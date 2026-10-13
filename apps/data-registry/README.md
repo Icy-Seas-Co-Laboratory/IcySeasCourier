@@ -4,8 +4,48 @@
 
 Start the development stack and open `http://127.0.0.1:8020/admin/`. On first login, enter the configured `REGISTRY_ADMIN_API_KEY` (`development-only-change-me` for the default local stack), enroll the generated TOTP secret in an authenticator, and confirm its current code. Later console logins require both factors and receive a short-lived, memory-only session. The console provides health metrics, project and invitation administration, searchable transfer status, per-file verification evidence, controlled verification retry, and the Registry audit log.
 
-The console never receives stored invitation secrets. Newly issued codes are shown
-once and the Registry retains only their keyed hashes.
+Administrators can reopen invitation codes and edit their expiration, use/size
+limits, project scope, purpose, and issuer. New codes are stored encrypted in
+addition to their keyed authentication hashes. Keep the token pepper stable and
+back it up securely; it also derives the encryption key. Legacy hash-only codes
+cannot be recovered: issue a replacement when needed. Changing scope or purpose
+revokes existing sessions; users must exchange the invitation again, which counts
+as another use. Expiration is the deadline for new code exchanges; existing
+sessions retain their session expiry/refresh policy. Revoke to end existing access.
+Revoked invitations remain viewable but cannot be edited.
+
+Open a project to inspect metrics and live transfer states, then **Browse project
+files** to navigate manifest folders, select files, and download them directly
+from S3. Completed objects are available during an upload, including individual
+members of packs. Availability is separate from independent verification. The
+browser streams packs and checks each selected file's size and recorded digest
+before publishing its download. Browser pack decoding is limited to a 32 MiB
+Zstd frame window; unusual compression settings may require Courier retrieval. Large files use the Save File API where available;
+other browsers and multiple-file downloads buffer individual files with a 512 MiB
+limit. Multiple files download separately, and a browser may request permission
+for multiple downloads. Packed previews read/decompress the containing pack;
+selecting several members currently reads that pack for each selection.
+
+The S3 bucket must permit cross-origin `GET` from the exact console origin (for
+local development, typically `http://127.0.0.1:8020`; use the actual tailnet console origin for beta administration, or the HTTPS
+origin for an HTTPS console). Merge this rule with any existing bucket CORS rules rather than replacing
+them. Allow `GET`, origin-specific access, and any required request headers; no
+wildcard origin or credentialed browser access is needed. The console's CSP allows
+only the configured public S3 origin. Storage failures and CORS failures are
+reported in the console; dataset bytes never pass through FastAPI.
+
+Transfer details expose searchable, paginated logs and a full NDJSON export.
+Registry lifecycle records are available for existing transfers. Updated desktop clients also
+persist typed transfer diagnostics locally and synchronize them with idempotent
+acknowledgements. Historical device logs and diagnostics not yet synchronized are
+not available on the server. These are typed state, object, part, retry, and error
+classification records; free-form device debug output, paths, tokens, and signed
+URLs are excluded. The development direct-S3 CLI records local events but has no
+Registry session and does not synchronize them. The admin view states its server
+coverage explicitly.
+
+See [storage operations review](../../docs/storage-operations-review.md) for
+lakeFS publication preparation and the SSD temperature investigation.
 
 ## Digest policy
 

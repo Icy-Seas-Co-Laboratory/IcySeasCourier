@@ -1,6 +1,7 @@
 import ipaddress
 import time
 from collections import OrderedDict, deque
+from urllib.parse import urlsplit
 
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -49,6 +50,16 @@ class SecurityMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, settings: Settings) -> None:
         super().__init__(app)
         self.settings = settings
+        endpoint = urlsplit(settings.s3_public_endpoint_url)
+        self.storage_origin = (
+            f"{endpoint.scheme}://{endpoint.netloc}"
+            if endpoint.scheme in {"http", "https"}
+            and endpoint.hostname
+            and endpoint.username is None
+            and endpoint.password is None
+            and not any(char.isspace() or char in ";\\" for char in endpoint.netloc)
+            else ""
+        )
         self.admin_networks = _networks(settings.admin_allowed_networks)
         self.trusted_proxies = _networks(settings.trusted_proxy_networks)
         self.rate_limiter = RateLimiter(settings.rate_limit_maximum_clients)
@@ -149,7 +160,9 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         if is_admin:
             response.headers["Cache-Control"] = "no-store"
             response.headers["Content-Security-Policy"] = (
-                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-                "img-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
+                "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; "
+                "style-src 'self' 'unsafe-inline'; "
+                f"img-src 'self'; connect-src 'self' {self.storage_origin}; "
+                "frame-ancestors 'none'; base-uri 'none'"
             )
         return response

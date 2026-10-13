@@ -93,7 +93,7 @@ def test_admin_console_and_operational_read_models(client: TestClient) -> None:
     assert invitations.status_code == 200
     assert invitations.json()[0]["id"] == invitation["id"]
     assert invitations.json()[0]["project_codes"] == ["P26014"]
-    assert "invitation_code" not in invitations.json()[0]
+    assert invitations.json()[0]["invitation_code"] == invitation["invitation_code"]
 
     audit = client.get("/api/v1/admin/audit-events", headers=ADMIN)
     assert audit.status_code == 200

@@ -88,6 +88,30 @@ class InvitationCreate(BaseModel):
         return self
 
 
+class InvitationUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    purpose: Literal["upload", "download"] | None = None
+    project_codes: list[str] | None = Field(default=None, min_length=1)
+    expires_at: datetime | None = None
+    maximum_transfer_bytes: int | None = Field(default=None, ge=0)
+    maximum_uses: int | None = Field(default=None, ge=1)
+    created_by: str | None = Field(default=None, min_length=1, max_length=320)
+
+    @model_validator(mode="after")
+    def validate_settings(self) -> "InvitationUpdate":
+        for field in ("purpose", "project_codes", "expires_at", "created_by"):
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(f"{field} cannot be null")
+        if self.project_codes is not None and len(self.project_codes) != len(
+            set(self.project_codes)
+        ):
+            raise ValueError("project codes must be unique")
+        if self.expires_at is not None and self.expires_at.utcoffset() is None:
+            raise ValueError("expiration must include a timezone")
+        return self
+
+
 class InvitationResponse(BaseModel):
     id: uuid.UUID
     invitation_code: str
@@ -99,6 +123,7 @@ class InvitationResponse(BaseModel):
 
 class AdminInvitationResponse(BaseModel):
     id: uuid.UUID
+    invitation_code: str | None = None
     expires_at: datetime
     project_codes: list[str]
     maximum_transfer_bytes: int | None
