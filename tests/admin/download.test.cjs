@@ -58,3 +58,40 @@ test('logout discards delayed invitation responses', async () => {
   resolve({ status: 200, ok: true, json: async () => ({ invitation_code: 'private' }) });
   await assert.rejects(result, e => e.name === 'AbortError');
 });
+
+test('folder collections preserve paths, separate transfers, and reject incomplete files', async () => {
+  const source = fs.readFileSync(path.join(admin, 'app.js'), 'utf8');
+  const code = source.slice(source.indexOf('async function listTransferFiles('), source.indexOf('async function showLogs('));
+  const saved = []; const status = { textContent: '' };
+  const directory = (prefix = '') => ({
+    getDirectoryHandle: async name => directory(`${prefix}${name}/`),
+    getFileHandle: async name => ({ path: `${prefix}${name}` }),
+  });
+  let available = true;
+  const context = vm.createContext({
+    state: {}, $: () => status, bytes: n => `${n} bytes`, markActivity: () => {}, URL, URLSearchParams,
+    window: { showDirectoryPicker: async () => directory() },
+    api: async url => {
+      if (url.includes('/files?')) {
+        const transfer = url.split('/')[2]; const folder = new URL(url, 'https://registry.test').searchParams.get('path');
+        const entry = { kind: 'file', transfer_id: transfer, file_id: `${transfer}-${folder}`, path: `${folder}/data.txt`, available };
+        return { entries: [entry], total: 1 };
+      }
+      const [, , transfer, , fileId] = url.split('/');
+      return { file_id: fileId, relative_path: `${fileId.slice(transfer.length + 1)}/data.txt` };
+    },
+    courierDownload: async (plan, handle) => saved.push(handle.path),
+  });
+  vm.runInContext(code, context);
+  const selection = [
+    { kind: 'folder', transfer_id: 'one', path: 'results' },
+    { kind: 'folder', transfer_id: 'two', path: 'results' },
+  ];
+  await vm.runInContext('downloadCollection', context)(selection, '', '#status');
+  assert.deepEqual(saved, ['one/results/data.txt', 'two/results/data.txt']);
+  assert.match(status.textContent, /2 file\(s\) downloaded/);
+  available = false;
+  await assert.rejects(vm.runInContext('downloadCollection', context)(selection, '', '#status'), /still uploading/);
+  assert.equal(saved.length, 2);
+  assert.throws(() => vm.runInContext('checkedPath', context)('../unsafe.txt'), /unsafe/);
+});

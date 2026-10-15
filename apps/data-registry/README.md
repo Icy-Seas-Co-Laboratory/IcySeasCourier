@@ -15,16 +15,24 @@ sessions retain their session expiry/refresh policy. Revoke to end existing acce
 Revoked invitations remain viewable but cannot be edited.
 
 Open a project to inspect metrics and live transfer states, then **Browse project
-files** to navigate manifest folders, select files, and download them directly
-from S3. Completed objects are available during an upload, including individual
-members of packs. Availability is separate from independent verification. The
-browser streams packs and checks each selected file's size and recorded digest
-before publishing its download. Browser pack decoding is limited to a 32 MiB
-Zstd frame window; unusual compression settings may require Courier retrieval. Large files use the Save File API where available;
-other browsers and multiple-file downloads buffer individual files with a 512 MiB
-limit. Multiple files download separately, and a browser may request permission
-for multiple downloads. Packed previews read/decompress the containing pack;
-selecting several members currently reads that pack for each selection.
+files** to navigate manifest folders and select files or multiple folders for
+direct download from S3. A completed transfer can also be downloaded from its
+details or from the project browser after selecting that transfer. Folder and
+transfer downloads require a browser with the File System Access directory
+picker (Chrome or Edge on a secure origin); choose a destination folder and
+Courier restores the manifest paths there. Entire transfers are placed in a
+separate folder named for the source and transfer ID. Selections spanning
+transfers place each transfer under its ID to avoid path collisions. If any
+selected file is still uploading, the collection is held until all files are
+available. Completed objects are available during an upload, including
+individual members of packs. Availability is separate from independent
+verification. The browser streams packs and checks each selected file's size
+and recorded digest before publishing it. Browser pack decoding is limited to
+a 32 MiB Zstd frame window; unusual compression settings may require Courier
+retrieval. Individual large files use the Save File API where available;
+other browsers buffer individual files with a 512 MiB limit. Packed previews
+read/decompress the containing pack; selecting several members currently reads
+that pack for each selection.
 
 The S3 bucket must permit cross-origin `GET` from the exact console origin (for
 local development, typically `http://127.0.0.1:8020`; use the actual tailnet console origin for beta administration, or the HTTPS

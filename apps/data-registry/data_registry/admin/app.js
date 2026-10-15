@@ -205,10 +205,10 @@ async function showTransfer(id) {
     const item = await api(`/transfers/${encodeURIComponent(id)}`);
     $("#detail-title").textContent = item.source_name;
     const retry = item.status === "failed" ? `<button type="button" class="secondary danger" data-retry="${escapeHtml(item.transfer_id)}">Retry verification</button>` : "";
-    const download = item.status === "complete" ? `<button type="button" class="primary" data-download="${escapeHtml(item.transfer_id)}">Generate download commands</button>` : "";
+    const download = item.status === "complete" ? `<button type="button" class="primary" data-retrieve-transfer="${escapeHtml(item.transfer_id)}" data-source-name="${escapeHtml(item.source_name)}">Download entire transfer</button><button type="button" class="secondary" data-download="${escapeHtml(item.transfer_id)}">Generate download commands</button>` : "";
     const remove = `<button type="button" class="secondary danger" data-delete-transfer="${escapeHtml(item.transfer_id)}">${item.status === "complete" ? "Delete completed transfer" : "Purge incomplete transfer"}</button>`;
     const savings = item.transport_bytes === null || item.original_bytes === 0 ? "—" : `${((1 - item.transport_bytes / item.original_bytes) * 100).toLocaleString(undefined, { maximumFractionDigits: 1 })}%`;
-    $("#detail-body").innerHTML = `<div class="detail-grid"><div><span>Registry ID</span><strong>${escapeHtml(item.transfer_id)}</strong></div><div><span>Project</span><strong>${escapeHtml(item.project_code)}</strong></div><div><span>Status</span><strong>${badge(item.status)}</strong></div><div><span>Digest policy</span><strong>${escapeHtml(item.hash_algorithm.toUpperCase())}</strong></div><div><span>Original data</span><strong>${bytes(item.original_bytes)}</strong></div><div><span>Packaged data</span><strong>${item.transport_bytes === null ? "Pending" : bytes(item.transport_bytes)}</strong></div><div><span>Size reduction</span><strong>${savings}</strong></div><div><span>Files</span><strong>${item.file_count.toLocaleString()}</strong></div><div><span>Attempts</span><strong>${item.verification_attempt_count}</strong></div><div><span>Verified</span><strong>${when(item.verified_at)}</strong></div></div>${item.verification_error ? `<div class="error">${escapeHtml(item.verification_error)}</div>` : ""}<div class="evidence"><span>Canonical manifest SHA-256</span><code>${escapeHtml(item.manifest_sha256 || "Not submitted")}</code></div><div id="download-plan"></div><h3>File verification evidence</h3><div class="table-card">${fileTable(item.files)}</div><div class="dialog-actions"><button type="button" class="secondary" data-logs="${escapeHtml(item.transfer_id)}">Transfer logs</button><button type="button" class="secondary" data-browse-project="${escapeHtml(item.project_code)}" data-browse-transfer="${escapeHtml(item.transfer_id)}">Browse files</button>${retry}${download}${remove}</div>`;
+    $("#detail-body").innerHTML = `<div class="detail-grid"><div><span>Registry ID</span><strong>${escapeHtml(item.transfer_id)}</strong></div><div><span>Project</span><strong>${escapeHtml(item.project_code)}</strong></div><div><span>Status</span><strong>${badge(item.status)}</strong></div><div><span>Digest policy</span><strong>${escapeHtml(item.hash_algorithm.toUpperCase())}</strong></div><div><span>Original data</span><strong>${bytes(item.original_bytes)}</strong></div><div><span>Packaged data</span><strong>${item.transport_bytes === null ? "Pending" : bytes(item.transport_bytes)}</strong></div><div><span>Size reduction</span><strong>${savings}</strong></div><div><span>Files</span><strong>${item.file_count.toLocaleString()}</strong></div><div><span>Attempts</span><strong>${item.verification_attempt_count}</strong></div><div><span>Verified</span><strong>${when(item.verified_at)}</strong></div></div>${item.verification_error ? `<div class="error">${escapeHtml(item.verification_error)}</div>` : ""}<div class="evidence"><span>Canonical manifest SHA-256</span><code>${escapeHtml(item.manifest_sha256 || "Not submitted")}</code></div><div id="download-plan"></div><h3>File verification evidence</h3><div class="table-card">${fileTable(item.files)}</div><div class="dialog-actions"><button type="button" class="secondary" data-logs="${escapeHtml(item.transfer_id)}">Transfer logs</button><button type="button" class="secondary" data-browse-project="${escapeHtml(item.project_code)}" data-browse-transfer="${escapeHtml(item.transfer_id)}">Browse files</button>${retry}${download}${remove}</div><p id="detail-download-status" role="status"></p>`;
     $("#detail-dialog").showModal();
   } catch (error) { setError(error.message); }
 }
@@ -362,7 +362,7 @@ async function showProject(code, open = true) {
 
 async function openBrowser(code, transfer = '') {
   const transfers = await api(`/transfers?project_code=${encodeURIComponent(code)}&limit=1000`);
-  state.browser = { code, transfer, path: '', offset: 0, entries: [], total: 0 };
+  state.browser = { code, transfer, path: '', offset: 0, entries: [], total: 0, transfers, selected: new Map() };
   $('#browser-transfer').innerHTML = `<option value="">All transfers</option>${transfers.map((item) => `<option value="${escapeHtml(item.transfer_id)}">${escapeHtml(item.source_name)} · ${escapeHtml(item.transfer_id)} · ${escapeHtml(item.status)}</option>`).join('')}`;
   if (transfer && !transfers.some((item) => item.transfer_id === transfer)) $('#browser-transfer').add(new Option(transfer, transfer));
   $('#browser-transfer').value = transfer;
@@ -379,14 +379,21 @@ async function loadBrowser() {
   b.entries = result.entries; b.total = result.total;
   $('#browser-path').textContent = `${b.code} / ${b.path || ''}`;
   $('#browser-up').disabled = !b.path;
-  $('#browser-entries').innerHTML = result.entries.length ? `<table><thead><tr><th>Select</th><th>Name</th><th>Transfer</th><th>Size</th><th>Availability</th></tr></thead><tbody>${result.entries.map((item, index) => `<tr><td>${item.kind === 'file' ? `<input type="checkbox" data-file-select="${index}" aria-label="Select ${escapeHtml(item.name)}" ${item.available ? '' : 'disabled'}>` : ''}</td><td>${item.kind === 'folder' ? `<button type="button" class="browser-name" data-folder="${index}">📁 ${escapeHtml(item.name)}</button>` : escapeHtml(item.name)}</td><td>${escapeHtml(item.transfer_id)}</td><td>${item.kind === 'file' ? bytes(item.original_size) : '—'}</td><td>${item.kind === 'file' ? badge(item.verified ? 'verified' : item.available ? 'available' : 'uploading') : 'Folder'}</td></tr>`).join('')}</tbody></table>` : '<div class="empty">No files in this folder yet.</div>';
+  $('#browser-entries').innerHTML = result.entries.length ? `<table><thead><tr><th>Select</th><th>Name</th><th>Transfer</th><th>Size</th><th>Availability</th></tr></thead><tbody>${result.entries.map((item, index) => `<tr><td><input type="checkbox" data-entry-select="${index}" aria-label="Select ${escapeHtml(item.kind)} ${escapeHtml(item.name)}" ${b.selected.has(entryKey(item)) ? 'checked' : ''} ${item.kind === 'file' && !item.available ? 'disabled' : ''}></td><td>${item.kind === 'folder' ? `<button type="button" class="browser-name" data-folder="${index}">📁 ${escapeHtml(item.name)}</button>` : escapeHtml(item.name)}</td><td>${escapeHtml(item.transfer_id)}</td><td>${item.kind === 'file' ? bytes(item.original_size) : '—'}</td><td>${item.kind === 'file' ? badge(item.verified ? 'verified' : item.available ? 'available' : 'uploading') : 'Folder'}</td></tr>`).join('')}</tbody></table>` : '<div class="empty">No files in this folder yet.</div>';
   $('#browser-page').textContent = `${result.total ? b.offset + 1 : 0}–${Math.min(b.offset + 100, result.total)} of ${result.total}`;
   $('#browser-prev').disabled = b.offset === 0; $('#browser-next').disabled = b.offset + 100 >= result.total;
+  $('#browser-transfer-download').disabled = !b.transfer || b.transfers.find((item) => item.transfer_id === b.transfer)?.status !== 'complete';
+  $('#browser-download').textContent = b.selected.size ? `Download selected (${b.selected.size})` : 'Download selected';
 }
+const entryKey = (entry) => `${entry.transfer_id}:${entry.kind}:${entry.path}`;
 async function downloadSelected() {
   const b = state.browser;
-  const selected = $$('[data-file-select]:checked').map((input) => b.entries[Number(input.dataset.fileSelect)]);
-  if (!selected.length) throw new Error('Select at least one available file.');
+  const selected = [...b.selected.values()];
+  if (!selected.length) throw new Error('Select at least one file or folder.');
+  if (selected.length !== 1 || selected[0].kind === 'folder') {
+    await downloadCollection(selected, '', '#browser-status');
+    return;
+  }
   // File picker must run within the button gesture, before authorization awaits.
   let handle = null;
   if (selected.length === 1 && window.showSaveFilePicker) {
@@ -398,10 +405,71 @@ async function downloadSelected() {
       if (!state.token) throw new Error('Administrator session ended.');
       $('#browser-status').textContent = `Authorizing ${file.name}…`;
       const plan = await api(`/transfers/${encodeURIComponent(file.transfer_id)}/files/${encodeURIComponent(file.file_id)}/download`, { method: 'POST' });
-      await courierDownload(plan, handle, (received, total) => { $('#browser-status').textContent = `Downloading ${file.name}: ${bytes(received)} / ${bytes(total)}`; });
+      await courierDownload(plan, handle, (received, total) => { markActivity(); $('#browser-status').textContent = `Downloading ${file.name}: ${bytes(received)} / ${bytes(total)}`; });
     }
     $('#browser-status').textContent = `${selected.length} file(s) downloaded; sizes and digests matched.`;
   } finally { $('#browser-download').disabled = false; }
+}
+
+async function listTransferFiles(transferId, path = '') {
+  const files = [];
+  for (let offset = 0; ; offset += 1000) {
+    const params = new URLSearchParams({ path, offset, limit: 1000 });
+    const page = await api(`/transfers/${encodeURIComponent(transferId)}/files?${params}`);
+    files.push(...page.entries);
+    if (files.length >= page.total) return files;
+    if (!page.entries.length) throw new Error('The transfer file list changed during download. Refresh and retry.');
+  }
+}
+
+function checkedPath(path) {
+  const parts = path.split('/');
+  if (!parts.length || parts.some((part) => !part || part === '.' || part === '..' || /[\\\x00-\x1f]/.test(part))) {
+    throw new Error('The manifest contains an unsafe file path.');
+  }
+  return parts;
+}
+
+async function downloadCollection(entries, rootName, statusSelector) {
+  if (state.bulkDownloading) return;
+  if (!window.showDirectoryPicker) throw new Error('Folder downloads require a browser with the Save Folder API, such as Chrome or Edge over HTTPS.');
+  // Request destination access before any API call, while the click gesture is active.
+  const directory = await window.showDirectoryPicker({ mode: 'readwrite' });
+  state.bulkDownloading = true;
+  const status = $(statusSelector);
+  try {
+    status.textContent = 'Finding files…';
+    const selected = new Map();
+    for (const entry of entries) {
+      const files = entry.kind === 'folder' ? await listTransferFiles(entry.transfer_id, entry.path) : [entry];
+      for (const file of files) selected.set(`${file.transfer_id}:${file.file_id}`, file);
+    }
+    const files = [...selected.values()];
+    if (!files.length) throw new Error('No files were found in the selection.');
+    const unavailable = files.find((file) => !file.available);
+    if (unavailable) throw new Error(`${unavailable.path} is still uploading. Wait for it to become available before downloading this selection.`);
+    const paths = files.map((file) => checkedPath(file.path));
+    const multipleTransfers = new Set(files.map((file) => file.transfer_id)).size > 1;
+    let root = directory;
+    if (rootName) root = await root.getDirectoryHandle(checkedPath(rootName)[0], { create: true });
+    for (let index = 0; index < files.length; index++) {
+      const file = files[index];
+      let folder = root;
+      if (multipleTransfers) folder = await folder.getDirectoryHandle(checkedPath(file.transfer_id)[0], { create: true });
+      for (const part of paths[index].slice(0, -1)) folder = await folder.getDirectoryHandle(part, { create: true });
+      status.textContent = `Downloading ${index + 1} of ${files.length}: ${file.path}`;
+      const plan = await api(`/transfers/${encodeURIComponent(file.transfer_id)}/files/${encodeURIComponent(file.file_id)}/download`, { method: 'POST' });
+      if (plan.relative_path !== file.path || plan.file_id !== file.file_id) throw new Error('The file changed after listing. Refresh and retry.');
+      const handle = await folder.getFileHandle(paths[index].at(-1), { create: true });
+      await courierDownload(plan, handle, (received, total) => { markActivity(); status.textContent = `Downloading ${index + 1} of ${files.length}: ${file.path} · ${bytes(received)} / ${bytes(total)}`; });
+    }
+    status.textContent = `${files.length} file(s) downloaded with original folders; sizes and digests matched.`;
+  } finally { state.bulkDownloading = false; }
+}
+
+async function downloadTransfer(transferId, sourceName, statusSelector) {
+  const safeName = sourceName.replace(/[^\w.-]+/g, '_').replace(/^\.+/, '') || 'transfer';
+  await downloadCollection([{ kind: 'folder', transfer_id: transferId, path: '' }], `${safeName}-${transferId}`, statusSelector);
 }
 async function showLogs(id) {
   state.logTransfer = id; state.logOffset = 0; $('#logs-search').value = '';
@@ -428,8 +496,17 @@ document.addEventListener('click', (event) => {
   const refresh = event.target.closest('[data-refresh-project]'); if (refresh) reportFailure(() => showProject(refresh.dataset.refreshProject, false));
   const browse = event.target.closest('[data-browse-project]'); if (browse) { event.preventDefault(); reportFailure(() => openBrowser(browse.dataset.browseProject, browse.dataset.browseTransfer || '')); }
   const logs = event.target.closest('[data-logs]'); if (logs) { event.preventDefault(); reportFailure(() => showLogs(logs.dataset.logs)); }
+  const retrieve = event.target.closest('[data-retrieve-transfer]'); if (retrieve) reportFailure(() => downloadTransfer(retrieve.dataset.retrieveTransfer, retrieve.dataset.sourceName, '#detail-download-status'));
   const edit = event.target.closest('[data-edit-invitation]'); if (edit) reportFailure(async () => openInvitationForm(await api(`/invitations/${encodeURIComponent(edit.dataset.editInvitation)}`)));
   const folder = event.target.closest('[data-folder]'); if (folder) { const entry = state.browser.entries[Number(folder.dataset.folder)]; Object.assign(state.browser, { path: entry.path, transfer: entry.transfer_id, offset: 0 }); if (![...$('#browser-transfer').options].some((option) => option.value === entry.transfer_id)) $('#browser-transfer').add(new Option(entry.transfer_id, entry.transfer_id)); $('#browser-transfer').value = entry.transfer_id; reportFailure(loadBrowser); }
+});
+$('#browser-entries').addEventListener('change', (event) => {
+  const input = event.target.closest('[data-entry-select]');
+  if (!input || !state.browser) return;
+  const entry = state.browser.entries[Number(input.dataset.entrySelect)];
+  if (input.checked) state.browser.selected.set(entryKey(entry), entry);
+  else state.browser.selected.delete(entryKey(entry));
+  $('#browser-download').textContent = state.browser.selected.size ? `Download selected (${state.browser.selected.size})` : 'Download selected';
 });
 $('#browser-transfer').addEventListener('change', () => { Object.assign(state.browser, { transfer: $('#browser-transfer').value, path: '', offset: 0 }); reportFailure(loadBrowser); });
 $('#browser-up').addEventListener('click', () => { state.browser.path = state.browser.path.split('/').slice(0, -1).join('/'); state.browser.offset = 0; reportFailure(loadBrowser); });
@@ -437,6 +514,7 @@ $('#browser-refresh').addEventListener('click', () => reportFailure(loadBrowser)
 $('#browser-prev').addEventListener('click', () => { state.browser.offset -= 100; reportFailure(loadBrowser); });
 $('#browser-next').addEventListener('click', () => { state.browser.offset += 100; reportFailure(loadBrowser); });
 $('#browser-download').addEventListener('click', () => reportFailure(downloadSelected));
+$('#browser-transfer-download').addEventListener('click', () => { const b = state.browser; const item = b.transfers.find((transfer) => transfer.transfer_id === b.transfer); if (item?.status === 'complete') reportFailure(() => downloadTransfer(item.transfer_id, item.source_name, '#browser-status')); });
 $('#logs-search-form').addEventListener('submit', (event) => { event.preventDefault(); state.logOffset = 0; reportFailure(loadLogs); });
 $('#logs-prev').addEventListener('click', () => { state.logOffset -= 100; reportFailure(loadLogs); });
 $('#logs-next').addEventListener('click', () => { state.logOffset += 100; reportFailure(loadLogs); });

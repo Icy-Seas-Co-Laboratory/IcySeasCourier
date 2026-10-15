@@ -184,6 +184,27 @@ def test_pack_download_metadata_and_auth(client, database_factory, fake_storage)
     assert result["pack_original_bytes"] == 10
 
 
+def test_transfer_file_listing_for_folder_download(client, database_factory, fake_storage):
+    transfer_id, _, _ = prepare(client, database_factory, fake_storage)
+    url = f"/api/v1/admin/transfers/{transfer_id}/files"
+    assert client.get(url).status_code == 401
+    first = client.get(url, headers=ADMIN, params={"path": "folder", "limit": 1}).json()
+    second = client.get(
+        url, headers=ADMIN, params={"path": "folder", "limit": 1, "offset": 1}
+    ).json()
+    assert first["total"] == second["total"] == 2
+    assert {entry["path"] for entry in first["entries"] + second["entries"]} == {
+        "folder/pending.txt",
+        "folder/ready.txt",
+    }
+    assert [entry["available"] for entry in first["entries"] + second["entries"]] == [
+        False,
+        True,
+    ]
+    assert client.get(url, headers=ADMIN, params={"path": "../folder"}).status_code == 422
+    assert client.get(url, headers=ADMIN, params={"path": "missing"}).json()["total"] == 0
+
+
 def test_transfer_logs_search_pagination_and_complete_export(
     client, database_factory, fake_storage
 ):

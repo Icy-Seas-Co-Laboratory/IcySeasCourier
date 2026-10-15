@@ -56,6 +56,13 @@ class BrowserResponse(BaseModel):
     limit: int
 
 
+class TransferFilesResponse(BaseModel):
+    entries: list[BrowserEntry]
+    total: int
+    offset: int
+    limit: int
+
+
 class FileDownload(BaseModel):
     transfer_id: str
     file_id: uuid.UUID
@@ -201,6 +208,8 @@ def project_files(
         .outerjoin(TransferObject, TransferFile.transport_object_id == TransferObject.id)
         .where(Transfer.project_id == project.id)
     )
+
+
     if transfer_id:
         transfer = transfer_by_id(database, transfer_id)
         if transfer.project_id != project.id:
@@ -241,6 +250,46 @@ def project_files(
         offset=offset,
         limit=limit,
     )
+
+
+@router.get("/transfers/{transfer_id}/files", response_model=TransferFilesResponse)
+def transfer_files(
+    transfer_id: str,
+    database: Database,
+    _: AdminActor,
+    path: str = Query(default="", max_length=4096),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=1000, ge=1, le=1000),
+) -> TransferFilesResponse:
+    transfer = transfer_by_id(database, transfer_id)
+    if path and (
+        "\\" in path or "\x00" in path or any(p in {"", ".", ".."} for p in path.split("/"))
+    ):
+        raise HTTPException(422, "path must be a normalized relative directory")
+    query = (
+        select(TransferFile, TransferObject.status.label("object_status"))
+        .outerjoin(TransferObject, TransferFile.transport_object_id == TransferObject.id)
+        .where(TransferFile.transfer_id == transfer.id)
+    )
+    if path:
+        query = query.where(TransferFile.relative_path.startswith(path + "/", autoescape=True))
+    total = database.scalar(select(func.count()).select_from(query.subquery())) or 0
+    rows = database.execute(query.order_by(TransferFile.relative_path).offset(offset).limit(limit))
+    entries = [
+        BrowserEntry(
+            kind="file",
+            name=item.relative_path.rsplit("/", 1)[-1],
+            path=item.relative_path,
+            transfer_id=transfer_id,
+            file_id=item.id,
+            original_size=item.original_size,
+            status=item.status,
+            available=(object_status if object_status is not None else item.status) in READY,
+            verified=item.status == "verified",
+        )
+        for item, object_status in rows
+    ]
+    return TransferFilesResponse(entries=entries, total=total, offset=offset, limit=limit)
 
 
 @router.post("/transfers/{transfer_id}/files/{file_id}/download", response_model=FileDownload)
