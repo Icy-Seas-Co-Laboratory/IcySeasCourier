@@ -28,3 +28,7 @@ def test_totp_secret_encryption_and_admin_session_expiration(settings: Settings)
     assert expires_at == now + timedelta(seconds=settings.admin_session_lifetime_seconds)
     assert valid_admin_session_token(token, settings, now=now)
     assert not valid_admin_session_token(token, settings, now=expires_at)
+
+
+def test_admin_session_default_lifetime_is_30_minutes() -> None:
+    assert Settings.model_fields["admin_session_lifetime_seconds"].default == 1800

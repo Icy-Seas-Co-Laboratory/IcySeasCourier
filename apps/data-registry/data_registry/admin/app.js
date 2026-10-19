@@ -140,6 +140,21 @@ function toast(message) {
   window.setTimeout(() => element.classList.remove("show"), 2600);
 }
 
+async function copyText(value) {
+  if (navigator.clipboard?.writeText) {
+    try { await navigator.clipboard.writeText(value); return; } catch { /* Tailnet HTTP origins may lack Clipboard API access. */ }
+  }
+  const input = document.createElement('textarea');
+  input.value = value;
+  input.style.position = 'fixed';
+  input.style.opacity = '0';
+  document.body.append(input);
+  input.select();
+  const copied = document.execCommand('copy');
+  input.remove();
+  if (!copied) throw new Error('Copy is unavailable in this browser');
+}
+
 function renderAll() {
   const metric = (label, value, detail = "") => `<div class="metric"><span>${label}</span><strong>${value}</strong><small>${detail}</small></div>`;
   $("#metrics").innerHTML = [
@@ -160,7 +175,7 @@ function renderAll() {
 
 function transferTable(items, full = true) {
   if (!items.length) return `<div class="empty">No transfers match this view.</div>`;
-  return `<table><thead><tr><th>Dataset</th><th>Project</th><th>Status</th>${full ? "<th>Original / packaged</th><th>Updated</th>" : ""}</tr></thead><tbody>${items.map((item) => `<tr class="clickable" data-transfer="${escapeHtml(item.transfer_id)}"><td><strong>${escapeHtml(item.source_name)}</strong><span class="sub">${escapeHtml(item.transfer_id)} · ${item.file_count.toLocaleString()} files</span></td><td>${escapeHtml(item.project_code)}</td><td>${badge(item.status)}</td>${full ? `<td>${bytes(item.original_bytes)}<span class="sub">${item.transport_bytes === null ? "Packaging not complete" : `${bytes(item.transport_bytes)} packaged`}</span></td><td>${when(item.verified_at || item.completed_at || item.created_at)}</td>` : ""}</tr>`).join("")}</tbody></table>`;
+  return `<table><thead><tr><th>Dataset</th><th>Project</th><th>Status</th>${full ? "<th>Original / packaged</th><th>Updated</th>" : ""}<th>Action</th></tr></thead><tbody>${items.map((item) => `<tr class="clickable" data-transfer="${escapeHtml(item.transfer_id)}"><td><strong>${escapeHtml(item.source_name)}</strong><span class="sub">${escapeHtml(item.transfer_id)} · ${item.file_count.toLocaleString()} files</span></td><td>${escapeHtml(item.project_code)}</td><td>${badge(item.status)}</td>${full ? `<td>${bytes(item.original_bytes)}<span class="sub">${item.transport_bytes === null ? "Packaging not complete" : `${bytes(item.transport_bytes)} packaged`}</span></td><td>${when(item.verified_at || item.completed_at || item.created_at)}</td>` : ""}<td><button type="button" class="secondary" data-transfer="${escapeHtml(item.transfer_id)}">Open transfer</button></td></tr>`).join("")}</tbody></table>`;
 }
 
 function renderTransfers() {
@@ -205,7 +220,7 @@ async function showTransfer(id) {
     const item = await api(`/transfers/${encodeURIComponent(id)}`);
     $("#detail-title").textContent = item.source_name;
     const retry = item.status === "failed" ? `<button type="button" class="secondary danger" data-retry="${escapeHtml(item.transfer_id)}">Retry verification</button>` : "";
-    const download = item.status === "complete" ? `<button type="button" class="primary" data-retrieve-transfer="${escapeHtml(item.transfer_id)}" data-source-name="${escapeHtml(item.source_name)}">Download entire transfer</button><button type="button" class="secondary" data-download="${escapeHtml(item.transfer_id)}">Generate download commands</button>` : "";
+    const download = item.status === "complete" ? `<button type="button" class="primary" data-open-retrieval="${escapeHtml(item.transfer_id)}" data-source-name="${escapeHtml(item.source_name)}">Retrieve on another machine</button><button type="button" class="secondary" data-retrieve-transfer="${escapeHtml(item.transfer_id)}" data-source-name="${escapeHtml(item.source_name)}">Download in browser</button><button type="button" class="secondary" data-download="${escapeHtml(item.transfer_id)}">Server / raw S3 commands</button>` : "";
     const remove = `<button type="button" class="secondary danger" data-delete-transfer="${escapeHtml(item.transfer_id)}">${item.status === "complete" ? "Delete completed transfer" : "Purge incomplete transfer"}</button>`;
     const savings = item.transport_bytes === null || item.original_bytes === 0 ? "—" : `${((1 - item.transport_bytes / item.original_bytes) * 100).toLocaleString(undefined, { maximumFractionDigits: 1 })}%`;
     $("#detail-body").innerHTML = `<div class="detail-grid"><div><span>Registry ID</span><strong>${escapeHtml(item.transfer_id)}</strong></div><div><span>Project</span><strong>${escapeHtml(item.project_code)}</strong></div><div><span>Status</span><strong>${badge(item.status)}</strong></div><div><span>Digest policy</span><strong>${escapeHtml(item.hash_algorithm.toUpperCase())}</strong></div><div><span>Original data</span><strong>${bytes(item.original_bytes)}</strong></div><div><span>Packaged data</span><strong>${item.transport_bytes === null ? "Pending" : bytes(item.transport_bytes)}</strong></div><div><span>Size reduction</span><strong>${savings}</strong></div><div><span>Files</span><strong>${item.file_count.toLocaleString()}</strong></div><div><span>Attempts</span><strong>${item.verification_attempt_count}</strong></div><div><span>Verified</span><strong>${when(item.verified_at)}</strong></div></div>${item.verification_error ? `<div class="error">${escapeHtml(item.verification_error)}</div>` : ""}<div class="evidence"><span>Canonical manifest SHA-256</span><code>${escapeHtml(item.manifest_sha256 || "Not submitted")}</code></div><div id="download-plan"></div><h3>File verification evidence</h3><div class="table-card">${fileTable(item.files)}</div><div class="dialog-actions"><button type="button" class="secondary" data-logs="${escapeHtml(item.transfer_id)}">Transfer logs</button><button type="button" class="secondary" data-browse-project="${escapeHtml(item.project_code)}" data-browse-transfer="${escapeHtml(item.transfer_id)}">Browse files</button>${retry}${download}${remove}</div><p id="detail-download-status" role="status"></p>`;
@@ -221,7 +236,35 @@ async function generateDownloadPlan(id) {
     ? "This downloads verified Courier transport objects. Pack files still require Courier unpacking to restore the original directory tree."
     : "This transfer contains standalone payloads; use the manifest file list to restore their original names and paths.";
   const commandStyle = "max-height:220px;overflow:auto;padding:11px;border-radius:7px;background:#182b34;color:#e5f2f5;font-size:10px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere";
-  $("#download-plan").innerHTML = `<div class="evidence"><span>Recommended · reconstruct and verify on the Registry host</span><p class="sub">Run from the Courier deployment directory. The completed dataset appears under the configured export directory.</p><pre id="retrieve-command" style="${commandStyle}">${escapeHtml(plan.server_retrieve_command)}</pre><button type="button" class="secondary" data-copy-retrieve>Copy retrieval command</button></div><div class="evidence"><span>Raw S3 transport objects · links expire in ${Math.round(plan.expires_in_seconds / 60)} minutes</span><p class="sub">${escapeHtml(warning)}</p><pre id="download-command" style="${commandStyle}">${escapeHtml(plan.shell_command)}</pre><button type="button" class="secondary" data-copy-download>Copy raw download commands</button></div>`;
+  $("#download-plan").innerHTML = `<div class="evidence"><span>Server-side recovery · reconstruct and verify on the Registry host</span><p class="sub">Run from the Courier deployment directory. The completed dataset appears under the configured export directory.</p><pre id="retrieve-command" style="${commandStyle}">${escapeHtml(plan.server_retrieve_command)}</pre><button type="button" class="secondary" data-copy-retrieve>Copy retrieval command</button></div><div class="evidence"><span>Raw S3 transport objects · links expire in ${Math.round(plan.expires_in_seconds / 60)} minutes</span><p class="sub">${escapeHtml(warning)}</p><pre id="download-command" style="${commandStyle}">${escapeHtml(plan.shell_command)}</pre><button type="button" class="secondary" data-copy-download>Copy raw download commands</button></div>`;
+}
+
+const shellQuote = (value) => `'${value.replaceAll("'", "'\"'\"'")}'`;
+
+function renderRetrievalCommand() {
+  const registry = $('#retrieval-registry').value.trim();
+  const destination = $('#retrieval-destination').value.trim();
+  const transfer = $('#retrieval-dialog').dataset.transfer;
+  const output = $('#retrieval-command');
+  try {
+    const parsed = new URL(registry);
+    if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(parsed.hostname))) throw new Error('Use a Registry HTTPS address.');
+    if (!destination || /[\r\n]/.test(destination)) throw new Error('Enter a destination directory.');
+    output.textContent = `read -r -s -p 'Download invitation: ' courier_invitation && printf '\\n' && COURIER_DOWNLOAD_INVITATION="$courier_invitation" courier retrieve --registry ${shellQuote(parsed.origin)} --transfer ${shellQuote(transfer)} --destination ${shellQuote(destination)}; unset courier_invitation`;
+    $('#copy-retrieval-command').disabled = false;
+  } catch (error) {
+    output.textContent = error.message;
+    $('#copy-retrieval-command').disabled = true;
+  }
+}
+
+function openRetrievalCommands(id, name) {
+  $('#retrieval-dialog').dataset.transfer = id;
+  $('#retrieval-title').textContent = `${name} · ${id}`;
+  if (!$('#retrieval-registry').value && location.protocol === 'https:') $('#retrieval-registry').value = location.origin;
+  $('#retrieval-destination').value = `./${id}`;
+  renderRetrievalCommand();
+  openDialog('retrieval-dialog');
 }
 
 function fileTable(files) {
@@ -333,6 +376,7 @@ $("#new-project").addEventListener("click", openProjectForm); $("#new-invitation
 $$('nav button[data-view]').forEach((item) => item.addEventListener("click", () => showView(item.dataset.view)));
 $$('[data-go]').forEach((item) => item.addEventListener("click", () => showView(item.dataset.go)));
 document.addEventListener("click", async (event) => {
+  const retrieval = event.target.closest('[data-open-retrieval]'); if (retrieval) { event.preventDefault(); openRetrievalCommands(retrieval.dataset.openRetrieval, retrieval.dataset.sourceName); return; }
   const transfer = event.target.closest("[data-transfer]"); if (transfer) return showTransfer(transfer.dataset.transfer);
   const revoke = event.target.closest("[data-revoke]"); if (revoke && window.confirm("Revoke this invitation? Existing sessions will no longer be accepted.")) { try { await api(`/invitations/${revoke.dataset.revoke}`, { method: "DELETE" }); toast("Invitation revoked"); await loadAll(); } catch (error) { setError(error.message); } }
   const retry = event.target.closest("[data-retry]"); if (retry && window.confirm("Queue this transfer for another independent verification attempt?")) { try { await api(`/transfers/${encodeURIComponent(retry.dataset.retry)}/retry`, { method: "POST" }); $("#detail-dialog").close(); toast("Verification retry queued"); await loadAll(); } catch (error) { setError(error.message); } }
@@ -349,14 +393,17 @@ initializeLogin();
 
 function openDialog(id) { const dialog = $(`#${id}`); if (!dialog.open) dialog.showModal(); }
 async function showProject(code, open = true) {
-  const item = await api(`/projects/${encodeURIComponent(code)}/summary`);
+  const [item, completed] = await Promise.all([
+    api(`/projects/${encodeURIComponent(code)}/summary`),
+    api(`/transfers?project_code=${encodeURIComponent(code)}&transfer_status=complete&limit=500`),
+  ]);
   state.project = code;
   $('#project-title').textContent = `${code} · ${item.project.name}`;
   const metric = (label, value) => `<div><span>${label}</span><strong>${value}</strong></div>`;
   $('#project-body').innerHTML = `<p>${escapeHtml(item.project.description || '')}</p><div class="detail-grid">${[
     metric('Transfers', item.total_transfers), metric('Live', item.active_transfers), metric('Verified transfers', item.completed_transfers), metric('Failed', item.failed_transfers),
     metric('Manifest data', bytes(item.original_bytes)), metric('Available files', `${item.uploaded_file_count} / ${item.file_count}`), metric('Verified files', item.verified_file_count), metric('Recorded accepted parts', bytes(item.recorded_transport_bytes)),
-  ].join('')}</div><div class="dialog-actions"><button type="button" class="secondary" data-refresh-project="${escapeHtml(code)}">Refresh summary</button><button type="button" class="primary" data-browse-project="${escapeHtml(code)}">Browse project files</button></div><h3>Live transfers</h3>${transferTable(item.live_transfers)}<p class="sub">State reflects the latest Registry requests. Accepted-part bytes exclude a part still uploading; this is not device connectivity or a live speed measurement.</p>`;
+  ].join('')}</div><div class="dialog-actions"><button type="button" class="secondary" data-refresh-project="${escapeHtml(code)}">Refresh summary</button><button type="button" class="primary" data-browse-project="${escapeHtml(code)}">Browse project files</button></div><h3>Recent verified transfers</h3>${completed.length ? `<div class="table-card"><table><thead><tr><th>Dataset</th><th>Verified</th><th>Action</th></tr></thead><tbody>${completed.map((transfer) => `<tr><td><strong>${escapeHtml(transfer.source_name)}</strong><span class="sub">${escapeHtml(transfer.transfer_id)}</span></td><td>${when(transfer.verified_at)}</td><td><div class="table-actions"><button type="button" class="primary" data-open-retrieval="${escapeHtml(transfer.transfer_id)}" data-source-name="${escapeHtml(transfer.source_name)}">Copy retrieval command</button><button type="button" class="secondary" data-transfer="${escapeHtml(transfer.transfer_id)}">Open transfer</button></div></td></tr>`).join('')}</tbody></table></div>` : '<div class="empty">No verified transfers yet.</div>'}<h3>Live transfers</h3>${transferTable(item.live_transfers)}<p class="sub">State reflects the latest Registry requests. Accepted-part bytes exclude a part still uploading; this is not device connectivity or a live speed measurement.</p>`;
   if (open) openDialog('project-dialog');
 }
 
@@ -515,6 +562,9 @@ $('#browser-prev').addEventListener('click', () => { state.browser.offset -= 100
 $('#browser-next').addEventListener('click', () => { state.browser.offset += 100; reportFailure(loadBrowser); });
 $('#browser-download').addEventListener('click', () => reportFailure(downloadSelected));
 $('#browser-transfer-download').addEventListener('click', () => { const b = state.browser; const item = b.transfers.find((transfer) => transfer.transfer_id === b.transfer); if (item?.status === 'complete') reportFailure(() => downloadTransfer(item.transfer_id, item.source_name, '#browser-status')); });
+$('#retrieval-registry').addEventListener('input', renderRetrievalCommand);
+$('#retrieval-destination').addEventListener('input', renderRetrievalCommand);
+$('#copy-retrieval-command').addEventListener('click', async () => { try { await copyText($('#retrieval-command').textContent); toast('Retrieval command copied'); } catch { setError('Could not copy the command; select the command text manually.'); } });
 $('#logs-search-form').addEventListener('submit', (event) => { event.preventDefault(); state.logOffset = 0; reportFailure(loadLogs); });
 $('#logs-prev').addEventListener('click', () => { state.logOffset -= 100; reportFailure(loadLogs); });
 $('#logs-next').addEventListener('click', () => { state.logOffset += 100; reportFailure(loadLogs); });

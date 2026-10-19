@@ -99,7 +99,7 @@ sudo tailscale serve --bg --http=80 http://127.0.0.1:8021
 tailscale serve status
 ```
 
-The browser URL is HTTP, but its packets remain end-to-end encrypted by the tailnet. Port 8021 is bound only to host loopback and its gateway marks only that dedicated proxy path as transport-secure; Courier's public port does not receive this exception. Restrict port 80 on this tailnet node to approved administrators with Headscale policy. The Registry also requires the admin key and a TOTP code before issuing a 15-minute, memory-only console session.
+The browser URL is HTTP, but its packets remain end-to-end encrypted by the tailnet. Port 8021 is bound only to host loopback and its gateway marks only that dedicated proxy path as transport-secure; Courier's public port does not receive this exception. Restrict port 80 on this tailnet node to approved administrators with Headscale policy. The Registry also requires the admin key and a TOTP code before issuing a 30-minute, memory-only console session.
 
 When using the repository startup helper, `./scripts/dev-up.sh --tailscale` performs the same setup without attempting privilege escalation. If the local Tailscale installation requires elevated access, the helper prints the exact `sudo tailscale serve` command instead.
 
@@ -109,7 +109,7 @@ Open the `http://<courier-host>.<headscale-base-domain>/admin/` URL printed by S
 
 On the first visit, enter the configured `REGISTRY_ADMIN_API_KEY` and select **Open console**. Courier generates a TOTP secret and displays it once. Add the secret to an authenticator application, enter the current six-digit code, and select **Verify and finish setup**. The confirmed secret is encrypted in PostgreSQL using a key derived from `REGISTRY_TOKEN_PEPPER`; do not change the pepper without a coordinated credential recovery.
 
-Subsequent logins require both the admin key and a fresh authenticator code. Each code can be used only once, and the resulting console session expires after `REGISTRY_ADMIN_SESSION_LIFETIME_SECONDS` (15 minutes by default). The browser keeps the session only in memory.
+Subsequent logins require both the admin key and a fresh authenticator code. Each code can be used only once, and the resulting console session expires after `REGISTRY_ADMIN_SESSION_LIFETIME_SECONDS` (30 minutes by default). The browser keeps the session only in memory and renews it while the administrator remains active; 30 minutes without activity locks the console.
 
 If the authenticator is lost, a server operator with database access can reset enrollment. Back up the database first, then delete only the singleton enrollment row and repeat first setup:
 
@@ -158,6 +158,16 @@ every original size and digest, preserves file modification times, and atomicall
 publishes the destination only after all checks succeed. A failed attempt removes
 its private partial directory. The invitation is project-scoped, so other projects
 and incomplete or failed transfers are never listed.
+
+For a headless destination, build and install the `courier` CLI on that machine.
+In the admin console, open a completed transfer and choose **Retrieve on another
+machine**, or open its project and use **Copy retrieval command** beside the
+verified transfer. Enter the Registry HTTPS address and a new destination path,
+then copy and run the Bash command on the destination machine. It prompts without
+echoing for a read-only download invitation; the invitation is not embedded in
+the copied command. The destination machine needs network access to both the
+Registry and its public S3 endpoint. The CLI verifies the reconstructed files
+before publishing the destination directory.
 
 The administrator-only server retrieval command remains available for operational
 recovery and managed-storage workflows:

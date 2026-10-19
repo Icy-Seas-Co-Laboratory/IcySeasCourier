@@ -34,6 +34,8 @@ cargo run -p courier-cli -- send <transfer-id>
 
 The development CLI uploads directly to its configured S3-compatible data plane and therefore stops at `finalizing`. The Registry-connected desktop flow submits the transfer for independent verification and polls until it reaches `complete` or `failed`.
 
+For a headless machine, build the CLI with `cargo build --release -p courier-cli` and place `target/release/courier` on that machine's PATH. An administrator can open a completed transfer or project in the Registry console and copy its **Retrieve on another machine** command. The CLI asks for a project-scoped, read-only download invitation through a silent shell prompt. It downloads directly from the Registry-authorized S3 URLs, reconstructs packed files, verifies every logical file against the manifest, and publishes a new destination directory only after verification succeeds. The destination machine must reach both the Registry HTTPS address and the public S3 endpoint.
+
 Use `--state-db ./courier.db` for an isolated development database and `--json` for automation.
 
 ## Development

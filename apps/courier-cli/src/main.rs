@@ -15,6 +15,8 @@ use courier_transfer::{
 };
 use uuid::Uuid;
 
+mod retrieve;
+
 #[derive(Parser)]
 #[command(
     name = "courier",
@@ -64,11 +66,28 @@ enum Command {
     Retry { transfer_id: Uuid },
     /// Cancel a transfer without deleting its state.
     Cancel { transfer_id: Uuid },
+    /// Retrieve and verify a completed Registry dataset on this machine.
+    Retrieve {
+        #[arg(long)]
+        registry: String,
+        #[arg(long)]
+        transfer: String,
+        #[arg(long)]
+        destination: PathBuf,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Command::Retrieve {
+        registry,
+        transfer,
+        destination,
+    } = &cli.command
+    {
+        return retrieve::run(registry, transfer, destination, cli.json).await;
+    }
     let db_path = cli.state_db.unwrap_or(default_db_path()?);
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -132,6 +151,7 @@ async fn main() -> Result<()> {
         Command::Cancel { transfer_id } => {
             change(&store, transfer_id, TransferStatus::Cancelled, cli.json)?
         }
+        Command::Retrieve { .. } => unreachable!(),
     }
     Ok(())
 }

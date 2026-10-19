@@ -34,6 +34,12 @@ other browsers buffer individual files with a 512 MiB limit. Packed previews
 read/decompress the containing pack; selecting several members currently reads
 that pack for each selection.
 
+For direct retrieval onto a headless machine, a completed transfer's detail and
+its project summary provide a copyable `courier retrieve` command. Build the CLI
+from the repository and put the binary on the destination machine's PATH. The
+command prompts for a read-only download invitation and restores the verified
+logical files directly from S3 into a new destination directory.
+
 The S3 bucket must permit cross-origin `GET` from the exact console origin (for
 local development, typically `http://127.0.0.1:8020`; use the actual tailnet console origin for beta administration, or the HTTPS
 origin for an HTTPS console). Merge this rule with any existing bucket CORS rules rather than replacing

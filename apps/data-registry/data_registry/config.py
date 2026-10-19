@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     environment: str = "development"
     database_url: str = "postgresql+psycopg://registry:registry@127.0.0.1:5432/registry"
     admin_api_key: SecretStr = SecretStr("development-only-change-me")
-    admin_session_lifetime_seconds: int = 900
+    admin_session_lifetime_seconds: int = 1800
     admin_totp_setup_lifetime_seconds: int = 600
     token_pepper: SecretStr = SecretStr("development-only-change-me-too")
     session_lifetime_seconds: int = 3600
