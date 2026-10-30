@@ -1,8 +1,40 @@
-# Icy Seas Courier
+<p align="center">
+  <img src="apps/courier-desktop/src-tauri/icons/icon.png" alt="Icy Seas Courier icon" width="144">
+</p>
 
-Icy Seas Courier is a resumable scientific-data transfer client for Icy Seas Co-Laboratory LLC. It is being built as a reusable Rust engine with CLI, desktop, headless, and instrument-facing clients layered over the same implementation.
+<h1 align="center">Icy Seas Courier</h1>
 
-This repository contains the client-first foundation of Phase 1: the monorepo, persistent transfer and multipart state, strict recursive inventory and configurable logical-file hashing, source-mutation checks, deterministic S3-compatible part planning, restart reconciliation, bounded-memory SeaweedFS uploads, retry policy, and CLI and desktop interfaces. The Registry accepts manifest v3 only, keeps logical files separate from transport objects, provides scoped renewable sessions and direct object upload authorization, and reserves `complete` for independent server-side verification.
+<p align="center">
+  Resumable scientific-data transfer, from the field to independently verified storage.
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#desktop-application">Desktop application</a> ·
+  <a href="#data-registry">Data Registry</a> ·
+  <a href="docs/architecture.md">Architecture</a>
+</p>
+
+Courier is a transfer client for Icy Seas Co-Laboratory LLC. A shared Rust engine powers its CLI and desktop interfaces, with headless and instrument-facing clients planned around the same implementation.
+
+![Courier desktop workspace, showing saved project access](docs/images/courier-workspace.png)
+
+### From source files to verified datasets
+
+```mermaid
+flowchart LR
+    A[Source files] --> B[Courier<br/>inventory and upload]
+    B -->|Dataset bytes| C[S3-compatible storage]
+    B <-->|Manifest and authorization| D[Data Registry]
+    C -->|Independent verification| D
+    D --> E[Verified dataset]
+```
+
+- **Resume with confidence:** persistent local state, source-mutation checks, and multipart reconciliation support interrupted transfers.
+- **Transfer directly:** dataset bytes travel to S3-compatible storage using short-lived Registry-issued URLs; the Registry does not proxy them.
+- **Verify independently:** the Registry keeps logical files separate from transport objects and marks a transfer `complete` only after server-side verification.
+
+The current client-first foundation includes deterministic packing, bounded-memory uploads, retry policy, immutable manifest v3, and scoped renewable sessions.
 
 ## Quick start
 
